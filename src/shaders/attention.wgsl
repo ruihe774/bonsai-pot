@@ -74,7 +74,9 @@ fn main(
       s = s / 2u;
     }
     let dot = partial[0];
-    // (no barrier needed: subsequent partial[] writes happen next iteration after another barrier)
+    // Required: without this, thread 0 could write partial[0] = local_dot in
+    // the next iteration before another thread reads partial[0] in this one.
+    workgroupBarrier();
 
     // 2) Online softmax update + V accumulation
     let score = dot * p.scale;

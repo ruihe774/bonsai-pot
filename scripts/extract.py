@@ -64,6 +64,7 @@ def main():
 
     # ---- collect hyperparams ------------------------------------------------
     fld = lambda k: field_str(r.fields.get(k))
+    tokens_field = r.fields["tokenizer.ggml.tokens"]
     cfg = {
         "n_layer":   int(fld("qwen3.block_count")),
         "n_embd":    int(fld("qwen3.embedding_length")),
@@ -73,7 +74,7 @@ def main():
         "head_dim":  int(fld("qwen3.attention.key_length")),
         "rope_freq_base": float(fld("qwen3.rope.freq_base")),
         "rms_eps":   float(fld("qwen3.attention.layer_norm_rms_epsilon")),
-        "n_vocab":   151669,
+        "n_vocab":   len(tokens_field.data),
         "eos_token_id":     int(fld("tokenizer.ggml.eos_token_id")),
         "padding_token_id": int(fld("tokenizer.ggml.padding_token_id")),
         "add_bos":   bool(fld("tokenizer.ggml.add_bos_token") or False),
@@ -191,10 +192,7 @@ def main():
             write_tensor(f, by_name["output.weight"], "output.weight", "Q1_0")
 
     # ---- vocab dump --------------------------------------------------------
-    tokens_field = r.fields["tokenizer.ggml.tokens"]
-    n_vocab = len(tokens_field.data)
-    assert n_vocab == cfg["n_vocab"], \
-        f"n_vocab mismatch: gguf has {n_vocab}, cfg has {cfg['n_vocab']}"
+    n_vocab = cfg["n_vocab"]
     vocab_bytes = bytearray()
     offsets = [0]
     for i in tokens_field.data:

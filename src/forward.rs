@@ -129,7 +129,7 @@ fn dispatch_rope(
 ) {
     let p = RopeParams {
         head_dim: cfg.head_dim, n_heads, n_tokens, pos_base,
-        data_offset: data_off, rope_table_offset: 0,
+        data_offset: data_off,
         ..Default::default()
     };
     let off = uniforms.alloc(&p);
@@ -477,9 +477,9 @@ pub(crate) async fn prefill_matmul_topk(
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     if pos_base != 0 {
         // Caller must use prefill_matvec_loop_topk for incremental prefill.
-        return Err(PotError::ContextOverflow {
-            pos: pos_base, n: prompt.len() as u32, max: 0,
-        });
+        return Err(PotError::Config(
+            "prefill_matmul_topk requires pos_base == 0; use prefill_one_at_a_time for incremental prefill",
+        ));
     }
     let m = prompt.len() as u32;
     if m == 0 || m > model.m_max {
@@ -674,7 +674,7 @@ fn rope(model: &Model, cfg: &Config, se: &mut StepEncoder,
         data_off: u32, n_tokens: u32, n_heads: u32, pos_base: u32) {
     let p = RopeParams {
         head_dim: cfg.head_dim, n_heads, n_tokens, pos_base,
-        data_offset: data_off, rope_table_offset: 0,
+        data_offset: data_off,
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);

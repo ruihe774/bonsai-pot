@@ -109,7 +109,7 @@ pub(crate) struct RmsNormParams {
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub(crate) struct RopeParams {
     pub head_dim: u32, pub n_heads: u32, pub n_tokens: u32, pub pos_base: u32,
-    pub data_offset: u32, pub rope_table_offset: u32, pub _p0: u32, pub _p1: u32,
+    pub data_offset: u32, pub _p0: u32, pub _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]

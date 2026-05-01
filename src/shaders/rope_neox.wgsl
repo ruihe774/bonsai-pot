@@ -11,7 +11,6 @@ struct Params {
   n_tokens: u32,
   pos_base: u32,           // first token's position
   data_offset: u32,        // f16 element offset of [n_tokens, n_heads, head_dim]
-  rope_table_offset: u32,  // f16 element offset; per pos: head_dim/2 (cos,sin) pairs = head_dim halves
   _p0: u32, _p1: u32,
 };
 
@@ -31,7 +30,7 @@ fn main(
   let tid = lid.x;
   let base = p.data_offset + (m * p.n_heads + h) * p.head_dim;
   let pos = p.pos_base + m;
-  let cs_base = p.rope_table_offset + pos * p.head_dim;
+  let cs_base = pos * p.head_dim;
   for (var j: u32 = tid; j < half_dim; j += 64u) {
     let c = rope_cs[cs_base + j * 2u];
     let s = rope_cs[cs_base + j * 2u + 1u];

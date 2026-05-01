@@ -153,8 +153,8 @@ impl<'m> Session<'m> {
             }
             let k = effective_k(&opts.sampler);
             let (logits, indices) = forward::step_matvec_topk(self.model, next, self.pos, k).await?;
-            self.pos += 1;
             let chosen = sample_from_topk(&logits, &indices, &opts.sampler, self.pos);
+            self.pos += 1;
             if chosen == stop_id {
                 return Ok(StopReason::Eos);
             }
