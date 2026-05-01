@@ -90,7 +90,8 @@ fn main(
     }
   }
 
-  // 8-lane row-wise reduction via subgroup-shuffle butterfly (see matvec_q1_0).
+  // 8-lane row-wise reduction via subgroup-shuffle butterfly (see matvec_q1_0
+  // for the SG_SIZE / lid-mapping assumptions).
   acc = acc + subgroupShuffleXor(acc, 1u);
   acc = acc + subgroupShuffleXor(acc, 2u);
   acc = acc + subgroupShuffleXor(acc, 4u);

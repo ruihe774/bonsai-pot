@@ -5,11 +5,11 @@ enable f16;
 // dispatch: (n_head, m_tokens, 1).
 //
 // The outer scan over the K/V cache is unrolled by UNROLL=4: each iteration
-// loads four cache positions worth of K, computes four Q·K dots packed into a
-// single vec4<f32> reduction (shared barrier tree), and then runs four
-// sequential online-softmax updates / V accumulations per reduction. This
-// amortizes the workgroupBarrier cost (the dominant overhead at long context)
-// and lets multiple K/V loads stay in flight per barrier wait.
+// loads four cache positions worth of K, computes four Q·K dots packed into
+// one vec4<f32> reduced via a single subgroupAdd (with a templated cross-
+// subgroup merge for SG_SIZE < WG), and then runs four sequential online-
+// softmax updates / V accumulations per reduction. This amortizes the
+// per-iteration reduction cost and keeps multiple K/V loads in flight.
 //
 // K/V cache is Q8_0: per 32 contiguous elements of the kv-row we have one
 // FP32 scale (in the d-section) and 32 packed i8 values (in the qs-section).

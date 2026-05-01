@@ -69,8 +69,8 @@ fn main(
 
   // 8-lane row-wise reduction via subgroup-shuffle butterfly. Local invocation
   // index is `tx + ty*8`, so masks 1/2/4 stay within the current row's tx
-  // bits. Assumes subgroup_size == 64 and the row-major mapping of lid to
-  // subgroup_invocation_id (RDNA wave64).
+  // bits. Requires SG_SIZE >= 8 and the row-major lid → subgroup_invocation_id
+  // mapping (universal on AMD/NVIDIA/Intel/Apple); not specific to wave64.
   acc = acc + subgroupShuffleXor(acc, 1u);
   acc = acc + subgroupShuffleXor(acc, 2u);
   acc = acc + subgroupShuffleXor(acc, 4u);

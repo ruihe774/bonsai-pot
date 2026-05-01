@@ -9,8 +9,9 @@ enable f16;
 // (m, l, o) state for all Q_PER_GROUP=4 Q heads that share this KV head. K and
 // V are loaded once per cache position and reused across the four Q heads.
 // The four Q·K dots are computed in parallel via vec4<f32> packing and reduced
-// in a single `subgroupAdd` (assumes subgroup_size == workgroup_size == 64,
-// i.e. RDNA wave64). No workgroup barriers in the inner loop.
+// through wg_sum_v4 — a subgroupAdd that const-folds to a single instruction
+// when SG_SIZE == WG (e.g. RDNA wave64) and runs a templated cross-subgroup
+// merge otherwise. No workgroup barriers in the inner loop on the fast path.
 //
 // K/V cache is Q8_0: per 32 contiguous elements of the kv-row we have one
 // FP32 scale (in the d-section) and 32 packed i8 values (in the qs-section).
