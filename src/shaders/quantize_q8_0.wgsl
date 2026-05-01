@@ -21,15 +21,37 @@ struct Params {
 @group(0) @binding(1) var<storage, read> x: array<f16>;
 @group(0) @binding(2) var<storage, read_write> outbuf: array<u32>;
 
+const SG_SIZE: u32 = {{SG_SIZE}}u;
 const WG: u32 = 32u;
-var<workgroup> shared_x: array<f32, 32>;
-var<workgroup> shared_amax: array<f32, 32>;
-var<workgroup> packed: array<atomic<u32>, 8>;
+// Ceiling division so that SG_SIZE > WG still yields N_SG = 1 (the WG
+// occupies only part of one subgroup; subgroup ops still reduce correctly
+// over the active lanes).
+const N_SG: u32 = (WG + SG_SIZE - 1u) / SG_SIZE;
+
+var<workgroup> q_sh: array<u32, 32>;
+var<workgroup> sg_amax: array<f32, N_SG>;
+
+fn wg_max(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
+  let sg_m = subgroupMax(local);
+  if (N_SG == 1u) { return sg_m; }
+  let sg_id = tid / SG_SIZE;
+  if (sg_inv_id == 0u) { sg_amax[sg_id] = sg_m; }
+  workgroupBarrier();
+  if (sg_id == 0u) {
+    var combined: f32 = 0.0;
+    if (sg_inv_id < N_SG) { combined = sg_amax[sg_inv_id]; }
+    let final_m = subgroupMax(combined);
+    if (sg_inv_id == 0u) { sg_amax[0] = final_m; }
+  }
+  workgroupBarrier();
+  return sg_amax[0];
+}
 
 @compute @workgroup_size(WG)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_inv_id: u32,
 ) {
   let block_global = wg.y * p.dispatch_x_dim + wg.x;
   let nb_q8 = p.k / 32u;
@@ -40,32 +62,25 @@ fn main(
 
   let in_base = p.input_offset + m_idx * p.k + b_idx * 32u;
   let v = f32(x[in_base + tid]);
-  shared_x[tid] = v;
-  shared_amax[tid] = abs(v);
-  if (tid < 8u) { atomicStore(&packed[tid], 0u); }
-  workgroupBarrier();
 
-  // amax reduction
-  var s: u32 = WG / 2u;
-  while (s > 0u) {
-    if (tid < s) { shared_amax[tid] = max(shared_amax[tid], shared_amax[tid + s]); }
-    workgroupBarrier();
-    s = s / 2u;
-  }
-  let amax = shared_amax[0];
+  let amax = wg_max(abs(v), tid, sg_inv_id);
   let d = amax / 127.0;
   let id_inv = select(0.0, 1.0 / d, d > 0.0);
-  let qv_f = round(shared_x[tid] * id_inv);
-  let qv = u32(i32(clamp(qv_f, -127.0, 127.0))) & 0xFFu;
+  let qv = u32(i32(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
 
-  let pack_idx = tid / 4u;
-  let byte_in_pack = tid % 4u;
-  atomicOr(&packed[pack_idx], qv << (byte_in_pack * 8u));
+  // Pack via shmem: each thread stores its byte; tid 0..7 then assembles
+  // four bytes into one u32 and writes it out.
+  q_sh[tid] = qv;
   workgroupBarrier();
 
   if (tid < 8u) {
+    let base = tid * 4u;
+    let packed = q_sh[base + 0u]
+               | (q_sh[base + 1u] <<  8u)
+               | (q_sh[base + 2u] << 16u)
+               | (q_sh[base + 3u] << 24u);
     let qs_byte = p.qs_offset + m_idx * p.k + b_idx * 32u;
-    outbuf[(qs_byte >> 2u) + tid] = atomicLoad(&packed[tid]);
+    outbuf[(qs_byte >> 2u) + tid] = packed;
   }
   if (tid == 0u) {
     outbuf[(p.d_offset >> 2u) + block_global] = bitcast<u32>(d);

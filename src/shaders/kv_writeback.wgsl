@@ -30,19 +30,53 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> kv_k: array<u32>;
 @group(0) @binding(3) var<storage, read_write> kv_v: array<u32>;
 
+const SG_SIZE: u32 = {{SG_SIZE}}u;
 const WG: u32 = 32u;
+// Ceiling division so that for SG_SIZE > WG we still get N_SG = 1 (the WG
+// occupies only part of one subgroup, but the subgroup op still reduces
+// over the active lanes correctly).
+const N_SG: u32 = (WG + SG_SIZE - 1u) / SG_SIZE;
 
-var<workgroup> sh_k: array<f32, 32>;
-var<workgroup> sh_v: array<f32, 32>;
-var<workgroup> sh_amax_k: array<f32, 32>;
-var<workgroup> sh_amax_v: array<f32, 32>;
-var<workgroup> packed_k: array<atomic<u32>, 8>;
-var<workgroup> packed_v: array<atomic<u32>, 8>;
+// Per-thread quantized bytes (one for K, one for V), packed by tid 0..7.
+var<workgroup> qk_sh: array<u32, 32>;
+var<workgroup> qv_sh: array<u32, 32>;
+// Cross-subgroup partials for the amax reduction; dead-coded when N_SG == 1.
+var<workgroup> sg_amax_k: array<f32, N_SG>;
+var<workgroup> sg_amax_v: array<f32, N_SG>;
+
+fn wg_max2(a: f32, b: f32, tid: u32, sg_inv_id: u32) -> vec2<f32> {
+  let sa = subgroupMax(a);
+  let sb = subgroupMax(b);
+  if (N_SG == 1u) { return vec2<f32>(sa, sb); }
+  let sg_id = tid / SG_SIZE;
+  if (sg_inv_id == 0u) {
+    sg_amax_k[sg_id] = sa;
+    sg_amax_v[sg_id] = sb;
+  }
+  workgroupBarrier();
+  if (sg_id == 0u) {
+    var ca: f32 = 0.0;
+    var cb: f32 = 0.0;
+    if (sg_inv_id < N_SG) {
+      ca = sg_amax_k[sg_inv_id];
+      cb = sg_amax_v[sg_inv_id];
+    }
+    let fa = subgroupMax(ca);
+    let fb = subgroupMax(cb);
+    if (sg_inv_id == 0u) {
+      sg_amax_k[0] = fa;
+      sg_amax_v[0] = fb;
+    }
+  }
+  workgroupBarrier();
+  return vec2<f32>(sg_amax_k[0], sg_amax_v[0]);
+}
 
 @compute @workgroup_size(WG)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_inv_id: u32,
 ) {
   let block_global = wg.y * p.dispatch_x_dim + wg.x;
   let tok = block_global / p.nb_per_row;
@@ -53,50 +87,39 @@ fn main(
   let src_off = tok * p.kv_dim + b * 32u + tid;
   let kv = f32(act[p.k_cur_off + src_off]);
   let vv = f32(act[p.v_cur_off + src_off]);
-  sh_k[tid] = kv;
-  sh_v[tid] = vv;
-  sh_amax_k[tid] = abs(kv);
-  sh_amax_v[tid] = abs(vv);
-  if (tid < 8u) {
-    atomicStore(&packed_k[tid], 0u);
-    atomicStore(&packed_v[tid], 0u);
-  }
-  workgroupBarrier();
 
-  // amax reduction (32 → 1).
-  var s: u32 = WG / 2u;
-  while (s > 0u) {
-    if (tid < s) {
-      sh_amax_k[tid] = max(sh_amax_k[tid], sh_amax_k[tid + s]);
-      sh_amax_v[tid] = max(sh_amax_v[tid], sh_amax_v[tid + s]);
-    }
-    workgroupBarrier();
-    s = s / 2u;
-  }
-  let amax_k = sh_amax_k[0];
-  let amax_v = sh_amax_v[0];
-  let dk = amax_k / 127.0;
-  let dv = amax_v / 127.0;
+  // amax (32 → 1) via subgroup reduction (with cross-subgroup merge if needed).
+  let amax = wg_max2(abs(kv), abs(vv), tid, sg_inv_id);
+  let dk = amax.x / 127.0;
+  let dv = amax.y / 127.0;
   let id_inv_k = select(0.0, 1.0 / dk, dk > 0.0);
   let id_inv_v = select(0.0, 1.0 / dv, dv > 0.0);
-  let qk = u32(i32(clamp(round(sh_k[tid] * id_inv_k), -127.0, 127.0))) & 0xFFu;
-  let qv = u32(i32(clamp(round(sh_v[tid] * id_inv_v), -127.0, 127.0))) & 0xFFu;
+  let qk = u32(i32(clamp(round(kv * id_inv_k), -127.0, 127.0))) & 0xFFu;
+  let qv = u32(i32(clamp(round(vv * id_inv_v), -127.0, 127.0))) & 0xFFu;
 
-  let pack_idx = tid / 4u;
-  let byte_in_pack = tid % 4u;
-  atomicOr(&packed_k[pack_idx], qk << (byte_in_pack * 8u));
-  atomicOr(&packed_v[pack_idx], qv << (byte_in_pack * 8u));
+  // Pack via shmem: each thread stores its byte; tid 0..7 then assembles
+  // four bytes into one u32 and writes it out.
+  qk_sh[tid] = qk;
+  qv_sh[tid] = qv;
   workgroupBarrier();
 
-  // Write the block out.
   let pos = p.pos_base + tok;
-  let block_pos = pos * p.nb_per_row + b;
   if (tid < 8u) {
+    let base = tid * 4u;
+    let pk = qk_sh[base + 0u]
+           | (qk_sh[base + 1u] <<  8u)
+           | (qk_sh[base + 2u] << 16u)
+           | (qk_sh[base + 3u] << 24u);
+    let pv = qv_sh[base + 0u]
+           | (qv_sh[base + 1u] <<  8u)
+           | (qv_sh[base + 2u] << 16u)
+           | (qv_sh[base + 3u] << 24u);
     let qs_byte = p.dst_qs_byte_offset + pos * p.kv_dim + b * 32u;
-    kv_k[(qs_byte >> 2u) + tid] = atomicLoad(&packed_k[tid]);
-    kv_v[(qs_byte >> 2u) + tid] = atomicLoad(&packed_v[tid]);
+    kv_k[(qs_byte >> 2u) + tid] = pk;
+    kv_v[(qs_byte >> 2u) + tid] = pv;
   }
   if (tid == 0u) {
+    let block_pos = pos * p.nb_per_row + b;
     kv_k[p.dst_d_word_offset + block_pos] = bitcast<u32>(dk);
     kv_v[p.dst_d_word_offset + block_pos] = bitcast<u32>(dv);
   }
