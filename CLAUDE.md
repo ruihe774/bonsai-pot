@@ -87,7 +87,7 @@ The hot-path kernel `shaders/matvec_q1_0.wgsl` therefore needs **no multiplicati
 
 The model is run in one of two regimes, selected by the call-site (`forward.rs` has both):
 
-1. **Single-token (matvec) path** — `step_matvec_topk` / `encode_step_matvec` / `layer_pre_kv_in_pass` / `layer_post_kv_in_pass`. Used for **all of `--mode gen`** and for the generation phase of `--mode prompt`. Operates on `m=1` token; uses `matvec_q1_0` and the fused variant. The whole forward step (embed → 36× transformer layers → output_norm → LM head → topk_reduce) is encoded into a few compute passes per step. After the GPU step, the CPU reads back K (default K_MAX=64) candidates from `sample[0..2K]` and performs CPU-side sampling.
+1. **Single-token (matvec) path** — `step_matvec_topk` / `encode_step_matvec` / `layer_pre_kv_in_pass` / `layer_post_kv_in_pass`. Used for **all of `--mode gen`** and for the generation phase of `--mode prompt`. Operates on `m=1` token; uses `matvec_q1_0` and the fused variant. The whole forward step (embed → 36× transformer layers → output_norm → LM head → topk_reduce) is encoded into a few compute passes per step. After the GPU step, the CPU reads back K (default K_MAX=32) candidates from `sample[0..2K]` and performs CPU-side sampling.
 
 2. **Batched-prefill (matmul) path** — `prefill_matmul_topk` / `layer_step_matmul`. Used by `Session::prefill` and the bin's `--mode prompt`. Quantizes activations to Q8_0 (`quantize_q8_0.wgsl`), then uses `dot4I8Packed`-based `matmul_q1_0_q8_0.wgsl` for the projections. Has its own per-token KV-copy choreography: K/V for all M tokens are written to the cache after rope. Requires `pos_base == 0` (assumes a fresh KV cache); for incremental prefill into an existing context, use `Session::prefill_one_at_a_time` (matvec-loop variant).
 
@@ -95,7 +95,7 @@ These two paths use different shaders (`matvec_q1_0*` vs `matmul_q1_0_q8_0`) and
 
 ### Sampling: hybrid GPU top-K → CPU finish
 
-There is no GPU argmax shader. After the LM-head matvec, `topk_reduce.wgsl` (single workgroup, WG=64, K_MAX=64) reduces the full logits array to top-K candidates: each thread maintains a per-thread top-K_MAX min-heap in shmem, then a halving-tree two-pointer merge produces the global top-K. Output: K `f32` logits (descending) followed by K `u32` indices, written to the `sample` buffer.
+There is no GPU argmax shader. After the LM-head matvec, `topk_reduce.wgsl` (single workgroup, WG=64, K_MAX=32) reduces the full logits array to top-K candidates: each thread maintains a per-thread top-K_MAX min-heap in shmem, then a halving-tree two-pointer merge produces the global top-K. Output: K `f32` logits (descending) followed by K `u32` indices, written to the `sample` buffer.
 
 The CPU then reads `sample[0..2K]` back and finishes sampling: temperature scale → softmax → top-p nucleus filter → multinomial via xorshift/SplitMix64 PRNG seeded by `(sampler.seed + pos)`. Implementation in `session.rs::sample_from_topk`. With `temperature == 0.0` this short-circuits to argmax over the K candidates — which is exact, because the global max is always `sample[0]`.
 

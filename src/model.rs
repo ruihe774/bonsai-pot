@@ -163,7 +163,7 @@ pub(crate) struct TopKParams {
 pub(crate) const UNIFORM_SLOT_SIZE: u64 = 256;
 
 /// Maximum K supported by the `topk_reduce` shader (matches `K_MAX` in the WGSL).
-pub const TOPK_MAX: u32 = 64;
+pub const TOPK_MAX: u32 = 32;
 
 // ----- activation layout ----------------------------------------------------
 
