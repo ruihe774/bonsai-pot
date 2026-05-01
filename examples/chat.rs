@@ -41,13 +41,54 @@ struct Args {
     max_new_tokens: u32,
 }
 
+const HELP: &str = "\
+Interactive ChatML REPL for the bonsai-wgpu engine.
+
+USAGE:
+    chat <model_dir> [OPTIONS]
+
+ARGS:
+    <model_dir>            Path to a directory produced by scripts/extract.py
+                           (must contain config.json, weights_*.bin,
+                           vocab.bin, vocab_offsets.bin, merges.txt).
+
+OPTIONS:
+    --bpe <path>           Path to the bpe.py tokenizer script.
+                           [default: scripts/bpe.py]
+    --system <text>        System prompt prepended on the first turn.
+                           [default: \"You are a helpful assistant.\"]
+    --temperature <f>      Sampling temperature; 0.0 ⇒ greedy/argmax.
+                           [default: 0.7]
+    --top-p <p>            Nucleus filter cutoff in (0, 1].
+                           [default: 0.9]
+    --top-k <k>            Truncate to the top-k logits before sampling
+                           (capped at the engine's TOPK_MAX).
+                           [default: 40]
+    --seed <n>             PRNG seed for reproducible sampling.
+                           [default: wallclock-derived]
+    --max-new-tokens <n>   Hard cap on tokens emitted per assistant turn.
+                           [default: 512]
+    -h, --help             Show this help and exit.
+
+REPL COMMANDS:
+    /reset                 Clear the conversation (drop KV cache).
+    /quit, /exit           Exit the chat.
+
+EXAMPLE:
+    cargo run --release --example chat -- ./model
+    cargo run --release --example chat -- ./model --temperature 0.0 \\
+        --system \"You are a terse Rust expert.\"
+";
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
-    let usage = "usage: generate <model_dir> [--bpe path] [--system text] \
-                 [--temperature F] [--top-p P] [--top-k K] [--seed N] \
-                 [--max-new-tokens N]";
+    // Handle -h / --help before requiring a positional model_dir.
+    if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        print!("{HELP}");
+        std::process::exit(0);
+    }
     let model_dir = argv.get(1).map(PathBuf::from).unwrap_or_else(|| {
-        eprintln!("{usage}");
+        eprintln!("error: missing <model_dir>\n\n{HELP}");
         std::process::exit(1);
     });
     let mut a = Args {
@@ -67,7 +108,7 @@ fn parse_args() -> Args {
     while i < argv.len() {
         let val = || {
             argv.get(i + 1).cloned().unwrap_or_else(|| {
-                eprintln!("missing value for {}\n{usage}", argv[i]);
+                eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
                 std::process::exit(1);
             })
         };
@@ -79,7 +120,10 @@ fn parse_args() -> Args {
             "--top-k" => { a.top_k = Some(val().parse().unwrap()); i += 2; }
             "--seed" => { a.seed = val().parse().unwrap(); i += 2; }
             "--max-new-tokens" => { a.max_new_tokens = val().parse().unwrap(); i += 2; }
-            _ => { eprintln!("unknown flag: {}\n{usage}", argv[i]); std::process::exit(1); }
+            _ => {
+                eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
+                std::process::exit(1);
+            }
         }
     }
     a

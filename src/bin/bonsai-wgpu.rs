@@ -28,14 +28,62 @@ struct Args {
     seed: u64,
 }
 
+const HELP: &str = "\
+Demo CLI for the bonsai-wgpu engine.
+
+USAGE:
+    bonsai-wgpu <model_dir> [OPTIONS]
+
+ARGS:
+    <model_dir>            Path to a directory produced by scripts/extract.py.
+
+MODES:
+    --mode gen             (default) Single-token matvec for prefill + generation.
+                           Reads u32 prompt tokens from stdin.
+    --mode prompt          Batched matmul prefill, then matvec generation.
+                           Reads u32 prompt tokens from stdin.
+    --mode bench           Print an llama-bench-style pp/tg t/s table.
+                           No stdin input required.
+    --mode microbench      Per-kernel us/call breakdown for a tg step.
+                           No stdin input required.
+
+GEN/PROMPT OPTIONS:
+    --max-new-tokens <n>   Tokens to generate (incl. the first sampled token).
+                           [default: 32]
+    --temperature <f>      Sampling temperature; 0.0 ⇒ greedy.
+                           [default: 0.0]
+    --top-k <k>            Truncate to top-k logits before sampling.
+                           [default: unset]
+    --top-p <p>            Nucleus filter cutoff in (0, 1].
+                           [default: unset]
+    --seed <n>             PRNG seed for reproducible sampling.
+                           [default: 0]
+
+BENCH OPTIONS:
+    --pp <n>               Prefill batch size for the pp{N} bench row.
+                           [default: 512]
+    --tg <n>               Token-generation length for the tg{N} bench row.
+                           [default: 128]
+    --repeats <n>          Repeat count per bench row.
+                           [default: 5]
+
+OTHER:
+    -h, --help             Show this help and exit.
+
+EXAMPLES:
+    uv run scripts/bpe.py ./model \"Once upon a time\" \\
+        | bonsai-wgpu ./model --mode prompt --max-new-tokens 64
+    bonsai-wgpu ./model --mode bench --pp 512 --tg 128
+";
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
-    let usage = "usage: bonsai-wgpu <model_dir> \
-                 [--mode {gen,prompt,bench,microbench}] \
-                 [--max-new-tokens N] [--pp N] [--tg N] [--repeats N] \
-                 [--temperature F] [--top-k K] [--top-p P] [--seed N]";
+    if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        print!("{HELP}");
+        std::process::exit(0);
+    }
     let model_dir = argv.get(1).map(PathBuf::from).unwrap_or_else(|| {
-        eprintln!("{usage}");
+        eprintln!("error: missing <model_dir>\n\n{HELP}");
         std::process::exit(1);
     });
     let mut a = Args {
@@ -54,7 +102,8 @@ fn parse_args() -> Args {
     let mut i = 2;
     while i < argv.len() {
         let next = || argv.get(i + 1).cloned().unwrap_or_else(|| {
-            eprintln!("{usage}"); std::process::exit(1)
+            eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
+            std::process::exit(1)
         });
         match argv[i].as_str() {
             "--mode" => { a.mode = next(); i += 2; }
@@ -66,7 +115,10 @@ fn parse_args() -> Args {
             "--top-k" => { a.top_k = Some(next().parse().unwrap()); i += 2; }
             "--top-p" => { a.top_p = Some(next().parse().unwrap()); i += 2; }
             "--seed" => { a.seed = next().parse().unwrap(); i += 2; }
-            _ => { eprintln!("{usage}"); std::process::exit(1); }
+            _ => {
+                eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
+                std::process::exit(1);
+            }
         }
     }
     // Mode shortcut: `--mode prompt` ⇒ batched matmul prefill;
