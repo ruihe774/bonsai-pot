@@ -20,7 +20,7 @@
 //!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use bonsai_wgpu::{Model, Sampler};
+use bonsai_wgpu::{BonsaiError, Model, ModelOptions, Sampler};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,6 +39,7 @@ struct Args {
     top_k: Option<u32>,
     seed: u64,
     max_new_tokens: u32,
+    max_seq: u32,
 }
 
 const HELP: &str = "\
@@ -68,6 +69,10 @@ OPTIONS:
                            [default: wallclock-derived]
     --max-new-tokens <n>   Hard cap on tokens emitted per assistant turn.
                            [default: 512]
+    --max-seq <n>          KV-cache capacity (positions). Sets the upper
+                           bound on prompt + generated tokens across the
+                           whole conversation; raising it linearly grows
+                           VRAM use. [default: 1024]
     -h, --help             Show this help and exit.
 
 REPL COMMANDS:
@@ -103,6 +108,7 @@ fn parse_args() -> Args {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0),
         max_new_tokens: 512,
+        max_seq: 1024,
     };
     let mut i = 2;
     while i < argv.len() {
@@ -120,6 +126,7 @@ fn parse_args() -> Args {
             "--top-k" => { a.top_k = Some(val().parse().unwrap()); i += 2; }
             "--seed" => { a.seed = val().parse().unwrap(); i += 2; }
             "--max-new-tokens" => { a.max_new_tokens = val().parse().unwrap(); i += 2; }
+            "--max-seq" => { a.max_seq = val().parse().unwrap(); i += 2; }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 std::process::exit(1);
@@ -163,7 +170,10 @@ fn main() {
 
     pollster::block_on(async move {
         eprintln!("loading model from {}…", args.model_dir.display());
-        let model = Model::load(&args.model_dir).await.expect("load model");
+        let model = Model::load_with_options(
+            &args.model_dir,
+            ModelOptions { max_seq: args.max_seq },
+        ).await.expect("load model");
         let sampler = Sampler {
             temperature: args.temperature,
             top_k: args.top_k,
@@ -230,13 +240,28 @@ fn main() {
 
             write!(stdout, "Assistant: ").ok();
             stdout.flush().ok();
+            let mut hit_overflow = false;
             for _ in 0..args.max_new_tokens {
                 if next == IM_END || next == ENDOFTEXT { break; }
                 stdout.write_all(&model.decode_token(next)).ok();
                 stdout.flush().ok();
-                next = sess.step(next, &sampler).await.expect("step");
+                match sess.step(next, &sampler).await {
+                    Ok(t) => next = t,
+                    Err(BonsaiError::ContextOverflow { .. }) => {
+                        hit_overflow = true;
+                        break;
+                    }
+                    Err(e) => panic!("step: {e}"),
+                }
             }
             writeln!(stdout).ok();
+            if hit_overflow {
+                writeln!(
+                    stdout,
+                    "(context full at {} tokens — use /reset to start a new conversation)",
+                    sess.pos(),
+                ).ok();
+            }
             turn += 1;
         }
     });

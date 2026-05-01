@@ -13,6 +13,7 @@ pub enum BonsaiError {
     BufferMap(wgpu::BufferAsyncError),
     ContextOverflow { pos: u32, n: u32, max: u32 },
     PrefillTooLarge { n: u32, max: u32 },
+    Config(&'static str),
 }
 
 impl fmt::Display for BonsaiError {
@@ -29,6 +30,7 @@ impl fmt::Display for BonsaiError {
             BufferMap(e) => write!(f, "buffer mapping failed: {e:?}"),
             ContextOverflow { pos, n, max } => write!(f, "context overflow: pos {pos} + tokens {n} > max_seq {max}"),
             PrefillTooLarge { n, max } => write!(f, "prefill batch {n} exceeds max_prefill_tokens {max}"),
+            Config(msg) => write!(f, "invalid config: {msg}"),
         }
     }
 }

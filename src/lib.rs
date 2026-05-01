@@ -29,7 +29,7 @@ mod model;
 mod session;
 
 pub use error::{BonsaiError, Result};
-pub use model::{Model, ModelConfig, TOPK_MAX};
+pub use model::{Model, ModelConfig, ModelOptions, TOPK_MAX};
 pub use session::{GenerateOptions, Sampler, Session, StopReason};
 
 /// Bench / microbench helpers, exposed only with the `bench-internals` feature.

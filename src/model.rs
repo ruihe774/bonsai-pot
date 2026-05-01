@@ -260,15 +260,46 @@ pub struct Model {
 }
 
 const M_MAX: u32 = 512;
-const MAX_SEQ: u32 = 1024;
+const DEFAULT_MAX_SEQ: u32 = 1024;
 const UNIFORM_POOL_SLOTS: u64 = 65536;
 
+/// Allocate-time tunables for [`Model::load_with_options`].
+///
+/// These affect GPU buffer sizing (KV cache, RoPE table) and so cannot be
+/// changed per call — pick them once at load.
+#[derive(Debug, Clone)]
+pub struct ModelOptions {
+    /// Maximum sequence length (positions in the KV cache). Default: 1024.
+    ///
+    /// VRAM cost is linear: KV cache uses
+    /// `n_layer * max_seq * kv_dim * 2 bytes * 2` (K and V combined). The
+    /// RoPE table grows as `max_seq * head_dim * 2 bytes`. The shaders
+    /// themselves don't bake in a sequence-length limit, so any value up to
+    /// the model's `context_length` is supported (subject to VRAM).
+    pub max_seq: u32,
+}
+
+impl Default for ModelOptions {
+    fn default() -> Self {
+        Self { max_seq: DEFAULT_MAX_SEQ }
+    }
+}
+
 impl Model {
+    /// Load weights with default options. Equivalent to
+    /// [`Model::load_with_options`] with `ModelOptions::default()`.
+    pub async fn load(model_dir: &Path) -> Result<Self> {
+        Self::load_with_options(model_dir, ModelOptions::default()).await
+    }
+
     /// Load weights, build pipelines, allocate the KV cache. Reads
     /// `config.json`, `weights_*.bin`, `vocab.bin`, and `vocab_offsets.bin` from
     /// `model_dir`. Does **not** read `prompt.bin` — callers supply
     /// pre-tokenized prompts via [`crate::Session`].
-    pub async fn load(model_dir: &Path) -> Result<Self> {
+    pub async fn load_with_options(model_dir: &Path, opts: ModelOptions) -> Result<Self> {
+        if opts.max_seq == 0 {
+            return Err(BonsaiError::Config("max_seq must be > 0"));
+        }
         let cfg_path = model_dir.join("config.json");
         let cfg_text = std::fs::read_to_string(&cfg_path)
             .map_err(|e| BonsaiError::Io { path: cfg_path.clone(), source: e })?;
@@ -330,13 +361,13 @@ impl Model {
         let w_embed  = make_storage("w_embed",  &load("weights_embed_lmhead.bin")?);
 
         // ---- build RoPE table (f32 host-side, then downcast to f16) --------
-        let rope_table_f32 = build_rope_table(&cfg, MAX_SEQ);
+        let rope_table_f32 = build_rope_table(&cfg, opts.max_seq);
         let rope_table_f16: Vec<half::f16> =
             rope_table_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
         let rope_buf = make_storage("rope_table", bytemuck::cast_slice(&rope_table_f16));
 
         // ---- KV cache, activations, scratch --------------------------------
-        let kv_per_layer: u64 = MAX_SEQ as u64 * cfg.kv_dim as u64;
+        let kv_per_layer: u64 = opts.max_seq as u64 * cfg.kv_dim as u64;
         let kv_total: u64 = kv_per_layer * cfg.n_layer as u64 * std::mem::size_of::<half::f16>() as u64;
         let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_k"), size: kv_total,
@@ -508,7 +539,8 @@ impl Model {
 
         Ok(Self {
             device, queue, cfg, public_cfg, act_layout,
-            m_max: M_MAX, max_seq: MAX_SEQ,
+            m_max: M_MAX,
+            max_seq: opts.max_seq,
             buffers, pipes, bgls, vocab,
         })
     }
