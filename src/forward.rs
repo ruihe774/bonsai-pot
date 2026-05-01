@@ -40,6 +40,9 @@ impl UniformPool {
     fn new() -> Self {
         Self { cpu: Vec::with_capacity(64 * 1024), next_slot: 0 }
     }
+    fn remaining_slots(&self) -> u64 {
+        UNIFORM_POOL_SLOTS.saturating_sub(self.next_slot)
+    }
     fn alloc<T: Pod>(&mut self, params: &T) -> u32 {
         let slot = self.next_slot;
         assert!(
@@ -277,6 +280,16 @@ async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32
 
 // ---------- single-token forward (matvec) ----------------------------------
 
+/// Number of uniform slots `encode_step_matvec` allocates for one step.
+/// Used by `prefill_matvec_loop_topk` to decide when to flush the encoder so
+/// the uniform pool doesn't overflow on long incremental prefills.
+fn encode_step_matvec_slots(cfg: &Config) -> u64 {
+    // 1 embed + 13 per layer (rms, qkv_fused, q_norm, k_norm, rope_q, rope_k,
+    // kv_writeback, attn, Wo, ffn_norm, gate_up_fused, silu_mul, Wd) +
+    // 3 suffix (output rms, LM head, topk).
+    1 + 13 * cfg.n_layer as u64 + 3
+}
+
 /// Encode one tg step into the given encoder. The input token is read from
 /// `sample[sample_in]`. The final `topk_reduce` writes K f32 logits at
 /// `sample[topk_out_u32_base..+K]` and K u32 indices at
@@ -454,8 +467,20 @@ pub(crate) async fn prefill_matvec_loop_topk(
         // `TOPK_SCRATCH_BASE = 768` is well clear of any prompt tokens).
         const TOPK_SCRATCH_BASE: u32 = 768;
         model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(rest));
+        // `encode_step_matvec` allocates a fixed number of uniform slots per
+        // step (one for embed + 13 per transformer layer + 3 for the output
+        // suffix). The 1 MiB pool fits ~8 steps for Bonsai-4B, so for any
+        // prefill longer than that we have to split the work into multiple
+        // submits — KV-cache writes from a previous submit are visible to the
+        // next one's attention reads.
+        let slots_per_step = encode_step_matvec_slots(&model.cfg);
         let mut se = StepEncoder::new(model);
         for t in 0..rest.len() {
+            if se.uniforms.remaining_slots() < slots_per_step {
+                let cb = se.finish();
+                model.queue.submit(Some(cb));
+                se = StepEncoder::new(model);
+            }
             encode_step_matvec(
                 &mut se, &model.cfg,
                 /*sample_in=*/ t as u32,
