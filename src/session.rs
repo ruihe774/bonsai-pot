@@ -81,6 +81,11 @@ impl<'m> Session<'m> {
     /// a fresh KV cache. For incremental prefill into an existing context, use
     /// [`prefill_one_at_a_time`](Self::prefill_one_at_a_time).
     pub async fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
+        if self.pos != 0 {
+            return Err(PotError::Config(
+                "Session::prefill requires pos == 0; use prefill_one_at_a_time for incremental prefill",
+            ));
+        }
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
             return Err(PotError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
