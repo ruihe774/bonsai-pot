@@ -34,7 +34,7 @@ cargo run --release --features bench-internals -- ./model --mode microbench
 
 `<model_dir>` is the output of `scripts/extract.py` (default `./model`). It must contain `config.json`, the five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and (for the tokenizer) `merges.txt`. The runtime no longer reads `prompt.bin`; prompts come in over stdin from `scripts/bpe.py`.
 
-There is no separate test suite — `--mode gen` / `--mode prompt` plus parity diffs against captured baselines (and `examples/generate.rs`) are the correctness harness.
+There is no separate test suite — `--mode gen` / `--mode prompt` plus parity diffs against captured baselines (and `examples/chat.rs`) are the correctness harness.
 
 - `--mode gen` (default): single-token matvec path for both prompt and generation (multiply-free Q1_0 hot path).
 - `--mode prompt`: batched dot4I8Packed matmul prefill (with a Q8_0 activation quantize pre-pass), then matvec for generation.
@@ -59,7 +59,7 @@ uv run scripts/bpe.py ./model "Once upon a time" --out ./model/prompt.bin
 uv run scripts/bpe.py ./model "Once upon a time" | cargo run ...
 ```
 
-`scripts/bpe.py` depends only on the `regex` package (for `\p{L}` / `\p{N}` in the Qwen2 pretokenizer regex) — no `gguf`, no GPU, no compilation. It reads `vocab.bin` / `vocab_offsets.bin` / `merges.txt` from the model dir. Dependencies are declared inline in PEP 723 format and resolved automatically by `uv run`.
+`scripts/bpe.py` depends only on the `regex` package (for `\p{L}` / `\p{N}` in the Qwen2 pretokenizer regex) — no `gguf`, no GPU, no compilation. It reads `vocab.bin` / `vocab_offsets.bin` / `merges.txt` from the model dir. Dependencies are declared inline in PEP 723 format and resolved automatically by `uv run`. By default it splits the input on `<|...|>` literals that exist in the vocab (e.g. `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`) and emits each as its atomic token id, so ChatML-rendered prompts round-trip correctly. Pass `--no-specials` to byte-level-encode them instead.
 
 ## Architecture
 
@@ -73,7 +73,7 @@ uv run scripts/bpe.py ./model "Once upon a time" | cargo run ...
 - `src/decode.rs` — inverse of GPT-2 byte-level vocab encoding (codepoint → raw byte), used by `Model::decode_token`.
 - `src/bin/bonsai-wgpu.rs` — demo CLI on top of the public lib API. Argv parsing, stdin u32 reader, sampler construction, calls into `Session`. Routes `--mode bench`/`microbench` to `bonsai_wgpu::__bench` (only available when built with `--features bench-internals`).
 - `src/shaders/*.wgsl` — one shader per kernel kind. The matvec/matmul shaders are the two perf-critical ones; `topk_reduce.wgsl` is the new sampler-helper kernel.
-- `examples/generate.rs` — minimal end-to-end example using only the public library API.
+- `examples/chat.rs` — interactive ChatML REPL built on the public library API. Renders the Qwen-style `<|im_start|>...<|im_end|>` chat template per turn, shells out to `scripts/bpe.py` for tokenization, batched-matmul prefills the first turn (`pos==0`) and matvec-loop prefills subsequent turns, then streams generation with `Session::step` until `<|im_end|>`. Persists KV state across turns; `/reset` clears it. Demonstrates that out-of-process tokenization is fast enough for an interactive UX (subprocess startup is ~tens of ms vs. seconds of GPU work).
 - `scripts/extract.py` — GGUF → flat-file converter. Writes weights + vocab + merges + config.
 - `scripts/bpe.py` — standalone BPE encoder; reads model dir, writes u32 token IDs.
 

@@ -27,7 +27,7 @@ This script implements the GPT-2 byte-level BPE used by Qwen2 tokenizers, with
 Qwen2's pre-tokenizer regex from llama.cpp's qwen2 vocab branch. It does NOT
 depend on `gguf` or any GPU code — pure Python + the `regex` package.
 """
-import argparse, os, struct, sys
+import argparse, os, re, struct, sys
 import regex as re_u
 
 
@@ -58,6 +58,26 @@ QWEN2_PRETOK_RE = re_u.compile(
     r"\s+(?!\S)|"
     r"\s+"
 )
+
+
+# `<|...|>` literals that exist in the vocab (e.g. `<|im_start|>`,
+# `<|im_end|>`, `<|endoftext|>`). Treat each as an atomic token rather than
+# byte-level-BPE-ing it; this is what every instruction-tuned model expects.
+SPECIAL_RE = re.compile(r"<\|[^|>\s]+?\|>")
+
+
+def split_on_specials(text, vocab):
+    """Yield (kind, payload) where kind is 'text' (str) or 'special' (token id)."""
+    pos = 0
+    for m in SPECIAL_RE.finditer(text):
+        s = m.group(0)
+        if s in vocab:
+            if m.start() > pos:
+                yield ("text", text[pos:m.start()])
+            yield ("special", vocab[s])
+            pos = m.end()
+    if pos < len(text):
+        yield ("text", text[pos:])
 
 
 def bpe_encode(text, vocab, merges_rank):
@@ -154,6 +174,11 @@ def main():
                     help="write u32 bytes to this file (default: stdout)")
     ap.add_argument("--print-ids", action="store_true",
                     help="also print decoded token ids to stderr")
+    ap.add_argument("--no-specials", action="store_true",
+                    help="byte-level-encode `<|...|>` literals instead of "
+                         "emitting them as their atomic vocab IDs (default: "
+                         "split on specials so the chat template renders "
+                         "correctly).")
     args = ap.parse_args()
 
     if args.prompt is None:
@@ -170,7 +195,15 @@ def main():
     vocab = load_vocab(args.model_dir)
     merges = load_merges(args.model_dir)
 
-    ids = bpe_encode(text, vocab, merges)
+    if args.no_specials:
+        ids = bpe_encode(text, vocab, merges)
+    else:
+        ids = []
+        for kind, payload in split_on_specials(text, vocab):
+            if kind == "special":
+                ids.append(payload)
+            else:
+                ids.extend(bpe_encode(payload, vocab, merges))
     payload = struct.pack(f"<{len(ids)}I", *ids)
 
     if args.out:
