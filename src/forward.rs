@@ -371,7 +371,7 @@ fn layer_step_matvec(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     se.encoder.copy_buffer_to_buffer(&model.buffers.act, k_src_bytes, &model.buffers.kv_k, dst_offset_bytes, cache_row_bytes);
     se.encoder.copy_buffer_to_buffer(&model.buffers.act, v_src_bytes, &model.buffers.kv_v, dst_offset_bytes, cache_row_bytes);
 
-    // 2f. Attention
+    // 2f. Attention (single-token gen path: m_tokens=1, is_prefill=0, pos=pos+1)
     {
         let p = AttnParams {
             head_dim: cfg.head_dim, n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
@@ -382,7 +382,7 @@ fn layer_step_matvec(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
             v_cache_offset: ((layer_offset_bytes / 4) as u32),
             out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-            ..Default::default()
+            m_tokens: 1, is_prefill: 0,
         };
         let off = se.alloc_uniform(&p);
         let bg = make_bg(model, &model.bgls.attn, "attn_bg", std::mem::size_of::<AttnParams>() as u64,
@@ -515,10 +515,12 @@ async fn prefill_matmul(model: &mut Model, cfg: &Config, prompt: &[u32]) -> u32 
         model.queue.submit(Some(cb));
     }
 
-    // ---- 2. Per-layer transformer using matmul -----------------------------
-    for il in 0..cfg.n_layer {
+    // ---- 2. Per-layer transformer using matmul (one CB for all layers) ----
+    {
         let mut se = StepEncoder::new(model);
-        layer_step_matmul(model, cfg, &mut se, il, m);
+        for il in 0..cfg.n_layer {
+            layer_step_matmul(model, cfg, &mut se, il, m);
+        }
         let cb = se.finish();
         model.queue.submit(Some(cb));
     }
@@ -607,18 +609,18 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.v_cur * 4) as u64,
                                      &model.buffers.kv_v, layer_offset_bytes, total_bytes);
 
-    // 7. Attention per token (M dispatches)
-    for mi in 0..m {
+    // 7. Attention: single batched dispatch of (n_head, M) WGs.
+    {
         let p = AttnParams {
             head_dim: cfg.head_dim, n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
-            pos: mi + 1,
+            pos: 0,                  // unused when is_prefill=1
             kv_stride: cfg.kv_dim,
-            q_offset: model.act_layout.q + mi * cfg.q_dim,
+            q_offset: model.act_layout.q,
             k_cache_offset: ((layer_offset_bytes / 4) as u32),
             v_cache_offset: ((layer_offset_bytes / 4) as u32),
-            out_offset: model.act_layout.attn_out + mi * cfg.q_dim,
+            out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-            ..Default::default()
+            m_tokens: m, is_prefill: 1,
         };
         let off = se.alloc_uniform(&p);
         let bg = make_bg(model, &model.bgls.attn, "attn_bg", std::mem::size_of::<AttnParams>() as u64,
@@ -626,7 +628,7 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("attn"), timestamp_writes: None });
         cp.set_pipeline(&model.pipes.attention);
         cp.set_bind_group(0, &bg, &[off]);
-        cp.dispatch_workgroups(cfg.n_head, 1, 1);
+        cp.dispatch_workgroups(cfg.n_head, m, 1);
     }
 
     // 8. Quantize attn_out then Wo with residual add
@@ -727,5 +729,5 @@ fn matmul_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("matmul"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.matmul);
     cp.set_bind_group(0, &bg, &[off]);
-    cp.dispatch_workgroups((n + 7) / 8, (m + 7) / 8, 1);
+    cp.dispatch_workgroups((n + 63) / 64, (m + 63) / 64, 1);
 }

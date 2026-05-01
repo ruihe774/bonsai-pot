@@ -97,7 +97,7 @@ pub struct MatmulParams {
 pub struct AttnParams {
     pub head_dim: u32, pub n_head: u32, pub n_kv_head: u32, pub pos: u32,
     pub kv_stride: u32, pub q_offset: u32, pub k_cache_offset: u32, pub v_cache_offset: u32,
-    pub out_offset: u32, pub scale: f32, pub _p0: u32, pub _p1: u32,
+    pub out_offset: u32, pub scale: f32, pub m_tokens: u32, pub is_prefill: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
