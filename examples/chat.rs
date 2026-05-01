@@ -1,7 +1,7 @@
 //! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
 //! Bonsai-4B is an instruction-tuned model, so we render each turn into the
-//! Qwen-style ChatML template (`<|im_start|>...<|im_end|>`), shell out to
+//! Qwen-style `ChatML` template (`<|im_start|>...<|im_end|>`), shell out to
 //! `scripts/bpe.py` for tokenization, prefill, and stream the assistant's
 //! reply token-by-token. Multi-turn conversation is preserved across the
 //! `Session`'s KV cache.
@@ -21,9 +21,13 @@
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
 use bonsai_pot::{PotError, KvSnapshot, Model, ModelOptions, Sampler};
-use std::io::Write;
+use std::env;
+use std::fmt::Display;
+use std::io::{stdin, stdout, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{exit, Command, Stdio};
+use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Args {
     model_dir: PathBuf,
@@ -81,25 +85,26 @@ EXAMPLE:
         --system \"You are a terse Rust expert.\"
 ";
 
-fn parse_or_die<T: std::str::FromStr>(flag: &str, raw: &str) -> T
-where T::Err: std::fmt::Display {
+fn parse_or_die<T: FromStr>(flag: &str, raw: &str) -> T
+where T::Err: Display {
     raw.parse::<T>().unwrap_or_else(|e| {
         eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
-        std::process::exit(1);
+        exit(1);
     })
 }
 
 fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = env::args().collect();
     // Handle -h / --help before requiring a positional model_dir.
     if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
-        std::process::exit(0);
+        exit(0);
     }
-    let model_dir = argv.get(1).map(PathBuf::from).unwrap_or_else(|| {
+    let Some(model_dir_arg) = argv.get(1) else {
         eprintln!("error: missing <model_dir>\n\n{HELP}");
-        std::process::exit(1);
-    });
+        exit(1);
+    };
+    let model_dir = PathBuf::from(model_dir_arg);
     let mut a = Args {
         model_dir,
         bpe: "scripts/bpe.py".into(),
@@ -107,10 +112,9 @@ fn parse_args() -> Args {
         temperature: 0.7,
         top_p: Some(0.9),
         top_k: Some(40),
-        seed: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0),
+        seed: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64),
         max_new_tokens: 512,
         max_seq: 1024,
     };
@@ -119,7 +123,7 @@ fn parse_args() -> Args {
         let val = || {
             argv.get(i + 1).cloned().unwrap_or_else(|| {
                 eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
-                std::process::exit(1);
+                exit(1);
             })
         };
         match argv[i].as_str() {
@@ -133,7 +137,7 @@ fn parse_args() -> Args {
             "--max-seq" => { a.max_seq = parse_or_die("--max-seq", &val()); i += 2; }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
-                std::process::exit(1);
+                exit(1);
             }
         }
     }
@@ -154,17 +158,16 @@ fn tokenize(bpe: &str, model_dir: &Path, text: &str) -> Vec<u32> {
         .expect("failed to spawn bpe.py — is `uv` on PATH?");
     if !out.status.success() {
         eprintln!("bpe.py exited with status {}", out.status);
-        std::process::exit(2);
+        exit(2);
     }
     bytemuck::cast_slice(&out.stdout).to_vec()
 }
 
 fn read_user_line() -> Option<String> {
     let mut s = String::new();
-    match std::io::stdin().read_line(&mut s) {
-        Ok(0) => None, // EOF
-        Ok(_) => Some(s.trim_end_matches(['\n', '\r']).to_string()),
-        Err(_) => None,
+    match stdin().read_line(&mut s) {
+        Ok(n) if n > 0 => Some(s.trim_end_matches(['\n', '\r']).to_string()),
+        _ => None, // EOF or error
     }
 }
 
@@ -182,11 +185,11 @@ fn main() {
         ).await.expect("load model");
         let im_end = model.token_id("<|im_end|>").unwrap_or_else(|| {
             eprintln!("error: vocab missing <|im_end|>");
-            std::process::exit(2);
+            exit(2);
         });
         let endoftext = model.token_id("<|endoftext|>").unwrap_or_else(|| {
             eprintln!("error: vocab missing <|endoftext|>");
-            std::process::exit(2);
+            exit(2);
         });
         let sampler = Sampler {
             temperature: args.temperature,
@@ -195,7 +198,7 @@ fn main() {
             seed: args.seed,
         };
         let mut sess = model.new_session();
-        let mut stdout = std::io::stdout().lock();
+        let mut stdout = stdout().lock();
 
         // Prefill the system prompt once with the fast batched-matmul path
         // (requires pos == 0), then snapshot the KV state. /reset restores
@@ -218,9 +221,9 @@ fn main() {
         loop {
             write!(stdout, "\nYou: ").ok();
             stdout.flush().ok();
-            let user = match read_user_line() {
-                Some(l) => l,
-                None => { writeln!(stdout).ok(); break; }
+            let Some(user) = read_user_line() else {
+                writeln!(stdout).ok();
+                break;
             };
             let user = user.trim();
             if user.is_empty() { continue; }
@@ -239,16 +242,14 @@ fn main() {
             // (generation stops before that token enters the KV cache).
             let segment = if turn == 0 {
                 format!(
-                    "<|im_start|>user\n{}<|im_end|>\n\
-                     <|im_start|>assistant\n",
-                    user,
+                    "<|im_start|>user\n{user}<|im_end|>\n\
+                     <|im_start|>assistant\n"
                 )
             } else {
                 format!(
                     "<|im_end|>\n\
-                     <|im_start|>user\n{}<|im_end|>\n\
-                     <|im_start|>assistant\n",
-                    user,
+                     <|im_start|>user\n{user}<|im_end|>\n\
+                     <|im_start|>assistant\n"
                 )
             };
             let tokens = tokenize(&args.bpe, &args.model_dir, &segment);

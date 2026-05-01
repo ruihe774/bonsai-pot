@@ -1,22 +1,28 @@
-//! Bonsai-4B (Qwen3 architecture) Q1_0 inference: model loading & GPU resource setup.
+//! Bonsai-4B (Qwen3 architecture) `Q1_0` inference: model loading & GPU resource setup.
 //!
 //! All large weights live in 5 storage buffers organized by role; the activation
 //! workspace is a single f16 buffer with named regions plus a separate buffer for
-//! Q8_0 activations (used by the dot4I8Packed matmul path). Norm weights and the
-//! RoPE cos/sin table are also f16; Q8_0 scales remain f32.
+//! `Q8_0` activations (used by the `dot4I8Packed` matmul path). Norm weights and the
+//! `RoPE` cos/sin table are also f16; `Q8_0` scales remain f32.
 
+use crate::decode;
 use crate::error::{PotError, Result};
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{Pod, Zeroable, cast_slice};
+use futures_intrusive::channel::shared::oneshot_channel;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::mem::size_of;
+use std::fs::{read, read_to_string};
+use std::num::NonZeroU64;
 use std::path::Path;
+use std::str::from_utf8;
 use wgpu::util::DeviceExt;
 
 // ----- config & manifest ----------------------------------------------------
 
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
-pub(crate) struct TensorEntry {
+pub struct TensorEntry {
     pub dtype: String,
     pub shape: Vec<u64>,
     pub buffer: String,
@@ -30,7 +36,7 @@ pub(crate) struct TensorEntry {
 /// Internal config: the full struct deserialized from `config.json`.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
-pub(crate) struct ConfigRaw {
+pub struct ConfigRaw {
     pub n_layer: u32,
     pub n_embd: u32,
     pub n_ff: u32,
@@ -55,7 +61,7 @@ pub(crate) struct ConfigRaw {
 // Internal alias for the full config — most code uses this name and reaches the
 // fields directly. Kept as `Config` so existing call sites are minimally
 // disturbed.
-pub(crate) type Config = ConfigRaw;
+pub type Config = ConfigRaw;
 
 /// Public, read-only view of the model's hyperparameters. Stable for the
 /// library API; does not expose the GGUF tensor manifest or any other internal
@@ -75,7 +81,7 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    fn from_raw(c: &ConfigRaw) -> Self {
+    const fn from_raw(c: &ConfigRaw) -> Self {
         Self {
             n_layer: c.n_layer,
             n_embd: c.n_embd,
@@ -95,31 +101,31 @@ impl ModelConfig {
 
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct EmbedParams {
+pub struct EmbedParams {
     pub k: u32, pub d_offset: u32, pub qs_offset: u32, pub output_offset: u32,
     pub sample_offset: u32, pub _p0: u32, pub _p1: u32, pub _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct RmsNormParams {
+pub struct RmsNormParams {
     pub group_size: u32, pub n_groups: u32, pub input_offset: u32, pub output_offset: u32,
     pub weight_offset: u32, pub eps: f32, pub _p0: u32, pub _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct RopeParams {
+pub struct RopeParams {
     pub head_dim: u32, pub n_heads: u32, pub n_tokens: u32, pub pos_base: u32,
     pub data_offset: u32, pub _p0: u32, pub _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct MatvecParams {
+pub struct MatvecParams {
     pub k: u32, pub n: u32, pub d_offset: u32, pub qs_offset: u32,
     pub input_offset: u32, pub output_offset: u32, pub accumulate: u32, pub dispatch_x_dim: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct MatvecFusedParams {
+pub struct MatvecFusedParams {
     pub k: u32, pub n_total: u32, pub input_offset: u32, pub dispatch_x_dim: u32,
     pub d_offset_0: u32, pub qs_offset_0: u32, pub n_0: u32, pub output_offset_0: u32,
     pub d_offset_1: u32, pub qs_offset_1: u32, pub n_1: u32, pub output_offset_1: u32,
@@ -127,13 +133,13 @@ pub(crate) struct MatvecFusedParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct QuantParams {
+pub struct QuantParams {
     pub k: u32, pub m: u32, pub input_offset: u32, pub d_offset: u32,
     pub qs_offset: u32, pub dispatch_x_dim: u32, pub _p1: u32, pub _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct MatmulParams {
+pub struct MatmulParams {
     pub k: u32, pub n: u32, pub m: u32,
     pub w_d_offset: u32, pub w_qs_offset: u32,
     pub a_d_offset: u32, pub a_qs_offset: u32,
@@ -142,7 +148,7 @@ pub(crate) struct MatmulParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct AttnParams {
+pub struct AttnParams {
     pub head_dim: u32, pub n_head: u32, pub n_kv_head: u32, pub pos: u32,
     pub kv_stride: u32, pub q_offset: u32,
     pub k_d_word_offset: u32, pub k_qs_byte_offset: u32,
@@ -151,7 +157,7 @@ pub(crate) struct AttnParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct AttnSplitParams {
+pub struct AttnSplitParams {
     pub head_dim: u32, pub n_head: u32, pub n_kv_head: u32, pub pos: u32,
     pub kv_stride: u32, pub q_offset: u32,
     pub k_d_word_offset: u32, pub k_qs_byte_offset: u32,
@@ -160,24 +166,24 @@ pub(crate) struct AttnSplitParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct AttnMergeParams {
+pub struct AttnMergeParams {
     pub head_dim: u32, pub n_head: u32, pub out_offset: u32, pub n_chunks_active: u32,
     pub _p0: u32, pub _p1: u32, pub _p2: u32, pub _p3: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct SiluMulParams {
+pub struct SiluMulParams {
     pub n: u32, pub m: u32, pub gate_offset: u32, pub up_offset: u32,
     pub out_offset: u32, pub dispatch_x_count: u32, pub _p1: u32, pub _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct TopKParams {
+pub struct TopKParams {
     pub n: u32, pub in_offset: u32, pub out_offset: u32, pub k: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub(crate) struct KvWritebackParams {
+pub struct KvWritebackParams {
     pub k_cur_off: u32,           // f16 element offset in act
     pub v_cur_off: u32,           // f16 element offset in act
     pub dst_d_word_offset: u32,   // u32-word offset into kv_{k,v} (FP32 d-section, layer base)
@@ -189,7 +195,7 @@ pub(crate) struct KvWritebackParams {
 }
 
 // All of these <= 64 bytes; we pack each into a 256-byte uniform slot.
-pub(crate) const UNIFORM_SLOT_SIZE: u64 = 256;
+pub const UNIFORM_SLOT_SIZE: u64 = 256;
 
 /// Maximum K supported by the `topk_reduce` shader (matches `K_MAX` in the WGSL).
 pub const TOPK_MAX: u32 = 32;
@@ -200,7 +206,7 @@ pub const TOPK_MAX: u32 = 32;
 /// **element offsets** (count of f16 elements from the buffer's start), to
 /// match the shader-side `array<f16>` indexing — never bytes.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct ActLayout {
+pub struct ActLayout {
     pub x: u32, pub x_norm: u32,
     pub q: u32, pub k_cur: u32, pub v_cur: u32,
     pub attn_out: u32,
@@ -229,7 +235,7 @@ impl ActLayout {
 
 // ----- the model ------------------------------------------------------------
 
-pub(crate) struct Pipelines {
+pub struct Pipelines {
     pub embed: wgpu::ComputePipeline,
     pub rms_norm: wgpu::ComputePipeline,
     pub rope_neox: wgpu::ComputePipeline,
@@ -245,7 +251,7 @@ pub(crate) struct Pipelines {
     pub kv_writeback: wgpu::ComputePipeline,
 }
 
-pub(crate) struct Buffers {
+pub struct Buffers {
     pub w_attn: wgpu::Buffer,
     pub w_ffn_gu: wgpu::Buffer,
     pub w_ffn_d: wgpu::Buffer,
@@ -262,7 +268,7 @@ pub(crate) struct Buffers {
     pub readback: wgpu::Buffer,   // u32 readback (mappable)
 }
 
-pub(crate) struct BindGroupLayouts {
+pub struct BindGroupLayouts {
     pub embed:    wgpu::BindGroupLayout,
     pub rms_norm: wgpu::BindGroupLayout,
     pub rope:     wgpu::BindGroupLayout,
@@ -282,7 +288,7 @@ pub(crate) struct BindGroupLayouts {
 /// since we use dynamic offsets and the slot is large enough to hold any of
 /// the per-dispatch params structs. One BG per (kind, weight buffer) is reused
 /// across every dispatch of that kind in a step.
-pub(crate) struct CachedBindGroups {
+pub struct CachedBindGroups {
     pub embed: wgpu::BindGroup,                  // (uniform, w_embed, act, sample)
     pub rms_norm: wgpu::BindGroup,               // (uniform, act, w_norms)
     pub rope: wgpu::BindGroup,                   // (uniform, rope_table, act)
@@ -306,15 +312,15 @@ pub(crate) struct CachedBindGroups {
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
 /// directly to one of the cached bind groups in [`CachedBindGroups`].
 #[derive(Copy, Clone, Debug)]
-pub(crate) enum WeightSet { Attn, FfnGU, FfnD, Embed }
+pub enum WeightSet { Attn, FfnGU, FfnD, Embed }
 
-/// Per-layer Q1_0 weight + norm-vector offsets, precomputed at load time so
+/// Per-layer `Q1_0` weight + norm-vector offsets, precomputed at load time so
 /// the per-step encoder doesn't go through `format!` + `HashMap` lookup +
-/// `TensorEntry::clone` for every dispatch. The per-Q1_0-tensor pair is
+/// `TensorEntry::clone` for every dispatch. The per-`Q1_0`-tensor pair is
 /// `(d_offset, qs_offset)`; norm offsets are pre-divided by `ACT_ELEM_BYTES`
 /// so they're directly usable as the element-offset that the shader expects.
 #[derive(Clone, Debug)]
-pub(crate) struct LayerTensors {
+pub struct LayerTensors {
     // per-layer Q1_0 weights (d_offset, qs_offset) — values are byte offsets
     // into the corresponding weight buffer (w_attn / w_ffn_gu / w_ffn_d).
     pub wq: (u32, u32),
@@ -331,54 +337,56 @@ pub(crate) struct LayerTensors {
     pub ffn_norm_off: u32,
 }
 
-/// Precomputed offsets for global / output-side tensors (LM head + output_norm).
+/// Precomputed offsets for global / output-side tensors (LM head + `output_norm`).
 #[derive(Clone, Debug)]
-pub(crate) struct OutputTensors {
+pub struct OutputTensors {
     pub token_embd_d: u32,
     pub token_embd_qs: u32,
     pub output_norm_off: u32,
 }
 
-/// GPU-bearing handle to a loaded Bonsai model. Holds weights, pipelines,
-/// activations, and the KV cache. Cheap to share across [`crate::Session`]s
-/// (they each carry only their own `pos` cursor); but only one inference can
-/// run at a time because they share the activation/KV/sample buffers.
+/// GPU-bearing handle to a loaded Bonsai model.
+///
+/// Holds weights, pipelines, activations, and the KV cache. Cheap to share
+/// across [`crate::Session`]s (they each carry only their own `pos` cursor);
+/// but only one inference can run at a time because they share the
+/// activation/KV/sample buffers.
 pub struct Model {
-    pub(crate) device: wgpu::Device,
-    pub(crate) queue: wgpu::Queue,
-    pub(crate) cfg: Config,
-    pub(crate) public_cfg: ModelConfig,
-    pub(crate) act_layout: ActLayout,
-    pub(crate) m_max: u32,
-    pub(crate) max_seq: u32,
-    pub(crate) buffers: Buffers,
-    pub(crate) pipes: Pipelines,
-    pub(crate) cached: CachedBindGroups,
-    pub(crate) layer_tensors: Vec<LayerTensors>,
-    pub(crate) output_tensors: OutputTensors,
-    pub(crate) vocab: Vec<String>,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub cfg: Config,
+    pub public_cfg: ModelConfig,
+    pub act_layout: ActLayout,
+    pub m_max: u32,
+    pub max_seq: u32,
+    pub buffers: Buffers,
+    pub pipes: Pipelines,
+    pub cached: CachedBindGroups,
+    pub layer_tensors: Vec<LayerTensors>,
+    pub output_tensors: OutputTensors,
+    pub vocab: Vec<String>,
 }
 
 const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.wgsl`.
-pub(crate) const ATTN_CHUNK_SIZE: u32 = 32;
+pub const ATTN_CHUNK_SIZE: u32 = 32;
 // 4096 * 256 B = 1 MiB. Each per-token step uses ~450 slots, matmul prefill ~470.
 // 4096 leaves ~8x headroom and is 16x smaller than the historical 65536.
-pub(crate) const UNIFORM_POOL_SLOTS: u64 = 4096;
+pub const UNIFORM_POOL_SLOTS: u64 = 4096;
 
 /// Allocate-time tunables for [`Model::load_with_options`].
 ///
-/// These affect GPU buffer sizing (KV cache, RoPE table) and so cannot be
+/// These affect GPU buffer sizing (KV cache, `RoPE` table) and so cannot be
 /// changed per call — pick them once at load.
 #[derive(Debug, Clone)]
 pub struct ModelOptions {
     /// Maximum sequence length (positions in the KV cache). Default: 1024.
     ///
-    /// VRAM cost is linear: KV cache (Q8_0 K and V combined) uses roughly
+    /// VRAM cost is linear: KV cache (`Q8_0` K and V combined) uses roughly
     /// `n_layer * max_seq * kv_dim * 2.25 bytes` — 32 i8 qs + one FP32 scale
-    /// per 32-element block, doubled for K and V. The RoPE table grows as
+    /// per 32-element block, doubled for K and V. The `RoPE` table grows as
     /// `max_seq * head_dim * 2 bytes`. The shaders themselves don't bake in
     /// a sequence-length limit, so any value up to the model's
     /// `context_length` is supported (subject to VRAM).
@@ -394,6 +402,10 @@ impl Default for ModelOptions {
 impl Model {
     /// Load weights with default options. Equivalent to
     /// [`Model::load_with_options`] with `ModelOptions::default()`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Model::load_with_options`].
     pub async fn load(model_dir: &Path) -> Result<Self> {
         Self::load_with_options(model_dir, ModelOptions::default()).await
     }
@@ -402,12 +414,44 @@ impl Model {
     /// `config.json`, `weights_*.bin`, `vocab.bin`, and `vocab_offsets.bin` from
     /// `model_dir`. Does **not** read `prompt.bin` — callers supply
     /// pre-tokenized prompts via [`crate::Session`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `opts.max_seq == 0`, the model files cannot be read
+    /// or parsed, no suitable wgpu adapter is available, the adapter does not
+    /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
+    /// subgroup size is unsupported, or the vocab files are malformed.
     pub async fn load_with_options(model_dir: &Path, opts: ModelOptions) -> Result<Self> {
+        // Hoisted constants/items so we don't trip items-after-statements lints.
+        const SAMPLE_BYTES: u64 = 4 * 1024;
+        const fn ubo_dyn(binding: u32) -> wgpu::BindGroupLayoutEntry {
+            wgpu::BindGroupLayoutEntry {
+                binding, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+        }
+        const fn ssbo(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+            wgpu::BindGroupLayoutEntry {
+                binding, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+        }
+
         if opts.max_seq == 0 {
             return Err(PotError::Config("max_seq must be > 0"));
         }
         let cfg_path = model_dir.join("config.json");
-        let cfg_text = std::fs::read_to_string(&cfg_path)
+        let cfg_text = read_to_string(&cfg_path)
             .map_err(|e| PotError::Io { path: cfg_path.clone(), source: e })?;
         let cfg: Config = serde_json::from_str(&cfg_text)?;
         let public_cfg = ModelConfig::from_raw(&cfg);
@@ -440,9 +484,8 @@ impl Model {
         let mut limits = adapter.limits();
         limits.max_storage_buffer_binding_size = limits
             .max_storage_buffer_binding_size
-            .min(1u64 << 30)
-            .max(300 * 1024 * 1024);
-        limits.max_buffer_size = limits.max_buffer_size.min(1u64 << 30).max(300 * 1024 * 1024);
+            .clamp(300 * 1024 * 1024, 1u64 << 30);
+        limits.max_buffer_size = limits.max_buffer_size.clamp(300 * 1024 * 1024, 1u64 << 30);
         limits.max_storage_buffers_per_shader_stage = limits.max_storage_buffers_per_shader_stage.max(8);
 
         let (device, queue) = adapter
@@ -466,7 +509,7 @@ impl Model {
         // a tiny `subgroup_size`-builtin readback to learn the real value, then
         // bake that into every other shader at compile time.
         let sg_size = probe_subgroup_size(&device, &queue).await?;
-        if sg_size < 8 || sg_size > 64 || (sg_size & (sg_size - 1)) != 0 {
+        if !(8..=64).contains(&sg_size) || (sg_size & (sg_size - 1)) != 0 {
             return Err(PotError::Config(
                 "unsupported runtime subgroup size (need power-of-2 in [8, 64])",
             ));
@@ -479,7 +522,7 @@ impl Model {
         // ---- load weight buffers from disk ---------------------------------
         let load = |fname: &str| -> Result<Vec<u8>> {
             let p = model_dir.join(fname);
-            std::fs::read(&p).map_err(|e| PotError::Io { path: p, source: e })
+            read(&p).map_err(|e| PotError::Io { path: p, source: e })
         };
         let w_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let make_storage = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
@@ -497,7 +540,7 @@ impl Model {
         let rope_table_f32 = build_rope_table(&cfg, opts.max_seq);
         let rope_table_f16: Vec<half::f16> =
             rope_table_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        let rope_buf = make_storage("rope_table", bytemuck::cast_slice(&rope_table_f16));
+        let rope_buf = make_storage("rope_table", cast_slice(&rope_table_f16));
 
         // ---- KV cache (Q8_0), activations, scratch -------------------------
         // Layout per buffer (kv_k / kv_v):
@@ -506,14 +549,14 @@ impl Model {
         // Block size = 32 elements; one FP32 scale per block. The two sections
         // are u32-aligned (4 | block-bytes; 4 | row-bytes given kv_dim % 32 == 0
         // and kv_dim >= 32), so reads/writes are clean word loads.
-        if cfg.kv_dim % 32 != 0 {
+        if !cfg.kv_dim.is_multiple_of(32) {
             return Err(PotError::Config("kv_dim must be a multiple of 32 (Q8_0 block size)"));
         }
-        let nb_per_row = (cfg.kv_dim / 32) as u64;
+        let nb_per_row = u64::from(cfg.kv_dim / 32);
         let kv_d_total: u64 =
-            cfg.n_layer as u64 * opts.max_seq as u64 * nb_per_row * 4;
+            u64::from(cfg.n_layer) * u64::from(opts.max_seq) * nb_per_row * 4;
         let kv_qs_total: u64 =
-            cfg.n_layer as u64 * opts.max_seq as u64 * cfg.kv_dim as u64;
+            u64::from(cfg.n_layer) * u64::from(opts.max_seq) * u64::from(cfg.kv_dim);
         let kv_total: u64 = kv_d_total + kv_qs_total;
         let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_k"), size: kv_total,
@@ -531,7 +574,7 @@ impl Model {
         });
 
         let act_layout = ActLayout::build(&cfg, M_MAX);
-        let act_size = (act_layout.total_elems as u64 * std::mem::size_of::<half::f16>() as u64 + 3) & !3;
+        let act_size = (u64::from(act_layout.total_elems) * size_of::<half::f16>() as u64 + 3) & !3;
         let act_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("act"),
             size: act_size,
@@ -543,18 +586,18 @@ impl Model {
         let q8_d_section_bytes  = M_MAX * (max_k / 32) * 4;
         let q8_qs_section_bytes = M_MAX * max_k;
         let act_q8_size = q8_d_section_bytes + q8_qs_section_bytes;
-        let act_q8_size = ((act_q8_size + 15) / 16) * 16;
+        let act_q8_size = act_q8_size.div_ceil(16) * 16;
         let act_q8_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("act_q8"), size: act_q8_size as u64,
+            label: Some("act_q8"), size: u64::from(act_q8_size),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         // Split-K attention partials: per layer, n_head * n_chunks_max chunks of
         // (head_dim + 2) f32 each. Reused across layers within a step.
-        let n_chunks_max = (opts.max_seq + ATTN_CHUNK_SIZE - 1) / ATTN_CHUNK_SIZE;
+        let n_chunks_max = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
         let attn_partials_size =
-            (cfg.n_head as u64) * (n_chunks_max as u64) * (cfg.head_dim as u64 + 2) * 4;
+            u64::from(cfg.n_head) * u64::from(n_chunks_max) * (u64::from(cfg.head_dim) + 2) * 4;
         let attn_partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("attn_partials"), size: attn_partials_size,
             usage: wgpu::BufferUsages::STORAGE,
@@ -572,7 +615,6 @@ impl Model {
         // matmul prefill (M_MAX * 4 = 2048 bytes), or 2*TOPK_MAX u32 entries
         // for the topk_reduce output (K floats + K indices = 2*64*4 = 512 bytes).
         // 4 KB is comfortable.
-        const SAMPLE_BYTES: u64 = 4 * 1024;
         let sample = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sample"), size: SAMPLE_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
@@ -619,28 +661,6 @@ impl Model {
         let sh_topk = load_shader!("topk_reduce.wgsl");
         let sh_kv_writeback = load_shader!("kv_writeback.wgsl");
 
-        fn ubo_dyn(binding: u32) -> wgpu::BindGroupLayoutEntry {
-            wgpu::BindGroupLayoutEntry {
-                binding, visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: None,
-                },
-                count: None,
-            }
-        }
-        fn ssbo(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-            wgpu::BindGroupLayoutEntry {
-                binding, visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }
-        }
         let make_bgl = |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {
             let mut entries = vec![ubo_dyn(0)];
             for i in 0..n_storage {
@@ -700,17 +720,17 @@ impl Model {
         // ---- vocab ----------------------------------------------------------
         let vocab_path = model_dir.join("vocab.bin");
         let offs_path = model_dir.join("vocab_offsets.bin");
-        let vocab_bytes = std::fs::read(&vocab_path)
+        let vocab_bytes = read(&vocab_path)
             .map_err(|e| PotError::Io { path: vocab_path, source: e })?;
-        let offs_bytes = std::fs::read(&offs_path)
+        let offs_bytes = read(&offs_path)
             .map_err(|e| PotError::Io { path: offs_path, source: e })?;
-        let offs: &[u32] = bytemuck::cast_slice(&offs_bytes);
+        let offs: &[u32] = cast_slice(&offs_bytes);
         if offs.len() as u32 != cfg.n_vocab + 1 {
             return Err(PotError::Vocab("offsets length doesn't match n_vocab + 1"));
         }
         let mut vocab = Vec::with_capacity(cfg.n_vocab as usize);
         for i in 0..cfg.n_vocab as usize {
-            let s = std::str::from_utf8(&vocab_bytes[offs[i] as usize..offs[i + 1] as usize])
+            let s = from_utf8(&vocab_bytes[offs[i] as usize..offs[i + 1] as usize])
                 .unwrap_or("?")
                 .to_string();
             vocab.push(s);
@@ -729,7 +749,7 @@ impl Model {
             let qn = tensor(&cfg, &format!("blk.{il}.attn_q_norm.weight"));
             let kn = tensor(&cfg, &format!("blk.{il}.attn_k_norm.weight"));
             let fn_ = tensor(&cfg, &format!("blk.{il}.ffn_norm.weight"));
-            let act_elem_bytes = std::mem::size_of::<half::f16>() as u64;
+            let act_elem_bytes = size_of::<half::f16>() as u64;
             LayerTensors {
                 wq: (q.d_offset as u32, q.qs_offset as u32),
                 wk: (k.d_offset as u32, k.qs_offset as u32),
@@ -748,7 +768,7 @@ impl Model {
         let output_tensors = {
             let te = tensor(&cfg, "token_embd.weight");
             let on = tensor(&cfg, "output_norm.weight");
-            let act_elem_bytes = std::mem::size_of::<half::f16>() as u64;
+            let act_elem_bytes = size_of::<half::f16>() as u64;
             OutputTensors {
                 token_embd_d:    te.d_offset as u32,
                 token_embd_qs:   te.qs_offset as u32,
@@ -771,26 +791,32 @@ impl Model {
     }
 
     /// Read-only view of the model's hyperparameters.
-    pub fn config(&self) -> &ModelConfig { &self.public_cfg }
+    #[must_use]
+    pub const fn config(&self) -> &ModelConfig { &self.public_cfg }
 
     /// Maximum sequence length supported by the allocated KV cache.
-    pub fn max_seq_len(&self) -> u32 { self.max_seq }
+    #[must_use]
+    pub const fn max_seq_len(&self) -> u32 { self.max_seq }
 
     /// Maximum batch size supported by a single matmul prefill dispatch.
-    pub fn max_prefill_tokens(&self) -> u32 { self.m_max }
+    #[must_use]
+    pub const fn max_prefill_tokens(&self) -> u32 { self.m_max }
 
     /// Open a fresh inference session. Cheap; does no GPU work.
-    pub fn new_session(&self) -> crate::Session<'_> { crate::Session::new(self) }
+    #[must_use]
+    pub const fn new_session(&self) -> crate::Session<'_> { crate::Session::new(self) }
 
     /// Decode a single token id to its raw bytes (after inverting the GPT-2
     /// byte-level vocab encoding). Returns the UTF-8 encoding of the literal
     /// vocab string for special tokens like `<|im_start|>`.
+    #[must_use]
     pub fn decode_token(&self, id: u32) -> Vec<u8> {
-        let s = self.vocab.get(id as usize).map(|s| s.as_str()).unwrap_or("");
-        crate::decode::decode_token_bytes(s)
+        let s = self.vocab.get(id as usize).map_or("", String::as_str);
+        decode::decode_token_bytes(s)
     }
 
     /// Decode a sequence of token ids into a string (lossy UTF-8).
+    #[must_use]
     pub fn decode_tokens(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
@@ -800,29 +826,31 @@ impl Model {
     }
 
     /// The raw vocab string for a token id (still in GPT-2 byte-encoded form).
+    #[must_use]
     pub fn vocab_token(&self, id: u32) -> Option<&str> {
-        self.vocab.get(id as usize).map(|s| s.as_str())
+        self.vocab.get(id as usize).map(String::as_str)
     }
 
     /// Reverse lookup: find the token id whose raw vocab string matches
     /// `token` exactly. Linear scan over the vocab — only intended for
     /// occasional startup-time lookups (e.g. resolving `<|im_end|>` in a chat
     /// REPL), not per-token decode work.
+    #[must_use]
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.vocab.iter().position(|s| s == token).map(|i| i as u32)
     }
 }
 
-/// Precompute cos/sin table for NEOX rope: per position p (0..max_seq),
-/// per j (0..head_dim/2), interleaved (cos, sin) pairs => head_dim floats per pos.
+/// Precompute cos/sin table for NEOX rope: per position p (`0..max_seq`),
+/// per j (`0..head_dim/2`), interleaved (cos, sin) pairs => `head_dim` floats per pos.
 fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
     let half = (cfg.head_dim / 2) as usize;
     let mut out = vec![0f32; max_seq as usize * cfg.head_dim as usize];
     for p in 0..max_seq as usize {
         for j in 0..half {
-            let theta = (cfg.rope_freq_base as f64).powf(-2.0 * j as f64 / cfg.head_dim as f64);
+            let theta = f64::from(cfg.rope_freq_base).powf(-2.0 * j as f64 / f64::from(cfg.head_dim));
             let angle = p as f64 * theta;
-            out[p * cfg.head_dim as usize + 2 * j + 0] = angle.cos() as f32;
+            out[p * cfg.head_dim as usize + 2 * j] = angle.cos() as f32;
             out[p * cfg.head_dim as usize + 2 * j + 1] = angle.sin() as f32;
         }
     }
@@ -883,7 +911,7 @@ async fn probe_subgroup_size(device: &wgpu::Device, queue: &wgpu::Queue) -> Resu
     queue.submit(Some(enc.finish()));
 
     let slice = readback.slice(..);
-    let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+    let (tx, rx) = oneshot_channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
     device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
     rx.receive().await.ok_or(PotError::Config("probe map_async failed"))?
@@ -898,7 +926,7 @@ async fn probe_subgroup_size(device: &wgpu::Device, queue: &wgpu::Queue) -> Resu
 
 // ----- public(crate) helpers used by forward.rs -----------------------------
 
-pub(crate) fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
+pub fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
     cfg.manifest.get(name).unwrap_or_else(|| panic!("missing tensor in manifest: {name}"))
 }
 
@@ -910,7 +938,7 @@ fn build_cached_bind_groups(
 ) -> CachedBindGroups {
     // The UBO binding always uses UNIFORM_SLOT_SIZE — every params struct
     // fits in one slot, and the dynamic offset selects which slot.
-    let ubo_size = std::num::NonZeroU64::new(UNIFORM_SLOT_SIZE).unwrap();
+    let ubo_size = NonZeroU64::new(UNIFORM_SLOT_SIZE).unwrap();
     let ubo = || wgpu::BindingResource::Buffer(wgpu::BufferBinding {
         buffer: &buffers.uniform, offset: 0, size: Some(ubo_size),
     });
@@ -1005,19 +1033,19 @@ mod tests {
     #[test]
     fn params_struct_sizes_fit_uniform_slot() {
         let limit = UNIFORM_SLOT_SIZE as usize;
-        assert!(std::mem::size_of::<EmbedParams>()       <= limit);
-        assert!(std::mem::size_of::<RmsNormParams>()     <= limit);
-        assert!(std::mem::size_of::<RopeParams>()        <= limit);
-        assert!(std::mem::size_of::<MatvecParams>()      <= limit);
-        assert!(std::mem::size_of::<MatvecFusedParams>() <= limit);
-        assert!(std::mem::size_of::<QuantParams>()       <= limit);
-        assert!(std::mem::size_of::<MatmulParams>()      <= limit);
-        assert!(std::mem::size_of::<AttnParams>()        <= limit);
-        assert!(std::mem::size_of::<AttnSplitParams>()   <= limit);
-        assert!(std::mem::size_of::<AttnMergeParams>()   <= limit);
-        assert!(std::mem::size_of::<SiluMulParams>()     <= limit);
-        assert!(std::mem::size_of::<TopKParams>()        <= limit);
-        assert!(std::mem::size_of::<KvWritebackParams>() <= limit);
+        assert!(size_of::<EmbedParams>()       <= limit);
+        assert!(size_of::<RmsNormParams>()     <= limit);
+        assert!(size_of::<RopeParams>()        <= limit);
+        assert!(size_of::<MatvecParams>()      <= limit);
+        assert!(size_of::<MatvecFusedParams>() <= limit);
+        assert!(size_of::<QuantParams>()       <= limit);
+        assert!(size_of::<MatmulParams>()      <= limit);
+        assert!(size_of::<AttnParams>()        <= limit);
+        assert!(size_of::<AttnSplitParams>()   <= limit);
+        assert!(size_of::<AttnMergeParams>()   <= limit);
+        assert!(size_of::<SiluMulParams>()     <= limit);
+        assert!(size_of::<TopKParams>()        <= limit);
+        assert!(size_of::<KvWritebackParams>() <= limit);
     }
 
     #[test]

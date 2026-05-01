@@ -14,13 +14,13 @@ fn greedy_sampler() -> Sampler {
 }
 
 /// A short prompt using low-index token ids that are guaranteed to exist in
-/// any model with vocab_size >= 10. The exact ids don't matter for correctness
+/// any model with `vocab_size` >= 10. The exact ids don't matter for correctness
 /// tests; what matters is that all runs see the same input.
 fn short_prompt() -> Vec<u32> {
     vec![1u32, 2, 3, 4, 5, 6, 7, 8]
 }
 
-/// GenerateOptions for determinism tests: greedy, no stop token, bounded length.
+/// `GenerateOptions` for determinism tests: greedy, no stop token, bounded length.
 fn greedy_opts(max_new_tokens: u32) -> GenerateOptions {
     GenerateOptions {
         max_new_tokens,
@@ -158,7 +158,7 @@ fn seeded_sampler_reproducibility() {
     assert_eq!(f1, f2, "prefill sampled different tokens with same seed");
     assert_eq!(t1, t2, "generation not reproducible with same seed");
 
-    let seeded2 = Sampler { seed: 43, ..seeded.clone() };
+    let seeded2 = Sampler { seed: 43, ..seeded };
     let (f3, t3) = run(&seeded2);
     // Different seed should almost certainly produce a different sequence (may
     // collide on rare inputs, but won't for a real language model).

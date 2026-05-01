@@ -10,9 +10,14 @@
 //!   bonsai-pot ./model --temperature 0.8 --top-k 50 --top-p 0.95 --seed 42 \
 //!       < ./model/prompt.bin
 
+use bonsai_pot::__bench;
 use bonsai_pot::{GenerateOptions, Model, ModelOptions, Sampler};
-use std::io::{Read, Write};
+use std::env;
+use std::fmt::Display;
+use std::io::{stdin, stdout, Read, Write};
 use std::path::PathBuf;
+use std::process::exit;
+use std::str::FromStr;
 
 struct Args {
     model_dir: PathBuf,
@@ -81,24 +86,25 @@ EXAMPLES:
     bonsai-pot ./model --mode bench --pp 512 --tg 128
 ";
 
-fn parse_or_die<T: std::str::FromStr>(flag: &str, raw: &str) -> T
-where T::Err: std::fmt::Display {
+fn parse_or_die<T: FromStr>(flag: &str, raw: &str) -> T
+where T::Err: Display {
     raw.parse::<T>().unwrap_or_else(|e| {
         eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
-        std::process::exit(1);
+        exit(1);
     })
 }
 
 fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = env::args().collect();
     if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
-        std::process::exit(0);
+        exit(0);
     }
-    let model_dir = argv.get(1).map(PathBuf::from).unwrap_or_else(|| {
+    let Some(model_dir_arg) = argv.get(1) else {
         eprintln!("error: missing <model_dir>\n\n{HELP}");
-        std::process::exit(1);
-    });
+        exit(1);
+    };
+    let model_dir = PathBuf::from(model_dir_arg);
     let mut a = Args {
         model_dir,
         mode: "gen".to_string(),
@@ -117,7 +123,7 @@ fn parse_args() -> Args {
     while i < argv.len() {
         let next = || argv.get(i + 1).cloned().unwrap_or_else(|| {
             eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
-            std::process::exit(1)
+            exit(1)
         });
         match argv[i].as_str() {
             "--mode" => { a.mode = next(); i += 2; }
@@ -132,7 +138,7 @@ fn parse_args() -> Args {
             "--seed" => { a.seed = parse_or_die("--seed", &next()); i += 2; }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
-                std::process::exit(1);
+                exit(1);
             }
         }
     }
@@ -151,27 +157,27 @@ fn main() {
             &args.model_dir,
             ModelOptions { max_seq: args.max_seq },
         ).await
-            .unwrap_or_else(|e| { eprintln!("load error: {e}"); std::process::exit(2) });
+            .unwrap_or_else(|e| { eprintln!("load error: {e}"); exit(2) });
 
         match args.mode.as_str() {
             "bench" => {
-                bonsai_pot::__bench::bench(&model, args.pp_n, args.tg_n, args.repeats).await
-                    .unwrap_or_else(|e| { eprintln!("bench error: {e}"); std::process::exit(3) });
+                __bench::bench(&model, args.pp_n, args.tg_n, args.repeats).await
+                    .unwrap_or_else(|e| { eprintln!("bench error: {e}"); exit(3) });
             }
             "microbench" => {
-                bonsai_pot::__bench::microbench_tg(&model, args.repeats).await;
+                __bench::microbench_tg(&model, args.repeats).await;
             }
             "gen" | "prompt" => {
                 let mut buf = Vec::new();
-                std::io::stdin().lock().read_to_end(&mut buf).expect("read stdin");
+                stdin().lock().read_to_end(&mut buf).expect("read stdin");
                 if buf.len() % 4 != 0 {
                     eprintln!("stdin must be a multiple of 4 bytes (u32 token IDs)");
-                    std::process::exit(1);
+                    exit(1);
                 }
                 let prompt: Vec<u32> = bytemuck::cast_slice(&buf).to_vec();
                 if prompt.is_empty() {
                     eprintln!("empty prompt on stdin");
-                    std::process::exit(1);
+                    exit(1);
                 }
 
                 let sampler = Sampler {
@@ -187,7 +193,7 @@ fn main() {
                     sess.prefill_one_at_a_time(&prompt, &sampler).await.expect("prefill")
                 };
 
-                let mut stdout = std::io::stdout().lock();
+                let mut stdout = stdout().lock();
                 // Echo the decoded prompt before the first sampled token,
                 // matching the original CLI's behavior.
                 for &id in &prompt {
@@ -208,7 +214,7 @@ fn main() {
             }
             other => {
                 eprintln!("unknown mode: {other}");
-                std::process::exit(1);
+                exit(1);
             }
         }
     });

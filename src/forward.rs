@@ -2,11 +2,11 @@
 //!
 //! Two execution modes:
 //!   - **matvec single-token** (`step_matvec_topk`, `prefill_matvec_loop_topk`):
-//!     processes one token at a time via the multiply-free Q1_0 matvec kernel.
+//!     processes one token at a time via the multiply-free `Q1_0` matvec kernel.
 //!     Used for token generation and for incremental prefill (when there's an
 //!     existing KV cache prefix).
 //!   - **matmul batched prefill** (`prefill_matmul_topk`): processes the prompt
-//!     as one batch using dot4I8Packed matmul with a Q8_0 quantize-activation
+//!     as one batch using `dot4I8Packed` matmul with a `Q8_0` quantize-activation
 //!     pre-pass. Faster on long prompts, but assumes the KV cache is empty
 //!     (`pos_base == 0`).
 //!
@@ -17,13 +17,18 @@
 //!
 //! Per-token encoder hot path: per-layer tensor offsets are precomputed at
 //! load time (`Model::layer_tensors`) so we don't re-do
-//! `format!` + HashMap lookup + clone on every dispatch; bind groups are also
+//! `format!` + `HashMap` lookup + clone on every dispatch; bind groups are also
 //! precomputed at load time (`Model::cached`) and shared across all dispatches
 //! of a given (kind, weight buffer) pair, since the dynamic uniform offset is
 //! the only per-dispatch variation.
 
 use crate::error::{PotError, Result};
-use crate::model::*;
+use crate::model::{
+    ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
+    KvWritebackParams, MatmulParams, MatvecFusedParams, MatvecParams, Model, QuantParams,
+    RmsNormParams, RopeParams, SiluMulParams, TOPK_MAX, TopKParams, UNIFORM_POOL_SLOTS,
+    UNIFORM_SLOT_SIZE, WeightSet,
+};
 use bytemuck::Pod;
 
 // ---------- Q8_0 KV cache layout helpers ------------------------------------
@@ -34,13 +39,13 @@ use bytemuck::Pod;
 // `(il * max_seq + pos) * (kv_dim/32) + b` (single-row stride = kv_dim/32 in
 // d-elements, kv_dim in qs-bytes).
 
-fn kv_qs_byte_base(cfg: &Config, max_seq: u32) -> u32 {
+const fn kv_qs_byte_base(cfg: &Config, max_seq: u32) -> u32 {
     cfg.n_layer * max_seq * (cfg.kv_dim / 32) * 4
 }
 
 /// `(d_word_offset, qs_byte_offset)` for the start of layer `il` inside each
-/// kv buffer. Same layout for kv_k and kv_v, so callers reuse the pair.
-fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
+/// kv buffer. Same layout for `kv_k` and `kv_v`, so callers reuse the pair.
+const fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
     let d_word = il * max_seq * (cfg.kv_dim / 32);
     let qs_byte = kv_qs_byte_base(cfg, max_seq) + il * max_seq * cfg.kv_dim;
     (d_word, qs_byte)
@@ -48,7 +53,7 @@ fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
 
 // ---------- per-step encoder + uniform pool ---------------------------------
 
-pub(crate) struct UniformPool {
+pub struct UniformPool {
     cpu: Vec<u8>,
     next_slot: u64,
 }
@@ -62,7 +67,7 @@ impl UniformPool {
         let cap = (UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE) as usize;
         Self { cpu: Vec::with_capacity(cap), next_slot: 0 }
     }
-    fn remaining_slots(&self) -> u64 {
+    const fn remaining_slots(&self) -> u64 {
         UNIFORM_POOL_SLOTS.saturating_sub(self.next_slot)
     }
     fn alloc<T: Pod>(&mut self, params: &T) -> u32 {
@@ -82,7 +87,7 @@ impl UniformPool {
     }
 }
 
-pub(crate) struct StepEncoder<'a> {
+pub struct StepEncoder<'a> {
     model: &'a Model,
     pub encoder: wgpu::CommandEncoder,
     pub uniforms: UniformPool,
@@ -121,7 +126,7 @@ impl<'a> StepEncoder<'a> {
 
 // ---------- weight-set selection -------------------------------------------
 
-fn matvec_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
+const fn matvec_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
     match ws {
         WeightSet::Attn  => &model.cached.matvec_w_attn,
         WeightSet::FfnGU => &model.cached.matvec_w_ffn_gu,
@@ -130,7 +135,7 @@ fn matvec_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
     }
 }
 
-fn matmul_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
+const fn matmul_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
     match ws {
         WeightSet::Attn  => &model.cached.matmul_w_attn,
         WeightSet::FfnGU => &model.cached.matmul_w_ffn_gu,
@@ -184,14 +189,14 @@ fn dispatch_matvec_q1_0(
     in_off: u32, out_off: u32, accumulate: bool,
 ) {
     const ROWS_PER_WG: u32 = 8;
-    let n_wg = (n + ROWS_PER_WG - 1) / ROWS_PER_WG;
+    let n_wg = n.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
-    let dispatch_y = (n_wg + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
     let p = MatvecParams {
         k, n,
         d_offset: w_d, qs_offset: w_qs,
         input_offset: in_off, output_offset: out_off,
-        accumulate: if accumulate { 1 } else { 0 },
+        accumulate: u32::from(accumulate),
         dispatch_x_dim: dispatch_x,
     };
     let off = uniforms.alloc(&p);
@@ -205,6 +210,7 @@ fn dispatch_matvec_q1_0_fused(
     k: u32, input_offset: u32, weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
+    const ROWS_PER_WG: u32 = 8;
     debug_assert!(ranges.len() == 2 || ranges.len() == 3);
     for (_, _, n, _) in ranges { debug_assert!(n % 8 == 0); }
     let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
@@ -212,10 +218,9 @@ fn dispatch_matvec_q1_0_fused(
     let (d1, qs1, n1, o1) = r(1);
     let (d2, qs2, n2, o2) = r(2);
     let n_total = n0 + n1 + n2;
-    const ROWS_PER_WG: u32 = 8;
-    let n_wg = (n_total + ROWS_PER_WG - 1) / ROWS_PER_WG;
+    let n_wg = n_total.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
-    let dispatch_y = (n_wg + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
     let p = MatvecFusedParams {
         k, n_total, input_offset, dispatch_x_dim: dispatch_x,
         d_offset_0: d0, qs_offset_0: qs0, n_0: n0, output_offset_0: o0,
@@ -233,9 +238,9 @@ fn dispatch_silu_mul(
     n: u32, m: u32, gate_off: u32, up_off: u32, out_off: u32,
 ) {
     let total = n * m;
-    let groups = (total + 63) / 64;
+    let groups = total.div_ceil(64);
     let dispatch_x = groups.min(65535);
-    let dispatch_y = (groups + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = groups.div_ceil(dispatch_x);
     let p = SiluMulParams {
         n, m, gate_offset: gate_off, up_offset: up_off, out_offset: out_off,
         dispatch_x_count: dispatch_x * 64,
@@ -267,7 +272,7 @@ fn dispatch_kv_writeback(
     let nb_per_row = cfg.kv_dim / 32;
     let total_blocks = m_tokens * nb_per_row;
     let dispatch_x = total_blocks.min(65535);
-    let dispatch_y = (total_blocks + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = total_blocks.div_ceil(dispatch_x);
     let (dst_d_word_offset, dst_qs_byte_offset) =
         kv_layer_offsets(cfg, model.max_seq, layer_il);
     let p = KvWritebackParams {
@@ -291,13 +296,14 @@ fn dispatch_kv_writeback(
 /// This must be called AFTER the step's command buffer has been submitted —
 /// i.e. the readback copy is in flight. There is no separate submit here.
 async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
-    let bytes = (k as u64) * 8; // K f32 + K u32
+    use core::result::Result as StdResult;
+    use futures_intrusive::channel::shared::oneshot_channel;
+    use wgpu::{BufferAsyncError, PollType};
+    let bytes = u64::from(k) * 8; // K f32 + K u32
     let slice = model.buffers.readback.slice(0..bytes);
-    let (s, r) = futures_intrusive::channel::shared::oneshot_channel::<
-        std::result::Result<(), wgpu::BufferAsyncError>,
-    >();
+    let (s, r) = oneshot_channel::<StdResult<(), BufferAsyncError>>();
     slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
-    model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+    model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
     match r.receive().await {
         Some(Ok(())) => {}
         Some(Err(e)) => return Err(PotError::BufferMap(e)),
@@ -321,16 +327,16 @@ fn encode_step_matvec_slots_no_suffix(cfg: &Config) -> u64 {
     // 1 embed + 14 per layer (rms, qkv_fused, q_norm, k_norm, rope_q, rope_k,
     // kv_writeback, attn_split, attn_merge, Wo, ffn_norm, gate_up_fused,
     // silu_mul, Wd).
-    1 + 14 * cfg.n_layer as u64
+    1 + 14 * u64::from(cfg.n_layer)
 }
 
 /// Encode one tg step into the given encoder. The input token is read from
 /// `sample[sample_in]`. If `topk_out = Some((base, k))`, the suffix
-/// (output_norm + LM head + topk_reduce) is appended and the top-K logits +
+/// (`output_norm` + LM head + `topk_reduce`) is appended and the top-K logits +
 /// indices land at `sample[base..base + 2*k]`. If `topk_out = None`, the
 /// suffix is skipped — useful for KV-fill-only steps (e.g. mid-prefill) where
 /// the sampled token isn't read.
-pub(crate) fn encode_step_matvec(
+pub fn encode_step_matvec(
     se: &mut StepEncoder, cfg: &Config,
     sample_in: u32, topk_out: Option<(u32, u32)>, pos: u32,
 ) {
@@ -380,16 +386,16 @@ pub(crate) fn encode_step_matvec(
 
 /// Run one matvec step at `pos`, reading the current token from CPU and
 /// returning the top-`k` logits + indices for the next token.
-pub(crate) async fn step_matvec_topk(
+pub async fn step_matvec_topk(
     model: &Model, token_id: u32, pos: u32, k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
-    let k = k.min(TOPK_MAX).max(1);
+    let k = k.clamp(1, TOPK_MAX);
     model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&token_id));
     let mut se = StepEncoder::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos);
     // Fold the readback copy into the same command buffer so the step + the
     // sample→readback transfer are one submit, not two.
-    se.copy_sample_to_readback((k as u64) * 8);
+    se.copy_sample_to_readback(u64::from(k) * 8);
     let cb = se.finish();
     model.queue.submit(Some(cb));
     await_topk_readback(model, k).await
@@ -399,7 +405,7 @@ pub(crate) async fn step_matvec_topk(
 /// Used by perf benches to avoid coupling forward-pass cost to readback I/O —
 /// callers `device.poll(wait_indefinitely)` themselves to time the work.
 #[cfg(feature = "bench-internals")]
-pub(crate) fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
+pub fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&token_id));
     let mut se = StepEncoder::new(model);
     // We still encode the topk_reduce dispatch (with k=1, the single argmax case)
@@ -409,7 +415,7 @@ pub(crate) fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     model.queue.submit(Some(cb));
 }
 
-/// Pre-KV-copy block of one layer: rms_norm → QKV fused → q/k norms → rope.
+/// Pre-KV-copy block of one layer: `rms_norm` → QKV fused → q/k norms → rope.
 fn layer_pre_kv_in_pass(
     model: &Model, cfg: &Config, uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>, il: u32, pos: u32,
@@ -434,8 +440,8 @@ fn layer_pre_kv_in_pass(
     dispatch_rope(model, cfg, uniforms, pass, model.act_layout.k_cur, 1, cfg.n_kv_head, pos);
 }
 
-/// Post-KV-copy block of one layer: attention → Wo (resid) → ffn_norm
-/// → gate-up fused → silu_mul → Wd (resid).
+/// Post-KV-copy block of one layer: attention → Wo (resid) → `ffn_norm`
+/// → gate-up fused → `silu_mul` → Wd (resid).
 fn layer_post_kv_in_pass(
     model: &Model, cfg: &Config, uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>, il: u32, pos: u32,
@@ -445,7 +451,7 @@ fn layer_post_kv_in_pass(
     // Split-K + GQA-batched flash-attention for tg (m_tokens=1).
     {
         let cur_pos = pos + 1;
-        let n_chunks_active = (cur_pos + ATTN_CHUNK_SIZE - 1) / ATTN_CHUNK_SIZE;
+        let n_chunks_active = cur_pos.div_ceil(ATTN_CHUNK_SIZE);
         let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, il);
 
         let ps = AttnSplitParams {
@@ -500,7 +506,7 @@ fn layer_post_kv_in_pass(
 /// `pos` from `pos_base` to `pos_base + prompt.len()`, and return the top-K
 /// candidates from the LAST token's logits. Suitable for incremental prefill
 /// after an existing KV cache (any `pos_base`).
-pub(crate) async fn prefill_matvec_loop_topk(
+pub async fn prefill_matvec_loop_topk(
     model: &Model, prompt: &[u32], pos_base: u32, k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     let Some((&last, rest)) = prompt.split_last() else {
@@ -550,7 +556,7 @@ pub(crate) async fn prefill_matvec_loop_topk(
 /// Advances pos from 0 to `prompt.len()`. Returns top-K candidates from the
 /// last token's logits. Requires `pos_base == 0` (the matmul attention shader
 /// assumes a fresh cache).
-pub(crate) async fn prefill_matmul_topk(
+pub async fn prefill_matmul_topk(
     model: &Model, prompt: &[u32], pos_base: u32, k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     if pos_base != 0 {
@@ -565,7 +571,7 @@ pub(crate) async fn prefill_matmul_topk(
     }
     let cfg = &model.cfg;
     let ot = &model.output_tensors;
-    let k = k.min(TOPK_MAX).max(1);
+    let k = k.clamp(1, TOPK_MAX);
 
     // ---- All phases (embed → per-layer transformer → final norm/LM-head/topk
     //      → readback copy) into ONE command buffer / ONE submit. ------------
@@ -621,7 +627,7 @@ pub(crate) async fn prefill_matmul_topk(
     }
 
     // Phase 4: append readback copy so it ships with this same command buffer.
-    se.copy_sample_to_readback((k as u64) * 8);
+    se.copy_sample_to_readback(u64::from(k) * 8);
 
     let cb = se.finish();
     model.queue.submit(Some(cb));
@@ -741,6 +747,7 @@ fn matvec_q1_0_fused_pass(
     k: u32, input_offset: u32, weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
+    const ROWS_PER_WG: u32 = 8;
     debug_assert!(ranges.len() == 2 || ranges.len() == 3);
     for (_, _, n, _) in ranges { debug_assert!(n % 8 == 0); }
     let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
@@ -748,10 +755,9 @@ fn matvec_q1_0_fused_pass(
     let (d1, qs1, n1, o1) = r(1);
     let (d2, qs2, n2, o2) = r(2);
     let n_total = n0 + n1 + n2;
-    const ROWS_PER_WG: u32 = 8;
-    let n_wg = (n_total + ROWS_PER_WG - 1) / ROWS_PER_WG;
+    let n_wg = n_total.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
-    let dispatch_y = (n_wg + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
     let p = MatvecFusedParams {
         k, n_total, input_offset, dispatch_x_dim: dispatch_x,
         d_offset_0: d0, qs_offset_0: qs0, n_0: n0, output_offset_0: o0,
@@ -770,14 +776,14 @@ fn matvec_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
                weights: WeightSet, w_d: u32, w_qs: u32,
                in_off: u32, out_off: u32, accumulate: bool) {
     const ROWS_PER_WG: u32 = 8;
-    let n_wg = (n + ROWS_PER_WG - 1) / ROWS_PER_WG;
+    let n_wg = n.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
-    let dispatch_y = (n_wg + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
     let p = MatvecParams {
         k, n,
         d_offset: w_d, qs_offset: w_qs,
         input_offset: in_off, output_offset: out_off,
-        accumulate: if accumulate { 1 } else { 0 },
+        accumulate: u32::from(accumulate),
         dispatch_x_dim: dispatch_x,
     };
     let off = se.alloc_uniform(&p);
@@ -794,7 +800,7 @@ fn quantize_act(model: &Model, _cfg: &Config, se: &mut StepEncoder,
     let qs_off = m * nb_q8 * 4;
     let total = m * nb_q8;
     let dispatch_x = total.min(65535);
-    let dispatch_y = (total + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = total.div_ceil(dispatch_x);
     let p = QuantParams {
         k, m, input_offset: in_off_f32,
         d_offset: d_off, qs_offset: qs_off,
@@ -815,7 +821,7 @@ fn kv_writeback(model: &Model, cfg: &Config, se: &mut StepEncoder,
     let nb_per_row = cfg.kv_dim / 32;
     let total_blocks = m_tokens * nb_per_row;
     let dispatch_x = total_blocks.min(65535);
-    let dispatch_y = (total_blocks + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = total_blocks.div_ceil(dispatch_x);
     let (dst_d_word_offset, dst_qs_byte_offset) =
         kv_layer_offsets(cfg, model.max_seq, layer_il);
     let p = KvWritebackParams {
@@ -836,9 +842,9 @@ fn kv_writeback(model: &Model, cfg: &Config, se: &mut StepEncoder,
 fn silu_mul(model: &Model, se: &mut StepEncoder,
             n: u32, m: u32, gate_off: u32, up_off: u32, out_off: u32) {
     let total = n * m;
-    let groups = (total + 63) / 64;
+    let groups = total.div_ceil(64);
     let dispatch_x = groups.min(65535);
-    let dispatch_y = (groups + dispatch_x - 1) / dispatch_x;
+    let dispatch_y = groups.div_ceil(dispatch_x);
     let p = SiluMulParams {
         n, m, gate_offset: gate_off, up_offset: up_off, out_offset: out_off,
         dispatch_x_count: dispatch_x * 64,
@@ -860,14 +866,14 @@ fn matmul_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
         w_d_offset: w_d, w_qs_offset: w_qs,
         a_d_offset: a_d, a_qs_offset: a_qs,
         out_offset: out_off,
-        accumulate: if accumulate { 1 } else { 0 },
+        accumulate: u32::from(accumulate),
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("matmul"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.matmul);
     cp.set_bind_group(0, matmul_bg(model, weights), &[off]);
-    cp.dispatch_workgroups((n + 63) / 64, (m + 63) / 64, 1);
+    cp.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);
 }
 
 // =========================================================================
@@ -877,10 +883,22 @@ fn matmul_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
 
 #[cfg(feature = "bench-internals")]
 pub mod bench_internals {
-    use super::*;
+    use super::{
+        AttnParams, Config, EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
+        kv_layer_offsets, kv_writeback, matvec_q1_0, matvec_q1_0_fused_pass,
+        prefill_matmul_topk, rms_norm, rope, silu_mul, step_matvec_no_sample, step_matvec_topk,
+    };
+    use std::time::Instant;
+    use wgpu::PollType;
 
     /// Match `llama-bench` style: pp{n} measures batched-prefill throughput;
     /// tg{n} measures single-token generation throughput.
+    ///
+    /// # Errors
+    /// Returns an error if any prefill or step call fails (e.g. buffer-mapping).
+    ///
+    /// # Panics
+    /// Panics if `device.poll` returns an error.
     pub async fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let cfg = &model.cfg;
         eprintln!("--- bench: pp={pp_n}, tg={tg_n}, repeats={repeats} (after 1 warmup) ---");
@@ -890,14 +908,14 @@ pub mod bench_internals {
         // ----- warm up -----
         let _ = prefill_matmul_topk(model, &prompt[..pp_n.min(model.m_max) as usize], 0, 1).await?;
         step_matvec_no_sample(model, 1u32, 0);
-        model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+        model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
 
         // ----- pp{pp_n} -----
         let mut pp_times = Vec::with_capacity(repeats as usize);
         for _ in 0..repeats {
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             let _ = prefill_matmul_topk(model, &prompt, 0, 1).await?;
-            model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+            model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
             pp_times.push(t.elapsed().as_secs_f32());
         }
         let pp_mean = pp_times.iter().sum::<f32>() / pp_times.len() as f32;
@@ -908,11 +926,11 @@ pub mod bench_internals {
         // ----- tg{tg_n} (from empty KV) -----
         let mut tg_times = Vec::with_capacity(repeats as usize);
         for _ in 0..repeats {
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             for pos in 0..tg_n {
                 let (_, _) = step_matvec_topk(model, 1u32, pos, 1).await?;
             }
-            model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+            model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
             tg_times.push(t.elapsed().as_secs_f32());
         }
         let tg_mean = tg_times.iter().sum::<f32>() / tg_times.len() as f32;
@@ -934,14 +952,17 @@ pub mod bench_internals {
         var.sqrt()
     }
 
+    /// # Panics
+    /// Panics if `device.poll` returns an error or sorting comparator fails.
     pub async fn microbench_tg(model: &Model, repeats: u32) {
+        type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
+
         let cfg = &model.cfg;
         let n_per_cb: u32 = 200;
         let attn_pos: u32 = 64;
 
         eprintln!("--- microbench tg (N={n_per_cb}/CB, repeats={repeats}) ---");
 
-        type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
         let mut entries: Vec<(String, u32, DispatchFn)> = Vec::new();
 
         // (label, k, n, calls/step, weight_set, w_d_offset, w_qs_offset)
@@ -1051,25 +1072,25 @@ pub mod bench_internals {
         // Warmup
         {
             let mut se = StepEncoder::new(model);
-            for (_l, _c, f) in entries.iter() { f(model, cfg, &mut se); }
+            for (_l, _c, f) in &entries { f(model, cfg, &mut se); }
             kv_writeback(model, cfg, &mut se,
                          model.act_layout.k_cur, model.act_layout.v_cur,
                          /*layer_il=*/ 0, /*pos_base=*/ 0, /*m_tokens=*/ 1);
             let cb = se.finish();
             model.queue.submit(Some(cb));
-            model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+            model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
         }
 
         let mut breakdown: Vec<(String, u32, f32)> = Vec::new();
-        for (label, calls, build) in entries.iter() {
+        for (label, calls, build) in &entries {
             let mut samples = Vec::with_capacity(repeats as usize);
             for _ in 0..repeats {
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 let mut se = StepEncoder::new(model);
                 for _ in 0..n_per_cb { build(model, cfg, &mut se); }
                 let cb = se.finish();
                 model.queue.submit(Some(cb));
-                model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+                model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -1080,7 +1101,7 @@ pub mod bench_internals {
         {
             let mut samples = Vec::with_capacity(repeats as usize);
             for _ in 0..repeats {
-                let t = std::time::Instant::now();
+                let t = Instant::now();
                 let mut se = StepEncoder::new(model);
                 for _ in 0..n_per_cb {
                     kv_writeback(model, cfg, &mut se,
@@ -1089,7 +1110,7 @@ pub mod bench_internals {
                 }
                 let cb = se.finish();
                 model.queue.submit(Some(cb));
-                model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+                model.device.poll(PollType::wait_indefinitely()).expect("device.poll failed");
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;

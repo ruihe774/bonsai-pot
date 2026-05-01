@@ -1,9 +1,12 @@
-use std::fmt;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::io;
 use std::path::PathBuf;
+use std::result::Result as StdResult;
 
 #[derive(Debug)]
 pub enum PotError {
-    Io { path: PathBuf, source: std::io::Error },
+    Io { path: PathBuf, source: io::Error },
     ConfigParse(serde_json::Error),
     MissingTensor(String),
     Vocab(&'static str),
@@ -16,9 +19,12 @@ pub enum PotError {
     Config(&'static str),
 }
 
-impl fmt::Display for PotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use PotError::*;
+impl Display for PotError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        use PotError::{
+            BufferMap, Config, ConfigParse, ContextOverflow, DeviceRequest, FeatureUnsupported,
+            Io, MissingTensor, NoAdapter, PrefillTooLarge, Vocab,
+        };
         match self {
             Io { path, source } => write!(f, "io error reading {}: {}", path.display(), source),
             ConfigParse(e) => write!(f, "failed to parse config.json: {e}"),
@@ -35,36 +41,38 @@ impl fmt::Display for PotError {
     }
 }
 
-impl std::error::Error for PotError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for PotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            PotError::Io { source, .. } => Some(source),
-            PotError::ConfigParse(e) => Some(e),
-            PotError::DeviceRequest(e) => Some(e),
+            Self::Io { source, .. } => Some(source),
+            Self::ConfigParse(e) => Some(e),
+            Self::DeviceRequest(e) => Some(e),
             _ => None,
         }
     }
 }
 
 impl From<serde_json::Error> for PotError {
-    fn from(e: serde_json::Error) -> Self { PotError::ConfigParse(e) }
+    fn from(e: serde_json::Error) -> Self { Self::ConfigParse(e) }
 }
 
 impl From<wgpu::RequestDeviceError> for PotError {
-    fn from(e: wgpu::RequestDeviceError) -> Self { PotError::DeviceRequest(e) }
+    fn from(e: wgpu::RequestDeviceError) -> Self { Self::DeviceRequest(e) }
 }
 
-pub type Result<T> = std::result::Result<T, PotError>;
+pub type Result<T> = StdResult<T, PotError>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::PotError;
     use std::error::Error;
+    use std::io;
+    use std::path::PathBuf;
 
     fn make_io_error() -> PotError {
         PotError::Io {
-            path: std::path::PathBuf::from("/tmp/fake"),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+            path: PathBuf::from("/tmp/fake"),
+            source: io::Error::new(io::ErrorKind::NotFound, "not found"),
         }
     }
 

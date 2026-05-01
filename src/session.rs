@@ -64,16 +64,17 @@ pub struct Session<'m> {
 }
 
 impl<'m> Session<'m> {
-    pub(crate) fn new(model: &'m Model) -> Self {
+    pub(crate) const fn new(model: &'m Model) -> Self {
         Self { model, pos: 0 }
     }
 
     /// Current position (number of tokens consumed so far).
-    pub fn pos(&self) -> u32 { self.pos }
+    #[must_use]
+    pub const fn pos(&self) -> u32 { self.pos }
 
     /// Reset to a fresh conversation. O(1) — the KV cache is overwritten in
     /// place by subsequent prefill / step calls, so no GPU work is needed.
-    pub fn reset(&mut self) { self.pos = 0; }
+    pub const fn reset(&mut self) { self.pos = 0; }
 
     /// Read back the live `[0..pos)` slice of the GPU KV cache to host memory.
     ///
@@ -81,8 +82,12 @@ impl<'m> Session<'m> {
     /// freely cloned, persisted to disk via [`KvSnapshot::to_bytes`], and
     /// restored into any `Session` created from the same [`crate::Model`].
     ///
-    /// Cost: one PCIe round-trip plus a memcpy. For Bonsai-4B at `pos=512`,
-    /// roughly 1–2 ms on PCIe 4.
+    /// Cost: one `PCIe` round-trip plus a memcpy. For `Bonsai-4B` at `pos=512`,
+    /// roughly 1–2 ms on `PCIe 4`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GPU readback fails.
     pub async fn snapshot(&mut self) -> Result<KvSnapshot> {
         kv_snapshot::capture(self.model, self.pos).await
     }
@@ -98,6 +103,11 @@ impl<'m> Session<'m> {
     ///
     /// Cost: one queued upload via `Queue::write_buffer`, serialized against
     /// subsequent dispatches by wgpu.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `snap` does not match the model's `n_layer` /
+    /// `kv_dim`, or if `snap.pos()` exceeds `model.max_seq_len()`.
     pub fn restore(&mut self, snap: &KvSnapshot) -> Result<()> {
         kv_snapshot::apply(self.model, snap)?;
         self.pos = snap.pos();
@@ -110,6 +120,11 @@ impl<'m> Session<'m> {
     /// Requires `self.pos() == 0` because the matmul attention shader assumes
     /// a fresh KV cache. For incremental prefill into an existing context, use
     /// [`prefill_one_at_a_time`](Self::prefill_one_at_a_time).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `self.pos() != 0`, if the prompt would overflow the
+    /// KV cache, or if the underlying GPU dispatch fails.
     pub async fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         if self.pos != 0 {
             return Err(PotError::Config(
@@ -130,6 +145,11 @@ impl<'m> Session<'m> {
     /// Single-token-at-a-time matvec prefill. Slower than
     /// [`Session::prefill`] for long prompts, but supports any `pos`
     /// (incremental prefill into an existing context).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prompt would overflow the KV cache, or if the
+    /// underlying GPU dispatch fails.
     pub async fn prefill_one_at_a_time(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
@@ -144,6 +164,11 @@ impl<'m> Session<'m> {
 
     /// One matvec decoding step on `token`. Advances `pos` by 1 and returns
     /// the next sampled token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if advancing `pos` would overflow the KV cache, or if
+    /// the underlying GPU dispatch fails.
     pub async fn step(&mut self, token: u32, sampler: &Sampler) -> Result<u32> {
         if self.pos + 1 > self.model.max_seq {
             return Err(PotError::ContextOverflow { pos: self.pos, n: 1, max: self.model.max_seq });
@@ -158,6 +183,11 @@ impl<'m> Session<'m> {
     /// Collect-mode generation. `first_token` is fed as the next input but
     /// is **not** included in the returned `Vec`. Returns
     /// `(generated_tokens, stop_reason)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if generation would overflow the KV cache, or if the
+    /// underlying GPU dispatch fails.
     pub async fn generate(
         &mut self,
         first_token: u32,
@@ -172,13 +202,18 @@ impl<'m> Session<'m> {
     /// including `first_token`). The stop token, when produced, terminates
     /// generation **before** the callback is invoked — so the callback never
     /// sees the stop id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if generation would overflow the KV cache, or if the
+    /// underlying GPU dispatch fails.
     pub async fn generate_streaming<F: FnMut(u32)>(
         &mut self,
         first_token: u32,
         opts: &GenerateOptions,
         mut on_token: F,
     ) -> Result<StopReason> {
-        let stop_id = opts.stop_token.unwrap_or(self.model.config().eos_token_id);
+        let stop_id = opts.stop_token.unwrap_or_else(|| self.model.config().eos_token_id);
         let mut next = first_token;
         for _ in 0..opts.max_new_tokens {
             if self.pos + 1 > self.model.max_seq {
@@ -230,19 +265,19 @@ fn sample_from_topk(logits: &[f32], indices: &[u32], s: &Sampler, pos: u32) -> u
     // Temperature-scaled softmax over top-kk.
     let inv_t = 1.0 / s.temperature;
     let max_l = logits[0] * inv_t;
-    let mut probs: Vec<f32> = (0..kk).map(|i| (logits[i] * inv_t - max_l).exp()).collect();
+    let mut probs: Vec<f32> = (0..kk).map(|i| logits[i].mul_add(inv_t, -max_l).exp()).collect();
     let sum: f32 = probs.iter().sum();
     if sum <= 0.0 || !sum.is_finite() {
         return indices[0];
     }
-    for p in probs.iter_mut() { *p /= sum; }
+    for p in &mut probs { *p /= sum; }
 
     // Top-p (nucleus) filter on the (already descending) probabilities.
-    let cutoff = if let Some(p) = s.top_p { p.clamp(0.0, 1.0) } else { 1.0 };
+    let cutoff = s.top_p.map_or(1.0, |p| p.clamp(0.0, 1.0));
     let mut cum = 0.0f32;
     let mut keep = kk;
-    for i in 0..kk {
-        cum += probs[i];
+    for (i, &p) in probs.iter().enumerate().take(kk) {
+        cum += p;
         if cum >= cutoff { keep = i + 1; break; }
     }
     let kept = &probs[..keep];
@@ -252,7 +287,7 @@ fn sample_from_topk(logits: &[f32], indices: &[u32], s: &Sampler, pos: u32) -> u
     }
 
     // Multinomial: xorshift64-seeded uniform in [0, kept_sum).
-    let r = uniform_f32(s.seed.wrapping_add(pos as u64)) * kept_sum;
+    let r = uniform_f32(s.seed.wrapping_add(u64::from(pos))) * kept_sum;
     let mut acc = 0.0f32;
     for i in 0..keep {
         acc += probs[i];
@@ -263,7 +298,7 @@ fn sample_from_topk(logits: &[f32], indices: &[u32], s: &Sampler, pos: u32) -> u
     indices[keep - 1]
 }
 
-/// xorshift64 → uniform f32 in [0, 1). Seed is mixed via SplitMix64 first so
+/// xorshift64 → uniform f32 in [0, 1). Seed is mixed via `SplitMix64` first so
 /// nearby seeds (e.g. seed+pos) yield well-distributed outputs.
 fn uniform_f32(seed: u64) -> f32 {
     // SplitMix64 finalizer
@@ -349,7 +384,7 @@ mod tests {
     fn uniform_f32_in_range() {
         for seed in 0u64..1000 {
             let v = uniform_f32(seed);
-            assert!(v >= 0.0 && v < 1.0, "uniform_f32({seed}) = {v} not in [0, 1)");
+            assert!((0.0..1.0).contains(&v), "uniform_f32({seed}) = {v} not in [0, 1)");
         }
     }
 

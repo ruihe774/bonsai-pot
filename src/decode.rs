@@ -1,12 +1,12 @@
 use std::sync::OnceLock;
 
-/// Inverse of GPT-2's bytes_to_unicode map: each codepoint in a vocab token
+/// Inverse of GPT-2's `bytes_to_unicode` map: each codepoint in a vocab token
 /// maps back to its raw byte. Special tokens (e.g. `<|im_start|>`) fall through
 /// as their UTF-8 encoding.
 pub fn decode_token_bytes(s: &str) -> Vec<u8> {
     static INV: OnceLock<[Option<u8>; 0x180]> = OnceLock::new();
     let inv = INV.get_or_init(|| {
-        let mut bs: Vec<u32> = (b'!' as u32..=b'~' as u32)
+        let mut bs: Vec<u32> = (u32::from(b'!')..=u32::from(b'~'))
             .chain(0xa1..=0xac)
             .chain(0xae..=0xff)
             .collect();
@@ -30,12 +30,11 @@ pub fn decode_token_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for ch in s.chars() {
         let cp = ch as usize;
-        match inv.get(cp).copied().flatten() {
-            Some(b) => out.push(b),
-            None => {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-            }
+        if let Some(b) = inv.get(cp).copied().flatten() {
+            out.push(b);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
         }
     }
     out
@@ -84,16 +83,17 @@ mod tests {
                 .chain(0xa1..=0xac)
                 .chain(0xae..=0xff)
                 .collect();
-            if let Some(pos) = printable_single.iter().position(|&x| x == b) {
-                printable_single[pos] as char
-            } else {
-                // Non-printable byte: mapped to 256 + offset in the complement set.
-                let complement_singles: Vec<u8> = (0u8..=255)
-                    .filter(|x| !printable_single.contains(x))
-                    .collect();
-                let offset = complement_singles.iter().position(|&x| x == b).unwrap();
-                char::from_u32(256 + offset as u32).unwrap()
-            }
+            printable_single.iter().position(|&x| x == b).map_or_else(
+                || {
+                    // Non-printable byte: mapped to 256 + offset in the complement set.
+                    let complement_singles: Vec<u8> = (0u8..=255)
+                        .filter(|x| !printable_single.contains(x))
+                        .collect();
+                    let offset = complement_singles.iter().position(|&x| x == b).unwrap();
+                    char::from_u32(256 + offset as u32).unwrap()
+                },
+                |pos| printable_single[pos] as char,
+            )
         }
         for b in 0u8..=255 {
             let encoded = encode_byte(b).to_string();
