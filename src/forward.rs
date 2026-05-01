@@ -55,7 +55,12 @@ pub(crate) struct UniformPool {
 
 impl UniformPool {
     fn new() -> Self {
-        Self { cpu: Vec::with_capacity(64 * 1024), next_slot: 0 }
+        // Pre-size the CPU staging Vec to the full pool budget so per-step
+        // encoding doesn't reallocate. Tg uses ~120 KiB/step (508 slots),
+        // matmul prefill ~165 KiB (652 slots) — both blow past the old 64
+        // KiB initial capacity and triggered grow-and-copy on every step.
+        let cap = (UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE) as usize;
+        Self { cpu: Vec::with_capacity(cap), next_slot: 0 }
     }
     fn remaining_slots(&self) -> u64 {
         UNIFORM_POOL_SLOTS.saturating_sub(self.next_slot)
