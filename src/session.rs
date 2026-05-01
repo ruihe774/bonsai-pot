@@ -1,5 +1,6 @@
 use crate::error::{PotError, Result};
 use crate::forward;
+use crate::kv_snapshot::{self, KvSnapshot};
 use crate::model::{Model, TOPK_MAX};
 
 /// Token sampler.
@@ -73,6 +74,35 @@ impl<'m> Session<'m> {
     /// Reset to a fresh conversation. O(1) — the KV cache is overwritten in
     /// place by subsequent prefill / step calls, so no GPU work is needed.
     pub fn reset(&mut self) { self.pos = 0; }
+
+    /// Read back the live `[0..pos)` slice of the GPU KV cache to host memory.
+    ///
+    /// The resulting [`KvSnapshot`] is not tied to this `Session` and can be
+    /// freely cloned, persisted to disk via [`KvSnapshot::to_bytes`], and
+    /// restored into any `Session` created from the same [`crate::Model`].
+    ///
+    /// Cost: one PCIe round-trip plus a memcpy. For Bonsai-4B at `pos=512`,
+    /// roughly 1–2 ms on PCIe 4.
+    pub async fn snapshot(&mut self) -> Result<KvSnapshot> {
+        kv_snapshot::capture(self.model, self.pos).await
+    }
+
+    /// Replace the GPU KV cache with `snap`'s contents and set
+    /// `self.pos = snap.pos()`.
+    ///
+    /// Validates `snap` against the model (matching `n_layer` / `kv_dim`;
+    /// `snap.pos() ≤ model.max_seq_len()`). After a successful restore,
+    /// the next call should be [`prefill_one_at_a_time`](Self::prefill_one_at_a_time)
+    /// or [`step`](Self::step) if `snap.pos() > 0`, or [`prefill`](Self::prefill)
+    /// if `snap.pos() == 0`.
+    ///
+    /// Cost: one queued upload via `Queue::write_buffer`, serialized against
+    /// subsequent dispatches by wgpu.
+    pub fn restore(&mut self, snap: &KvSnapshot) -> Result<()> {
+        kv_snapshot::apply(self.model, snap)?;
+        self.pos = snap.pos();
+        Ok(())
+    }
 
     /// Batched matmul prefill. Advances `pos` by `tokens.len()` and returns
     /// the first sampled token (drawn from the last logits via `sampler`).

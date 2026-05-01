@@ -20,7 +20,7 @@
 //!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use bonsai_pot::{PotError, Model, ModelOptions, Sampler};
+use bonsai_pot::{PotError, KvSnapshot, Model, ModelOptions, Sampler};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -71,7 +71,8 @@ OPTIONS:
     -h, --help             Show this help and exit.
 
 REPL COMMANDS:
-    /reset                 Clear the conversation (drop KV cache).
+    /reset                 Restore the KV cache to just after the system prompt,
+                           skipping a re-prefill (~1-2 ms vs hundreds of ms).
     /quit, /exit           Exit the chat.
 
 EXAMPLE:
@@ -195,6 +196,19 @@ fn main() {
         };
         let mut sess = model.new_session();
         let mut stdout = std::io::stdout().lock();
+
+        // Prefill the system prompt once with the fast batched-matmul path
+        // (requires pos == 0), then snapshot the KV state. /reset restores
+        // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
+        let system_segment = format!(
+            "<|im_start|>system\n{}<|im_end|>\n",
+            args.system,
+        );
+        let system_tokens = tokenize(&args.bpe, &args.model_dir, &system_segment);
+        eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
+        sess.prefill(&system_tokens, &sampler).await.expect("system prefill");
+        let system_snap: KvSnapshot = sess.snapshot().await.expect("system snapshot");
+
         let mut turn: u32 = 0;
 
         eprintln!(
@@ -212,23 +226,22 @@ fn main() {
             if user.is_empty() { continue; }
             if user == "/quit" || user == "/exit" { break; }
             if user == "/reset" {
-                sess.reset();
+                sess.restore(&system_snap).expect("restore system snapshot");
                 turn = 0;
                 writeln!(stdout, "(conversation reset)").ok();
                 continue;
             }
 
-            // Build the ChatML segment to feed for THIS turn. On turn 0 we
-            // include the system prompt. On later turns the previous turn's
-            // closing `<|im_end|>` was sampled but not added to the KV cache
-            // (generation stops *before* the EOS goes in), so we re-emit it
-            // here to keep the conversation well-formed.
+            // Build the ChatML segment for this user turn. The system prompt
+            // is already in the KV cache, so we only encode the user/assistant
+            // wrapper. On turn 0 there is no prior assistant close; on later
+            // turns we re-emit <|im_end|> to close the previous assistant turn
+            // (generation stops before that token enters the KV cache).
             let segment = if turn == 0 {
                 format!(
-                    "<|im_start|>system\n{}<|im_end|>\n\
-                     <|im_start|>user\n{}<|im_end|>\n\
+                    "<|im_start|>user\n{}<|im_end|>\n\
                      <|im_start|>assistant\n",
-                    args.system, user,
+                    user,
                 )
             } else {
                 format!(
@@ -240,16 +253,11 @@ fn main() {
             };
             let tokens = tokenize(&args.bpe, &args.model_dir, &segment);
 
-            // Prefill: turn 0 uses the fast batched-matmul path (pos==0
-            // required); later turns use the matvec-loop variant which works
-            // at any pos. The first sampled token is returned but not yet in
-            // KV — we feed it via `step` in the streaming loop below.
-            let mut next = if turn == 0 {
-                sess.prefill(&tokens, &sampler).await.expect("prefill")
-            } else {
-                sess.prefill_one_at_a_time(&tokens, &sampler).await
-                    .expect("prefill_one_at_a_time")
-            };
+            // All user-turn prefills use the matvec-loop path (pos > 0 after
+            // the system prompt). The first sampled token is not yet in KV —
+            // it is fed back via `step` in the streaming loop below.
+            let mut next = sess.prefill_one_at_a_time(&tokens, &sampler).await
+                .expect("prefill_one_at_a_time");
 
             write!(stdout, "Assistant: ").ok();
             stdout.flush().ok();

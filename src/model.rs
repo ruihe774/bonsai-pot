@@ -517,12 +517,16 @@ impl Model {
         let kv_total: u64 = kv_d_total + kv_qs_total;
         let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_k"), size: kv_total,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                 | wgpu::BufferUsages::COPY_DST
+                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let kv_v = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_v"), size: kv_total,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                 | wgpu::BufferUsages::COPY_DST
+                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 

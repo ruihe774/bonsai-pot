@@ -25,10 +25,12 @@
 mod decode;
 mod error;
 pub(crate) mod forward;
+mod kv_snapshot;
 mod model;
 mod session;
 
 pub use error::{PotError, Result};
+pub use kv_snapshot::KvSnapshot;
 pub use model::{Model, ModelConfig, ModelOptions, TOPK_MAX};
 pub use session::{GenerateOptions, Sampler, Session, StopReason};
 
