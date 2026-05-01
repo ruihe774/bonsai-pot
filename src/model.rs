@@ -419,26 +419,10 @@ impl Model {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
 
-        // Pick the subgroup size we'll bake into shader source. The reduction
-        // shaders (rms_norm, attention*) and the matvec row-shuffle butterfly
-        // both depend on it. We pick `subgroup_max_size` because compute
-        // pipelines on AMD (the primary target) and the major non-AMD vendors
-        // (NVIDIA, Apple, Intel) typically run at that value. Hardware where
-        // min<max (notably AMD RDNA, 32..=64) gets the upper bound, which
-        // RADV's compute scheduler also picks in practice.
         let info = adapter.get_info();
-        let sg_size = info.subgroup_max_size;
-        if sg_size < 8
-            || sg_size > 64
-            || (sg_size & (sg_size - 1)) != 0
-        {
-            return Err(PotError::Config(
-                "unsupported subgroup_max_size (need power-of-2 in [8, 64])",
-            ));
-        }
         log::info!(
-            "subgroup size: min={}, max={}, baked={}",
-            info.subgroup_min_size, info.subgroup_max_size, sg_size,
+            "adapter subgroup range: min={}, max={}",
+            info.subgroup_min_size, info.subgroup_max_size,
         );
 
         let mut limits = adapter.limits();
@@ -461,6 +445,24 @@ impl Model {
                 },
             )
             .await?;
+
+        // ---- probe actual runtime subgroup size ----------------------------
+        // The adapter exposes the device's subgroup_min..max range, not the
+        // size the driver picks for any given pipeline. RADV in particular
+        // can be flipped to wave32 via `RADV_PERFTEST=cswave32` or kept at
+        // wave64 (default), and either choice is opaque to the API. We dispatch
+        // a tiny `subgroup_size`-builtin readback to learn the real value, then
+        // bake that into every other shader at compile time.
+        let sg_size = probe_subgroup_size(&device, &queue).await?;
+        if sg_size < 8 || sg_size > 64 || (sg_size & (sg_size - 1)) != 0 {
+            return Err(PotError::Config(
+                "unsupported runtime subgroup size (need power-of-2 in [8, 64])",
+            ));
+        }
+        log::info!(
+            "adapter={} backend={:?} subgroup_runtime={} (adapter range={}..={})",
+            info.name, info.backend, sg_size, info.subgroup_min_size, info.subgroup_max_size,
+        );
 
         // ---- load weight buffers from disk ---------------------------------
         let load = |fname: &str| -> Result<Vec<u8>> {
@@ -796,6 +798,73 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
         }
     }
     out
+}
+
+// Dispatch a one-thread-writes-the-builtin probe shader to find out what
+// subgroup size the driver actually picks for our compute pipelines.
+async fn probe_subgroup_size(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<u32> {
+    let result = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe_result"), size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe_readback"), size: 4,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("probe_subgroup.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/probe_subgroup.wgsl").into()),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("probe_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false, min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("probe_pl"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
+    });
+    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("probe_pipe"), layout: Some(&pl), module: &module,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("probe_bg"), layout: &bgl,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: result.as_entire_binding() }],
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("probe_enc") });
+    {
+        let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("probe_cp"), timestamp_writes: None,
+        });
+        cp.set_pipeline(&pipe);
+        cp.set_bind_group(0, &bg, &[]);
+        cp.dispatch_workgroups(1, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&result, 0, &readback, 0, 4);
+    queue.submit(Some(enc.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
+    rx.receive().await.ok_or(PotError::Config("probe map_async failed"))?
+        .map_err(|_| PotError::Config("probe map_async errored"))?;
+    let sg = {
+        let data = slice.get_mapped_range();
+        u32::from_le_bytes(data[..4].try_into().unwrap())
+    };
+    readback.unmap();
+    Ok(sg)
 }
 
 // ----- public(crate) helpers used by forward.rs -----------------------------
