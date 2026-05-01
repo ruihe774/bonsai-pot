@@ -10,6 +10,10 @@
 use crate::model::*;
 use bytemuck::Pod;
 
+/// Byte size of one activation / KV / norm-weight element. The whole forward
+/// pass stores these in f16, with f32 used only for in-shader accumulators.
+const ACT_ELEM_BYTES: u64 = std::mem::size_of::<half::f16>() as u64;
+
 // ---------- per-step encoder + uniform pool ---------------------------------
 
 struct UniformPool {
@@ -373,7 +377,7 @@ pub async fn microbench_tg(model: &mut Model, repeats: u32) {
         entries.push((label.to_string(), calls, Box::new(move |model, cfg, se| {
             let t = tensor(cfg, &ten_name_s).clone();
             rms_norm(model, cfg, se, ng, gs,
-                     model.act_layout.x_norm, model.act_layout.x_norm, (t.offset / 4) as u32);
+                     model.act_layout.x_norm, model.act_layout.x_norm, (t.offset / ACT_ELEM_BYTES) as u32);
         })));
     }
 
@@ -398,8 +402,8 @@ pub async fn microbench_tg(model: &mut Model, repeats: u32) {
             pos: attn_pos,
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: ((layer_offset / 4) as u32),
-            v_cache_offset: ((layer_offset / 4) as u32),
+            k_cache_offset: ((layer_offset / ACT_ELEM_BYTES) as u32),
+            v_cache_offset: ((layer_offset / ACT_ELEM_BYTES) as u32),
             out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
             m_tokens: 1, is_prefill: 0,
@@ -448,7 +452,7 @@ pub async fn microbench_tg(model: &mut Model, repeats: u32) {
 
     // kv-cache copies: 36 K + 36 V per step. Issue copy_buffer_to_buffer in
     // a dedicated CB. Treat as one combined entry (count = 72).
-    let kv_row_bytes = (cfg.kv_dim * 4) as u64;
+    let kv_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
 
     // Warmup: each closure once.
     {
@@ -681,7 +685,7 @@ fn encode_step_matvec(
     se: &mut StepEncoder, cfg: &Config,
     sample_in: u32, sample_out: u32, pos: u32,
 ) {
-    let cache_row_bytes = (cfg.kv_dim * 4) as u64;
+    let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let StepEncoder { model: m, encoder, uniforms } = se;
     // Pass 0: embed + layer 0 pre-kv
     {
@@ -707,8 +711,8 @@ fn encode_step_matvec(
     for il in 0..cfg.n_layer {
         let layer_offset_bytes = (il as u64) * (m.max_seq as u64) * cache_row_bytes;
         let dst_offset_bytes = layer_offset_bytes + (pos as u64) * cache_row_bytes;
-        let k_src_bytes = (m.act_layout.k_cur as u64) * 4;
-        let v_src_bytes = (m.act_layout.v_cur as u64) * 4;
+        let k_src_bytes = (m.act_layout.k_cur as u64) * ACT_ELEM_BYTES;
+        let v_src_bytes = (m.act_layout.v_cur as u64) * ACT_ELEM_BYTES;
         encoder.copy_buffer_to_buffer(&m.buffers.act, k_src_bytes, &m.buffers.kv_k, dst_offset_bytes, cache_row_bytes);
         encoder.copy_buffer_to_buffer(&m.buffers.act, v_src_bytes, &m.buffers.kv_v, dst_offset_bytes, cache_row_bytes);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -721,7 +725,7 @@ fn encode_step_matvec(
             let on = tensor(cfg, "output_norm.weight").clone();
             dispatch_rms_norm(m, cfg, uniforms, &mut pass,
                               1, cfg.n_embd, m.act_layout.x, m.act_layout.x_norm,
-                              (on.offset / 4) as u32);
+                              (on.offset / ACT_ELEM_BYTES) as u32);
             let lm_w = tensor(cfg, "token_embd.weight").clone();
             dispatch_matvec_q1_0(m, uniforms, &mut pass,
                                  cfg.n_embd, cfg.n_vocab,
@@ -777,7 +781,7 @@ fn layer_pre_kv_in_pass(
     // 2a. Pre-attn RMSNorm
     let attn_norm = tensor(cfg, &format!("blk.{il}.attn_norm.weight")).clone();
     dispatch_rms_norm(model, cfg, uniforms, pass, 1, cfg.n_embd,
-                      model.act_layout.x, model.act_layout.x_norm, (attn_norm.offset / 4) as u32);
+                      model.act_layout.x, model.act_layout.x_norm, (attn_norm.offset / ACT_ELEM_BYTES) as u32);
 
     // 2b. Q,K,V projections — fused 3-range
     let wq = tensor(cfg, &format!("blk.{il}.attn_q.weight")).clone();
@@ -793,10 +797,10 @@ fn layer_pre_kv_in_pass(
     // 2c. Per-head Q-norm and K-norm (BEFORE rope)
     let qn = tensor(cfg, &format!("blk.{il}.attn_q_norm.weight")).clone();
     dispatch_rms_norm(model, cfg, uniforms, pass, cfg.n_head, cfg.head_dim,
-                      model.act_layout.q, model.act_layout.q, (qn.offset / 4) as u32);
+                      model.act_layout.q, model.act_layout.q, (qn.offset / ACT_ELEM_BYTES) as u32);
     let kn = tensor(cfg, &format!("blk.{il}.attn_k_norm.weight")).clone();
     dispatch_rms_norm(model, cfg, uniforms, pass, cfg.n_kv_head, cfg.head_dim,
-                      model.act_layout.k_cur, model.act_layout.k_cur, (kn.offset / 4) as u32);
+                      model.act_layout.k_cur, model.act_layout.k_cur, (kn.offset / ACT_ELEM_BYTES) as u32);
 
     // 2d. RoPE
     dispatch_rope(model, cfg, uniforms, pass, model.act_layout.q,     1, cfg.n_head,    pos);
@@ -809,7 +813,7 @@ fn layer_post_kv_in_pass(
     model: &Model, cfg: &Config, uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>, il: u32, pos: u32,
 ) {
-    let cache_row_bytes = (cfg.kv_dim * 4) as u64;
+    let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let layer_offset_bytes = (il as u64) * (model.max_seq as u64) * cache_row_bytes;
 
     // 2f. Attention (single-token gen path)
@@ -819,8 +823,8 @@ fn layer_post_kv_in_pass(
             pos: pos + 1,
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: ((layer_offset_bytes / 4) as u32),
-            v_cache_offset: ((layer_offset_bytes / 4) as u32),
+            k_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
+            v_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
             out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
             m_tokens: 1, is_prefill: 0,
@@ -842,7 +846,7 @@ fn layer_post_kv_in_pass(
     // 2h. FFN: pre-RMSNorm
     let fn_n = tensor(cfg, &format!("blk.{il}.ffn_norm.weight")).clone();
     dispatch_rms_norm(model, cfg, uniforms, pass, 1, cfg.n_embd,
-                      model.act_layout.x, model.act_layout.x_norm, (fn_n.offset / 4) as u32);
+                      model.act_layout.x, model.act_layout.x_norm, (fn_n.offset / ACT_ELEM_BYTES) as u32);
 
     // 2i. Wgate, Wup fused
     let wg = tensor(cfg, &format!("blk.{il}.ffn_gate.weight")).clone();
@@ -1011,7 +1015,7 @@ async fn prefill_matmul(model: &mut Model, cfg: &Config, prompt: &[u32]) -> u32 
     let mut se = StepEncoder::new(model);
     let on = tensor(cfg, "output_norm.weight").clone();
     rms_norm(model, cfg, &mut se, m, cfg.n_embd,
-             model.act_layout.x, model.act_layout.x_norm, (on.offset / 4) as u32);
+             model.act_layout.x, model.act_layout.x_norm, (on.offset / ACT_ELEM_BYTES) as u32);
 
     // LM head matvec on the LAST token's x_norm only.
     let last_input_offset = model.act_layout.x_norm + (m - 1) * cfg.n_embd;
@@ -1051,7 +1055,7 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     // 1. RMSNorm(attn_norm) for each token
     let an = tensor(cfg, &format!("blk.{il}.attn_norm.weight")).clone();
     rms_norm(model, cfg, se, m, cfg.n_embd,
-             model.act_layout.x, model.act_layout.x_norm, (an.offset / 4) as u32);
+             model.act_layout.x, model.act_layout.x_norm, (an.offset / ACT_ELEM_BYTES) as u32);
 
     // 2. Quantize x_norm to Q8_0
     let (a_d_off, a_qs_off) = quantize_act(model, cfg, se, cfg.n_embd, m, model.act_layout.x_norm);
@@ -1073,22 +1077,22 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     // 4. Per-head Q-norm, K-norm (groups = M * n_head or M * n_kv_head)
     let qn = tensor(cfg, &format!("blk.{il}.attn_q_norm.weight")).clone();
     rms_norm(model, cfg, se, m * cfg.n_head, cfg.head_dim,
-             model.act_layout.q, model.act_layout.q, (qn.offset / 4) as u32);
+             model.act_layout.q, model.act_layout.q, (qn.offset / ACT_ELEM_BYTES) as u32);
     let kn = tensor(cfg, &format!("blk.{il}.attn_k_norm.weight")).clone();
     rms_norm(model, cfg, se, m * cfg.n_kv_head, cfg.head_dim,
-             model.act_layout.k_cur, model.act_layout.k_cur, (kn.offset / 4) as u32);
+             model.act_layout.k_cur, model.act_layout.k_cur, (kn.offset / ACT_ELEM_BYTES) as u32);
 
     // 5. RoPE
     rope(model, cfg, se, model.act_layout.q,     m, cfg.n_head,    pos_base);
     rope(model, cfg, se, model.act_layout.k_cur, m, cfg.n_kv_head, pos_base);
 
     // 6. Copy K, V to cache (M tokens at offsets [0, M))
-    let cache_row_bytes = (cfg.kv_dim * 4) as u64;
+    let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let layer_offset_bytes = (il as u64) * (model.max_seq as u64) * cache_row_bytes;
     let total_bytes = (m as u64) * cache_row_bytes;
-    se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.k_cur * 4) as u64,
+    se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.k_cur as u64) * ACT_ELEM_BYTES,
                                      &model.buffers.kv_k, layer_offset_bytes, total_bytes);
-    se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.v_cur * 4) as u64,
+    se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.v_cur as u64) * ACT_ELEM_BYTES,
                                      &model.buffers.kv_v, layer_offset_bytes, total_bytes);
 
     // 7. Attention: single batched dispatch of (n_head, M) WGs.
@@ -1098,8 +1102,8 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
             pos: 0,                  // unused when is_prefill=1
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: ((layer_offset_bytes / 4) as u32),
-            v_cache_offset: ((layer_offset_bytes / 4) as u32),
+            k_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
+            v_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
             out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
             m_tokens: m, is_prefill: 1,
@@ -1123,7 +1127,7 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     // 9. ffn_norm
     let fn_n = tensor(cfg, &format!("blk.{il}.ffn_norm.weight")).clone();
     rms_norm(model, cfg, se, m, cfg.n_embd,
-             model.act_layout.x, model.act_layout.x_norm, (fn_n.offset / 4) as u32);
+             model.act_layout.x, model.act_layout.x_norm, (fn_n.offset / ACT_ELEM_BYTES) as u32);
 
     // 10. Quantize x_norm again, then Wgate, Wup
     let (a_d3, a_qs3) = quantize_act(model, cfg, se, cfg.n_embd, m, model.act_layout.x_norm);

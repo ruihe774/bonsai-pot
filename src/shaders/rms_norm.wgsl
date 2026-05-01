@@ -1,3 +1,5 @@
+enable f16;
+
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * w
 // Single binding to the activations buffer; input and output regions live at
 // different offsets within it. This avoids the wgpu rule that disallows the
@@ -17,8 +19,8 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read_write> act: array<f32>;
-@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(1) var<storage, read_write> act: array<f16>;
+@group(0) @binding(2) var<storage, read> w: array<f16>;
 
 const WG: u32 = 64u;
 var<workgroup> partial: array<f32, WG>;
@@ -37,7 +39,7 @@ fn main(
 
   var s: f32 = 0.0;
   for (var i: u32 = tid; i < n; i += WG) {
-    let v = act[in_base + i];
+    let v = f32(act[in_base + i]);
     s += v * v;
   }
   partial[tid] = s;
@@ -48,8 +50,8 @@ fn main(
     workgroupBarrier();
     step = step / 2u;
   }
-  let inv = inverseSqrt(partial[0] / f32(n) + p.eps);
+  let inv_h = f16(inverseSqrt(partial[0] / f32(n) + p.eps));
   for (var i: u32 = tid; i < n; i += WG) {
-    act[out_base + i] = act[in_base + i] * inv * w[p.weight_offset + i];
+    act[out_base + i] = act[in_base + i] * inv_h * w[p.weight_offset + i];
   }
 }

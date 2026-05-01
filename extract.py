@@ -18,7 +18,8 @@ Q1_0 tensors are stored as their raw 18-byte blocks (LSB-first sign bits +
 FP16 d at the front). Per-row stride is (n_in / 128) * 18 bytes; rows are
 contiguous, total = n_out rows. Each tensor's region is 4-byte padded.
 
-Norms (originally F32) are written verbatim as F32.
+Norms (originally F32 in the GGUF) are downcast to F16 on disk so the
+runtime can bind them as `array<f16>` without a load-time conversion.
 """
 import argparse, json, os, struct, sys
 sys.path.insert(0, '/tmp/llama.cpp/gguf-py')
@@ -150,7 +151,8 @@ def main():
         u32-aligned reads in WGSL. For Q1_0 we split into a d-array (FP16
         scales) followed by a qs-array (raw 16-byte sign blocks). Both halves
         are u32-aligned because n_rows*(K/128) is even for all our tensors.
-        For F32 / F16 we just emit FP32 contiguous."""
+        For F32 we emit f32 contiguous; for F16 we emit f16 contiguous (the
+        GGUF source may be F32 or F16 — F32 sources are downcast on the fly)."""
         shape = [int(s) for s in t.shape]
         entry = {
             "dtype": expected_dtype,
@@ -179,13 +181,18 @@ def main():
             entry["qs_offset"] = qs_offset
             entry["nb"] = nb
         elif t.tensor_type == gguf.GGMLQuantizationType.F32:
-            assert expected_dtype == "F32", f"{name}: dtype mismatch"
-            buf = np.ascontiguousarray(data, dtype=np.float32).tobytes()
+            if expected_dtype == "F32":
+                buf = np.ascontiguousarray(data, dtype=np.float32).tobytes()
+            elif expected_dtype == "F16":
+                buf = np.ascontiguousarray(data).astype(np.float16).tobytes()
+            else:
+                raise RuntimeError(f"{name}: F32 source cannot produce {expected_dtype}")
             out_f.write(buf)
             pad = pad4(out_f.tell()) - out_f.tell()
             if pad: out_f.write(b"\x00" * pad)
         elif t.tensor_type == gguf.GGMLQuantizationType.F16:
-            buf = np.ascontiguousarray(data, dtype=np.float16).astype(np.float32).tobytes()
+            assert expected_dtype == "F16", f"{name}: F16 source must produce F16"
+            buf = np.ascontiguousarray(data, dtype=np.float16).tobytes()
             out_f.write(buf)
             pad = pad4(out_f.tell()) - out_f.tell()
             if pad: out_f.write(b"\x00" * pad)
@@ -214,13 +221,13 @@ def main():
             name = f"blk.{il}.ffn_down.weight"
             write_tensor(f, by_name[name], name, "Q1_0")
 
-    # ---- group D: weights_norms (all FP32 norms incl. q_norm/k_norm) -------
+    # ---- group D: weights_norms (norms downcast to F16 for the f16 runtime) ---
     with open(os.path.join(args.out, "weights_norms.bin"), "wb") as f:
         for il in range(n_layer):
             for tag in ("attn_norm", "attn_q_norm", "attn_k_norm", "ffn_norm"):
                 name = f"blk.{il}.{tag}.weight"
-                write_tensor(f, by_name[name], name, "F32")
-        write_tensor(f, by_name["output_norm.weight"], "output_norm.weight", "F32")
+                write_tensor(f, by_name[name], name, "F16")
+        write_tensor(f, by_name["output_norm.weight"], "output_norm.weight", "F16")
 
     # ---- group E: weights_embed_lmhead -------------------------------------
     # Bonsai-4B has tied embeddings (no separate output.weight). The LM head

@@ -1,4 +1,6 @@
-// Single-workgroup argmax over `n` floats. Threads cooperate via shmem.
+enable f16;
+
+// Single-workgroup argmax over `n` halves. Threads cooperate via shmem.
 // dispatch: (1, 1, 1)
 
 struct Params {
@@ -9,7 +11,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> logits: array<f16>;
 @group(0) @binding(2) var<storage, read_write> result: array<u32>;
 
 const WG: u32 = 256u;
@@ -22,7 +24,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   var best_v: f32 = -1e30;
   var best_i: u32 = 0u;
   for (var i: u32 = tid; i < p.n; i += WG) {
-    let v = logits[p.in_offset + i];
+    let v = f32(logits[p.in_offset + i]);
     if (v > best_v) { best_v = v; best_i = i; }
   }
   sh_val[tid] = best_v;

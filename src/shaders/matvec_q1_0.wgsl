@@ -1,3 +1,5 @@
+enable f16;
+
 // Multiply-free Q1_0 matvec.
 // Multi-row workgroup: WG_X threads cooperate per row, ROWS_PER_WG rows per WG.
 // Each thread accumulates ±xv per weight via select(), then scales by d.
@@ -19,7 +21,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> weights: array<u32>;
-@group(0) @binding(2) var<storage, read_write> act: array<f32>;
+@group(0) @binding(2) var<storage, read_write> act: array<f16>;
 
 fn load_f16_at(b_offset: u32) -> f32 {
   let word = weights[b_offset >> 2u];
@@ -58,7 +60,7 @@ fn main(
         let qword = weights[qs_word_base + w];
         let x_word_off = x_base + w * 32u;
         for (var i: u32 = 0u; i < 32u; i++) {
-          let xv = act[x_word_off + i];
+          let xv = f32(act[x_word_off + i]);
           let bit_set = ((qword >> i) & 1u) != 0u;
           block_acc = block_acc + select(-xv, xv, bit_set);
         }
@@ -81,9 +83,9 @@ fn main(
   if (tx == 0u && valid) {
     let yi = p.output_offset + row;
     if (p.accumulate != 0u) {
-      act[yi] = act[yi] + partial[ty * WG_X];
+      act[yi] = f16(f32(act[yi]) + partial[ty * WG_X]);
     } else {
-      act[yi] = partial[ty * WG_X];
+      act[yi] = f16(partial[ty * WG_X]);
     }
   }
 }

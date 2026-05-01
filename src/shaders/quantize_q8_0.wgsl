@@ -1,4 +1,6 @@
-// Quantize FP32 activations to Q8_0 layout, with d's stored as FP32 in a
+enable f16;
+
+// Quantize f16 activations to Q8_0 layout, with d's stored as FP32 in a
 // separate region from qs's (so both regions are u32-aligned). Output buffer
 // (`outbuf`) is treated as `array<u32>`; the matmul shader reads:
 //   d (f32):  bitcast<f32>(outbuf[d_offset/4 + block_global])
@@ -8,7 +10,7 @@
 struct Params {
   k: u32,             // K, multiple of 32
   m: u32,             // number of tokens (rows)
-  input_offset: u32,  // f32 elements
+  input_offset: u32,  // f16 elements
   d_offset: u32,      // bytes
   qs_offset: u32,     // bytes
   dispatch_x_dim: u32,
@@ -16,7 +18,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f16>;
 @group(0) @binding(2) var<storage, read_write> outbuf: array<u32>;
 
 const WG: u32 = 32u;
@@ -37,7 +39,7 @@ fn main(
   if (m_idx >= p.m) { return; }
 
   let in_base = p.input_offset + m_idx * p.k + b_idx * 32u;
-  let v = x[in_base + tid];
+  let v = f32(x[in_base + tid]);
   shared_x[tid] = v;
   shared_amax[tid] = abs(v);
   if (tid < 8u) { atomicStore(&packed[tid], 0u); }

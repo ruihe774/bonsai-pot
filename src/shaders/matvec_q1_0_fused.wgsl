@@ -1,3 +1,5 @@
+enable f16;
+
 // Multi-range Q1_0 matvec: one dispatch produces output rows belonging to 2
 // or 3 separate weight tensors that share the same K dimension and the same
 // input activation. Used for fused Q/K/V projection (3 ranges) and fused
@@ -22,7 +24,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> weights: array<u32>;
-@group(0) @binding(2) var<storage, read_write> act: array<f32>;
+@group(0) @binding(2) var<storage, read_write> act: array<f16>;
 
 fn load_f16_at(b_offset: u32) -> f32 {
   let word = weights[b_offset >> 2u];
@@ -81,7 +83,7 @@ fn main(
         let qword = weights[qs_word_base + w];
         let x_word_off = x_base + w * 32u;
         for (var i: u32 = 0u; i < 32u; i++) {
-          let xv = act[x_word_off + i];
+          let xv = f32(act[x_word_off + i]);
           let bit_set = ((qword >> i) & 1u) != 0u;
           block_acc = block_acc + select(-xv, xv, bit_set);
         }
@@ -103,6 +105,6 @@ fn main(
   }
   if (tx == 0u && valid) {
     let yi = out_off + local_row;
-    act[yi] = partial[ty * WG_X];  // fused matvecs don't accumulate; outputs are fresh
+    act[yi] = f16(partial[ty * WG_X]);  // fused matvecs don't accumulate; outputs are fresh
   }
 }

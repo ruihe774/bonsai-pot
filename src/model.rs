@@ -1,8 +1,9 @@
 //! Bonsai-4B (Qwen3 architecture) Q1_0 inference: model loading & GPU resource setup.
 //!
 //! All large weights live in 5 storage buffers organized by role; the activation
-//! workspace is a single FP32 buffer with named regions plus a separate buffer for
-//! Q8_0 activations (used by the dot4I8Packed matmul path).
+//! workspace is a single f16 buffer with named regions plus a separate buffer for
+//! Q8_0 activations (used by the dot4I8Packed matmul path). Norm weights and the
+//! RoPE cos/sin table are also f16; Q8_0 scales remain f32.
 
 use bytemuck::{Pod, Zeroable};
 use serde::Deserialize;
@@ -124,6 +125,9 @@ pub const UNIFORM_SLOT_SIZE: u64 = 256;
 
 // ----- activation layout ----------------------------------------------------
 
+/// Region offsets into the single f16 activation buffer. All values are
+/// **element offsets** (count of f16 elements from the buffer's start), to
+/// match the shader-side `array<f16>` indexing — never bytes.
 #[derive(Copy, Clone, Debug)]
 pub struct ActLayout {
     pub x: u32, pub x_norm: u32,
@@ -131,7 +135,7 @@ pub struct ActLayout {
     pub attn_out: u32,
     pub gate: u32, pub up: u32, pub ffn_in: u32,
     pub logits: u32,
-    pub total_f32: u32,
+    pub total_elems: u32,
 }
 
 impl ActLayout {
@@ -148,7 +152,7 @@ impl ActLayout {
         let up      = alloc(m_max * cfg.n_ff,   &mut o);
         let ffn_in  = alloc(m_max * cfg.n_ff,   &mut o);
         let logits  = alloc(cfg.n_vocab,        &mut o);
-        Self { x, x_norm, q, k_cur, v_cur, attn_out, gate, up, ffn_in, logits, total_f32: o }
+        Self { x, x_norm, q, k_cur, v_cur, attn_out, gate, up, ffn_in, logits, total_elems: o }
     }
 }
 
@@ -175,7 +179,7 @@ pub struct Buffers {
     pub w_embed: wgpu::Buffer,
     pub kv_k: wgpu::Buffer,
     pub kv_v: wgpu::Buffer,
-    pub act: wgpu::Buffer,        // FP32 activations
+    pub act: wgpu::Buffer,        // f16 activations
     pub act_q8: wgpu::Buffer,     // Q8_0 activations (raw u32 buffer)
     pub rope_table: wgpu::Buffer,
     pub uniform: wgpu::Buffer,    // pool of 256-byte slots
@@ -236,6 +240,10 @@ impl Model {
             .expect("no GPU adapter");
         eprintln!("adapter: {:?}", adapter.get_info());
 
+        if !adapter.features().contains(wgpu::Features::SHADER_F16) {
+            panic!("adapter does not support SHADER_F16 — required for the mixed-precision build");
+        }
+
         let mut limits = adapter.limits();
         // Cap the requested binding size to the smaller of (1 GB, what the
         // adapter advertises). Bonsai-4B's largest grouped weight buffer is
@@ -251,7 +259,7 @@ impl Model {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    required_features: wgpu::Features::empty(),
+                    required_features: wgpu::Features::SHADER_F16,
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                     experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -277,13 +285,15 @@ impl Model {
         let w_norms  = make_storage("w_norms",  &load("weights_norms.bin"));
         let w_embed  = make_storage("w_embed",  &load("weights_embed_lmhead.bin"));
 
-        // ---- build RoPE table ----------------------------------------------
-        let rope_table = build_rope_table(&cfg, MAX_SEQ);
-        let rope_buf = make_storage("rope_table", bytemuck::cast_slice(&rope_table));
+        // ---- build RoPE table (f32 host-side, then downcast to f16) --------
+        let rope_table_f32 = build_rope_table(&cfg, MAX_SEQ);
+        let rope_table_f16: Vec<half::f16> =
+            rope_table_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let rope_buf = make_storage("rope_table", bytemuck::cast_slice(&rope_table_f16));
 
         // ---- KV cache, activations, scratch --------------------------------
         let kv_per_layer: u64 = MAX_SEQ as u64 * cfg.kv_dim as u64;
-        let kv_total: u64 = kv_per_layer * cfg.n_layer as u64 * 4;
+        let kv_total: u64 = kv_per_layer * cfg.n_layer as u64 * std::mem::size_of::<half::f16>() as u64;
         let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_k"), size: kv_total,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -296,9 +306,13 @@ impl Model {
         });
 
         let act_layout = ActLayout::build(&cfg, M_MAX);
+        // Pad to a multiple of 4 bytes — wgpu requires storage-buffer binding
+        // sizes to be 4-byte aligned, and with f16 elements an odd `total_elems`
+        // (e.g. logits region for an odd n_vocab) would otherwise fail validation.
+        let act_size = (act_layout.total_elems as u64 * std::mem::size_of::<half::f16>() as u64 + 3) & !3;
         let act_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("act"),
-            size: act_layout.total_f32 as u64 * 4,
+            size: act_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });

@@ -1,3 +1,5 @@
+enable f16;
+
 // Causal self-attention with one-pass online softmax (flash-attention-1 style).
 // One workgroup per (token, head). GQA: Q-head h maps to KV-head h/(n_head/n_kv_head).
 // dispatch: (n_head, m_tokens, 1).
@@ -26,9 +28,9 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read_write> act: array<f32>;
-@group(0) @binding(2) var<storage, read> k_cache: array<f32>;
-@group(0) @binding(3) var<storage, read> v_cache: array<f32>;
+@group(0) @binding(1) var<storage, read_write> act: array<f16>;
+@group(0) @binding(2) var<storage, read> k_cache: array<f16>;
+@group(0) @binding(3) var<storage, read> v_cache: array<f16>;
 
 const WG: u32 = 64u;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
@@ -61,7 +63,7 @@ fn main(
     let k_base = p.k_cache_offset + t * p.kv_stride + g * hd;
     var local_dot: f32 = 0.0;
     for (var d: u32 = tid; d < hd; d += WG) {
-      local_dot = local_dot + act[q_base + d] * k_cache[k_base + d];
+      local_dot = local_dot + f32(act[q_base + d]) * f32(k_cache[k_base + d]);
     }
     partial[tid] = local_dot;
     workgroupBarrier();
@@ -86,7 +88,7 @@ fn main(
     for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
       let d = tid + i * WG;
       if (d < hd) {
-        o[i] = o[i] * correction + weight * v_cache[v_base + d];
+        o[i] = o[i] * correction + weight * f32(v_cache[v_base + d]);
       }
     }
   }
@@ -97,7 +99,7 @@ fn main(
   for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
     let d = tid + i * WG;
     if (d < hd) {
-      act[out_base + d] = o[i] * inv_l;
+      act[out_base + d] = f16(o[i] * inv_l);
     }
   }
 }

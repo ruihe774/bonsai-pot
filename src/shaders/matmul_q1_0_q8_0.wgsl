@@ -1,6 +1,7 @@
+enable f16;
 requires packed_4x8_integer_dot_product;
 
-// dot4I8Packed matmul: Q1_0 weights × Q8_0 activations -> FP32 output.
+// dot4I8Packed matmul: Q1_0 weights × Q8_0 activations -> f16 output.
 //
 // 64×64 tile, 256 threads, each thread = 4×4 = 16 cells.
 
@@ -20,7 +21,7 @@ struct Params {
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> weights: array<u32>;
 @group(0) @binding(2) var<storage, read> acts: array<u32>;
-@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f16>;
 
 const WG_N: u32 = 16u;
 const WG_M: u32 = 16u;
@@ -240,9 +241,9 @@ fn main(
       let yi = p.out_offset + m_idx * p.n + n_idx;
       let val = acc[tm * TN + tn];
       if (p.accumulate != 0u) {
-        y[yi] = y[yi] + val;
+        y[yi] = f16(f32(y[yi]) + val);
       } else {
-        y[yi] = val;
+        y[yi] = f16(val);
       }
     }
   }

@@ -1,4 +1,6 @@
-// Q1_0 row gather: dequant ONE row of the embedding matrix into FP32.
+enable f16;
+
+// Q1_0 row gather: dequant ONE row of the embedding matrix into f16.
 // Reads the row index (token_id) from `sample[sample_offset]`; this lets us
 // chain steps on the GPU without a CPU round-trip — argmax of step N writes
 // the input token for step N+1.
@@ -8,7 +10,7 @@ struct Params {
   k: u32,             // n_embd
   d_offset: u32,
   qs_offset: u32,
-  output_offset: u32, // f32 elements
+  output_offset: u32, // f16 elements
   sample_offset: u32, // index into sample[] for the input token
   m_token: u32,       // which output row in the M batch
   _p0: u32, _p1: u32,
@@ -16,7 +18,7 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> weights: array<u32>;
-@group(0) @binding(2) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> x: array<f16>;
 @group(0) @binding(3) var<storage, read> sample: array<u32>;
 
 fn load_f16_at(b_offset: u32) -> f32 {
@@ -43,7 +45,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   for (var k: u32 = 0u; k < 16u; k++) {
     let qb = load_byte_at(qs_b + k);
     for (var bit: u32 = 0u; bit < 8u; bit++) {
-      x[out_base + k * 8u + bit] = select(-d, d, ((qb >> bit) & 1u) != 0u);
+      x[out_base + k * 8u + bit] = f16(select(-d, d, ((qb >> bit) & 1u) != 0u));
     }
   }
 }
