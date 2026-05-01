@@ -10,7 +10,7 @@
 //!   bonsai-pot ./model --temperature 0.8 --top-k 50 --top-p 0.95 --seed 42 \
 //!       < ./model/prompt.bin
 
-use bonsai_pot::{GenerateOptions, Model, Sampler};
+use bonsai_pot::{GenerateOptions, Model, ModelOptions, Sampler};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -20,6 +20,7 @@ struct Args {
     n_gen: u32,
     pp_n: u32,
     tg_n: u32,
+    max_seq: u32,
     repeats: u32,
     use_matmul_prefill: bool,
     temperature: f32,
@@ -67,6 +68,10 @@ BENCH OPTIONS:
     --repeats <n>          Repeat count per bench row.
                            [default: 5]
 
+LOAD OPTIONS:
+    --max-seq <n>          KV-cache capacity (positions). Larger values cost
+                           VRAM linearly. [default: 1024]
+
 OTHER:
     -h, --help             Show this help and exit.
 
@@ -100,6 +105,7 @@ fn parse_args() -> Args {
         n_gen: 32,
         pp_n: 512,
         tg_n: 128,
+        max_seq: 1024,
         repeats: 5,
         use_matmul_prefill: false,
         temperature: 0.0, // CLI default = greedy, for reproducible runs
@@ -119,6 +125,7 @@ fn parse_args() -> Args {
             "--pp" => { a.pp_n = parse_or_die("--pp", &next()); i += 2; }
             "--tg" => { a.tg_n = parse_or_die("--tg", &next()); i += 2; }
             "--repeats" => { a.repeats = parse_or_die("--repeats", &next()); i += 2; }
+            "--max-seq" => { a.max_seq = parse_or_die("--max-seq", &next()); i += 2; }
             "--temperature" => { a.temperature = parse_or_die("--temperature", &next()); i += 2; }
             "--top-k" => { a.top_k = Some(parse_or_die("--top-k", &next())); i += 2; }
             "--top-p" => { a.top_p = Some(parse_or_die("--top-p", &next())); i += 2; }
@@ -140,7 +147,10 @@ fn main() {
     let args = parse_args();
 
     pollster::block_on(async move {
-        let model = Model::load(&args.model_dir).await
+        let model = Model::load_with_options(
+            &args.model_dir,
+            ModelOptions { max_seq: args.max_seq },
+        ).await
             .unwrap_or_else(|e| { eprintln!("load error: {e}"); std::process::exit(2) });
 
         match args.mode.as_str() {

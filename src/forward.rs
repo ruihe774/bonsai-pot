@@ -26,8 +26,25 @@ use crate::error::{PotError, Result};
 use crate::model::*;
 use bytemuck::Pod;
 
-/// Byte size of one activation / KV / norm-weight element.
-const ACT_ELEM_BYTES: u64 = std::mem::size_of::<half::f16>() as u64;
+// ---------- Q8_0 KV cache layout helpers ------------------------------------
+// Each kv_{k,v} buffer carries:
+//   d-section  (FP32 scales): bytes [0, n_layer * max_seq * (kv_dim/32) * 4)
+//   qs-section (i8 packed):   bytes [d_total, d_total + n_layer * max_seq * kv_dim)
+// The block index for (layer il, position pos, block b in [0, kv_dim/32)) is
+// `(il * max_seq + pos) * (kv_dim/32) + b` (single-row stride = kv_dim/32 in
+// d-elements, kv_dim in qs-bytes).
+
+fn kv_qs_byte_base(cfg: &Config, max_seq: u32) -> u32 {
+    cfg.n_layer * max_seq * (cfg.kv_dim / 32) * 4
+}
+
+/// `(d_word_offset, qs_byte_offset)` for the start of layer `il` inside each
+/// kv buffer. Same layout for kv_k and kv_v, so callers reuse the pair.
+fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
+    let d_word = il * max_seq * (cfg.kv_dim / 32);
+    let qs_byte = kv_qs_byte_base(cfg, max_seq) + il * max_seq * cfg.kv_dim;
+    (d_word, qs_byte)
+}
 
 // ---------- per-step encoder + uniform pool ---------------------------------
 
@@ -237,15 +254,27 @@ fn dispatch_topk_reduce(
 }
 
 fn dispatch_kv_writeback(
-    model: &Model, uniforms: &mut UniformPool, pass: &mut wgpu::ComputePass<'_>,
-    k_cur_off: u32, v_cur_off: u32, dst_off: u32, total_elems: u32,
+    model: &Model, cfg: &Config, uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    k_cur_off: u32, v_cur_off: u32,
+    layer_il: u32, pos_base: u32, m_tokens: u32,
 ) {
-    let p = KvWritebackParams { k_cur_off, v_cur_off, dst_off, total_elems };
+    let nb_per_row = cfg.kv_dim / 32;
+    let total_blocks = m_tokens * nb_per_row;
+    let dispatch_x = total_blocks.min(65535);
+    let dispatch_y = (total_blocks + dispatch_x - 1) / dispatch_x;
+    let (dst_d_word_offset, dst_qs_byte_offset) =
+        kv_layer_offsets(cfg, model.max_seq, layer_il);
+    let p = KvWritebackParams {
+        k_cur_off, v_cur_off,
+        dst_d_word_offset, dst_qs_byte_offset,
+        pos_base, nb_per_row, kv_dim: cfg.kv_dim,
+        dispatch_x_dim: dispatch_x,
+    };
     let off = uniforms.alloc(&p);
     pass.set_pipeline(&model.pipes.kv_writeback);
     pass.set_bind_group(0, &model.cached.kv_writeback, &[off]);
-    let n_wg = (total_elems + 63) / 64;
-    pass.dispatch_workgroups(n_wg, 1, 1);
+    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
 // ---------- async readback helper -------------------------------------------
@@ -320,11 +349,11 @@ pub(crate) fn encode_step_matvec(
     }
     for il in 0..cfg.n_layer {
         layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
-        // kv writeback (replaces the copy_buffer_to_buffer that used to break the pass)
-        let dst_off = il * m.max_seq * cfg.kv_dim + pos * cfg.kv_dim;
-        dispatch_kv_writeback(m, uniforms, &mut pass,
+        // Q8_0-quantize K/V and write into the cache (replaces the
+        // copy_buffer_to_buffer that used to break the pass).
+        dispatch_kv_writeback(m, cfg, uniforms, &mut pass,
                               m.act_layout.k_cur, m.act_layout.v_cur,
-                              dst_off, cfg.kv_dim);
+                              il, pos, 1);
         layer_post_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
     }
     // output suffix (was inside the last layer's pass before)
@@ -403,25 +432,22 @@ fn layer_post_kv_in_pass(
     pass: &mut wgpu::ComputePass<'_>, il: u32, pos: u32,
 ) {
     let lt = &model.layer_tensors[il as usize];
-    let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
-    let layer_offset_bytes = (il as u64) * (model.max_seq as u64) * cache_row_bytes;
 
     // Split-K + GQA-batched flash-attention for tg (m_tokens=1).
     {
         let cur_pos = pos + 1;
         let n_chunks_active = (cur_pos + ATTN_CHUNK_SIZE - 1) / ATTN_CHUNK_SIZE;
-        let kv_off = (layer_offset_bytes / ACT_ELEM_BYTES) as u32;
+        let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, il);
 
         let ps = AttnSplitParams {
             head_dim: cfg.head_dim, n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
             pos: cur_pos,
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: kv_off,
-            v_cache_offset: kv_off,
+            k_d_word_offset: d_word, k_qs_byte_offset: qs_byte,
+            v_d_word_offset: d_word, v_qs_byte_offset: qs_byte,
             n_chunks_active,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-            ..Default::default()
         };
         let off = uniforms.alloc(&ps);
         pass.set_pipeline(&model.pipes.attention_split);
@@ -623,19 +649,19 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     rope(model, cfg, se, model.act_layout.q,     m, cfg.n_head,    pos_base);
     rope(model, cfg, se, model.act_layout.k_cur, m, cfg.n_kv_head, pos_base);
 
-    let layer_offset_elems = il * model.max_seq * cfg.kv_dim;
-    kv_writeback(model, se,
+    kv_writeback(model, cfg, se,
                  model.act_layout.k_cur, model.act_layout.v_cur,
-                 layer_offset_elems, m * cfg.kv_dim);
+                 il, /*pos_base=*/ 0, m);
 
     {
+        let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, il);
         let p = AttnParams {
             head_dim: cfg.head_dim, n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
             pos: 0,
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: layer_offset_elems,
-            v_cache_offset: layer_offset_elems,
+            k_d_word_offset: d_word, k_qs_byte_offset: qs_byte,
+            v_d_word_offset: d_word, v_qs_byte_offset: qs_byte,
             out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
             m_tokens: m, is_prefill: 1,
@@ -776,17 +802,28 @@ fn quantize_act(model: &Model, _cfg: &Config, se: &mut StepEncoder,
     (d_off, qs_off)
 }
 
-fn kv_writeback(model: &Model, se: &mut StepEncoder,
-                k_cur_off: u32, v_cur_off: u32, dst_off: u32, total_elems: u32) {
-    let p = KvWritebackParams { k_cur_off, v_cur_off, dst_off, total_elems };
+fn kv_writeback(model: &Model, cfg: &Config, se: &mut StepEncoder,
+                k_cur_off: u32, v_cur_off: u32,
+                layer_il: u32, pos_base: u32, m_tokens: u32) {
+    let nb_per_row = cfg.kv_dim / 32;
+    let total_blocks = m_tokens * nb_per_row;
+    let dispatch_x = total_blocks.min(65535);
+    let dispatch_y = (total_blocks + dispatch_x - 1) / dispatch_x;
+    let (dst_d_word_offset, dst_qs_byte_offset) =
+        kv_layer_offsets(cfg, model.max_seq, layer_il);
+    let p = KvWritebackParams {
+        k_cur_off, v_cur_off,
+        dst_d_word_offset, dst_qs_byte_offset,
+        pos_base, nb_per_row, kv_dim: cfg.kv_dim,
+        dispatch_x_dim: dispatch_x,
+    };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("kv_writeback"), timestamp_writes: None,
     });
     cp.set_pipeline(&model.pipes.kv_writeback);
     cp.set_bind_group(0, &model.cached.kv_writeback, &[off]);
-    let n_wg = (total_elems + 63) / 64;
-    cp.dispatch_workgroups(n_wg, 1, 1);
+    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
 fn silu_mul(model: &Model, se: &mut StepEncoder,
@@ -958,14 +995,15 @@ pub mod bench_internals {
         })));
 
         entries.push((format!("attention pos={attn_pos:<3}                "), 36, Box::new(move |model, cfg, se| {
-            let layer_offset = 0u64;
+            // Layer 0: d-section starts at byte 0; qs-section starts at d_total.
+            let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, 0);
             let p = AttnParams {
                 head_dim: cfg.head_dim, n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
                 pos: attn_pos,
                 kv_stride: cfg.kv_dim,
                 q_offset: model.act_layout.q,
-                k_cache_offset: ((layer_offset / ACT_ELEM_BYTES) as u32),
-                v_cache_offset: ((layer_offset / ACT_ELEM_BYTES) as u32),
+                k_d_word_offset: d_word, k_qs_byte_offset: qs_byte,
+                v_d_word_offset: d_word, v_qs_byte_offset: qs_byte,
                 out_offset: model.act_layout.attn_out,
                 scale: 1.0 / (cfg.head_dim as f32).sqrt(),
                 m_tokens: 1, is_prefill: 0,
@@ -1003,13 +1041,13 @@ pub mod bench_internals {
             cp.dispatch_workgroups(1, 1, 1);
         })));
 
-        let kv_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
-
         // Warmup
         {
             let mut se = StepEncoder::new(model);
             for (_l, _c, f) in entries.iter() { f(model, cfg, &mut se); }
-            se.encoder.copy_buffer_to_buffer(&model.buffers.act, 0, &model.buffers.kv_k, 0, kv_row_bytes);
+            kv_writeback(model, cfg, &mut se,
+                         model.act_layout.k_cur, model.act_layout.v_cur,
+                         /*layer_il=*/ 0, /*pos_base=*/ 0, /*m_tokens=*/ 1);
             let cb = se.finish();
             model.queue.submit(Some(cb));
             model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
@@ -1036,18 +1074,20 @@ pub mod bench_internals {
             let mut samples = Vec::with_capacity(repeats as usize);
             for _ in 0..repeats {
                 let t = std::time::Instant::now();
-                let mut enc = model.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("kvcopy") });
+                let mut se = StepEncoder::new(model);
                 for _ in 0..n_per_cb {
-                    enc.copy_buffer_to_buffer(&model.buffers.act, 0, &model.buffers.kv_k, 0, kv_row_bytes);
-                    enc.copy_buffer_to_buffer(&model.buffers.act, 0, &model.buffers.kv_v, 0, kv_row_bytes);
+                    kv_writeback(model, cfg, &mut se,
+                                 model.act_layout.k_cur, model.act_layout.v_cur,
+                                 /*layer_il=*/ 0, /*pos_base=*/ 0, /*m_tokens=*/ 1);
                 }
-                model.queue.submit(Some(enc.finish()));
+                let cb = se.finish();
+                model.queue.submit(Some(cb));
                 model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
             let per_pair_us = mean / n_per_cb as f32 * 1e6;
-            breakdown.push(("kv-cache copy (K+V)             ".to_string(), 36, per_pair_us));
+            breakdown.push(("kv_writeback Q8_0 (K+V)         ".to_string(), 36, per_pair_us));
         }
 
         println!();

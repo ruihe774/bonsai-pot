@@ -12,6 +12,12 @@ enable f16;
 // in a single `subgroupAdd` (assumes subgroup_size == workgroup_size == 64,
 // i.e. RDNA wave64). No workgroup barriers in the inner loop.
 //
+// K/V cache is Q8_0: per 32 contiguous elements of the kv-row we have one
+// FP32 scale (in the d-section) and 32 packed i8 values (in the qs-section).
+// The two sections live in the SAME u32 storage buffer; layer-base offsets
+// are passed in as `k_d_word_offset` (u32-word offset, FP32 scales) and
+// `k_qs_byte_offset` (byte offset, i8 qs).
+//
 // Output: partials[h_global, chunk] = (o[head_dim], m, l) — 130 f32s per
 // (head, chunk). Stride in the chunk dim is `n_chunks_active`, set by host.
 
@@ -22,18 +28,18 @@ struct Params {
   pos: u32,
   kv_stride: u32,
   q_offset: u32,
-  k_cache_offset: u32,
-  v_cache_offset: u32,
+  k_d_word_offset: u32,
+  k_qs_byte_offset: u32,
+  v_d_word_offset: u32,
+  v_qs_byte_offset: u32,
   n_chunks_active: u32,
   scale: f32,
-  _p0: u32,
-  _p1: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> act: array<f16>;
-@group(0) @binding(2) var<storage, read> k_cache: array<f16>;
-@group(0) @binding(3) var<storage, read> v_cache: array<f16>;
+@group(0) @binding(2) var<storage, read> k_cache: array<u32>;
+@group(0) @binding(3) var<storage, read> v_cache: array<u32>;
 @group(0) @binding(4) var<storage, read_write> partials: array<f32>;
 
 const SG_SIZE: u32 = {{SG_SIZE}}u;
@@ -63,6 +69,37 @@ fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
   }
   workgroupBarrier();
   return sg_partial4[0];
+}
+
+// Load and dequantize one element from a Q8_0 cache buffer.
+//   buf:           &k_cache or &v_cache (both array<u32> in this BG)
+//   d_word_off:    u32-word offset of the layer's d-section start
+//   qs_byte_off:   byte offset of the layer's qs-section start
+//   t:             cache position (in elements within the layer's row-grid)
+//   kv_stride:     elements per row (= kv_dim)
+//   e_local:       element index within the row (= g_off + d)
+fn load_k(t: u32, e_local: u32) -> f32 {
+  let elem_idx = t * p.kv_stride + e_local;
+  let block_idx = elem_idx >> 5u;
+  let scale = bitcast<f32>(k_cache[p.k_d_word_offset + block_idx]);
+  let qs_byte_idx = p.k_qs_byte_offset + elem_idx;
+  let qs_word = k_cache[qs_byte_idx >> 2u];
+  let shift = (qs_byte_idx & 3u) << 3u;
+  let qs_byte = (qs_word >> shift) & 0xFFu;
+  let qs_signed = bitcast<i32>(qs_byte << 24u) >> 24u;
+  return scale * f32(qs_signed);
+}
+
+fn load_v(t: u32, e_local: u32) -> f32 {
+  let elem_idx = t * p.kv_stride + e_local;
+  let block_idx = elem_idx >> 5u;
+  let scale = bitcast<f32>(v_cache[p.v_d_word_offset + block_idx]);
+  let qs_byte_idx = p.v_qs_byte_offset + elem_idx;
+  let qs_word = v_cache[qs_byte_idx >> 2u];
+  let shift = (qs_byte_idx & 3u) << 3u;
+  let qs_byte = (qs_word >> shift) & 0xFFu;
+  let qs_signed = bitcast<i32>(qs_byte << 24u) >> 24u;
+  return scale * f32(qs_signed);
 }
 
 @compute @workgroup_size(WG)
@@ -97,12 +134,10 @@ fn main(
   var l: vec4<f32> = vec4<f32>(0.0);
 
   for (var t: u32 = chunk_start; t < chunk_end; t++) {
-    let k_base = p.k_cache_offset + t * p.kv_stride + g_off;
-
     // Load K[t] once, broadcast against all four Qs.
     var local: vec4<f32> = vec4<f32>(0.0);
     for (var d: u32 = tid; d < hd; d += WG) {
-      let k = f32(k_cache[k_base + d]);
+      let k = load_k(t, g_off + d);
       let q0 = f32(act[q_base0 + d]);
       let q1 = f32(act[q_base1 + d]);
       let q2 = f32(act[q_base2 + d]);
@@ -119,11 +154,10 @@ fn main(
     l = l * correction + weight;
     m = m_new;
 
-    let v_base = p.v_cache_offset + t * p.kv_stride + g_off;
     for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
       let d = tid + i * WG;
       if (d < hd) {
-        let v = f32(v_cache[v_base + d]);
+        let v = load_v(t, g_off + d);
         o0[i] = o0[i] * correction.x + weight.x * v;
         o1[i] = o1[i] * correction.y + weight.y * v;
         o2[i] = o2[i] * correction.z + weight.z * v;

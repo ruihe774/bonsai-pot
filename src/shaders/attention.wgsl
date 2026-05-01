@@ -11,6 +11,11 @@ enable f16;
 // amortizes the workgroupBarrier cost (the dominant overhead at long context)
 // and lets multiple K/V loads stay in flight per barrier wait.
 //
+// K/V cache is Q8_0: per 32 contiguous elements of the kv-row we have one
+// FP32 scale (in the d-section) and 32 packed i8 values (in the qs-section).
+// Both sections live in the SAME u32 storage buffer; layer-base offsets are
+// passed in (`k_d_word_offset` / `k_qs_byte_offset` / `v_*`).
+//
 // Per-thread output accumulator is `array<f32, ELEMS_PER_THREAD>` where each
 // thread owns elements (tid, tid+WG, ...) of the head-dim-sized output vector.
 // For Bonsai-4B (head_dim=128, WG=64), ELEMS_PER_THREAD = 2.
@@ -22,8 +27,10 @@ struct Params {
   pos: u32,
   kv_stride: u32,
   q_offset: u32,
-  k_cache_offset: u32,
-  v_cache_offset: u32,
+  k_d_word_offset: u32,
+  k_qs_byte_offset: u32,
+  v_d_word_offset: u32,
+  v_qs_byte_offset: u32,
   out_offset: u32,
   scale: f32,
   m_tokens: u32,
@@ -32,8 +39,8 @@ struct Params {
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read_write> act: array<f16>;
-@group(0) @binding(2) var<storage, read> k_cache: array<f16>;
-@group(0) @binding(3) var<storage, read> v_cache: array<f16>;
+@group(0) @binding(2) var<storage, read> k_cache: array<u32>;
+@group(0) @binding(3) var<storage, read> v_cache: array<u32>;
 
 const SG_SIZE: u32 = {{SG_SIZE}}u;
 const WG: u32 = 64u;
@@ -81,6 +88,31 @@ fn wg_sum_f32(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
   return sg_partial1[0];
 }
 
+// Dequant load helpers — see attention_split.wgsl for layout notes.
+fn load_k(t: u32, e_local: u32) -> f32 {
+  let elem_idx = t * p.kv_stride + e_local;
+  let block_idx = elem_idx >> 5u;
+  let scale = bitcast<f32>(k_cache[p.k_d_word_offset + block_idx]);
+  let qs_byte_idx = p.k_qs_byte_offset + elem_idx;
+  let qs_word = k_cache[qs_byte_idx >> 2u];
+  let shift = (qs_byte_idx & 3u) << 3u;
+  let qs_byte = (qs_word >> shift) & 0xFFu;
+  let qs_signed = bitcast<i32>(qs_byte << 24u) >> 24u;
+  return scale * f32(qs_signed);
+}
+
+fn load_v(t: u32, e_local: u32) -> f32 {
+  let elem_idx = t * p.kv_stride + e_local;
+  let block_idx = elem_idx >> 5u;
+  let scale = bitcast<f32>(v_cache[p.v_d_word_offset + block_idx]);
+  let qs_byte_idx = p.v_qs_byte_offset + elem_idx;
+  let qs_word = v_cache[qs_byte_idx >> 2u];
+  let shift = (qs_byte_idx & 3u) << 3u;
+  let qs_byte = (qs_word >> shift) & 0xFFu;
+  let qs_signed = bitcast<i32>(qs_byte << 24u) >> 24u;
+  return scale * f32(qs_signed);
+}
+
 @compute @workgroup_size(WG)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
@@ -112,17 +144,14 @@ fn main(
   while (t < main_end) {
     // 1) Compute four Q·K dots (one per upcoming cache position) packed into
     //    a single vec4<f32> reduction.
-    let k_base0 = p.k_cache_offset + (t + 0u) * p.kv_stride + g_off;
-    let k_base1 = p.k_cache_offset + (t + 1u) * p.kv_stride + g_off;
-    let k_base2 = p.k_cache_offset + (t + 2u) * p.kv_stride + g_off;
-    let k_base3 = p.k_cache_offset + (t + 3u) * p.kv_stride + g_off;
     var local: vec4<f32> = vec4<f32>(0.0);
     for (var d: u32 = tid; d < hd; d += WG) {
       let q = f32(act[q_base + d]);
-      let k0 = f32(k_cache[k_base0 + d]);
-      let k1 = f32(k_cache[k_base1 + d]);
-      let k2 = f32(k_cache[k_base2 + d]);
-      let k3 = f32(k_cache[k_base3 + d]);
+      let e_local = g_off + d;
+      let k0 = load_k(t + 0u, e_local);
+      let k1 = load_k(t + 1u, e_local);
+      let k2 = load_k(t + 2u, e_local);
+      let k3 = load_k(t + 3u, e_local);
       local = local + q * vec4<f32>(k0, k1, k2, k3);
     }
     // Workgroup-wide reduction (one subgroupAdd if SG covers WG, else two-step).
@@ -138,11 +167,11 @@ fn main(
       l_run = l_run * correction + weight;
       m_run = m_new;
 
-      let v_base = p.v_cache_offset + (t + i) * p.kv_stride + g_off;
       for (var j: u32 = 0u; j < ELEMS_PER_THREAD; j++) {
         let d = tid + j * WG;
         if (d < hd) {
-          o[j] = o[j] * correction + weight * f32(v_cache[v_base + d]);
+          let v = load_v(t + i, g_off + d);
+          o[j] = o[j] * correction + weight * v;
         }
       }
     }
@@ -152,10 +181,9 @@ fn main(
 
   // ---- Tail loop (remaining < UNROLL positions) ---------------------------
   while (t < cur_pos) {
-    let k_base = p.k_cache_offset + t * p.kv_stride + g_off;
     var local_dot: f32 = 0.0;
     for (var d: u32 = tid; d < hd; d += WG) {
-      local_dot = local_dot + f32(act[q_base + d]) * f32(k_cache[k_base + d]);
+      local_dot = local_dot + f32(act[q_base + d]) * load_k(t, g_off + d);
     }
     let dot = wg_sum_f32(local_dot, tid, sg_inv_id);
 
@@ -166,11 +194,11 @@ fn main(
     l_run = l_run * correction + weight;
     m_run = m_new;
 
-    let v_base = p.v_cache_offset + t * p.kv_stride + g_off;
     for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
       let d = tid + i * WG;
       if (d < hd) {
-        o[i] = o[i] * correction + weight * f32(v_cache[v_base + d]);
+        let v = load_v(t, g_off + d);
+        o[i] = o[i] * correction + weight * v;
       }
     }
     t = t + 1u;

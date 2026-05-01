@@ -144,15 +144,19 @@ pub(crate) struct MatmulParams {
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub(crate) struct AttnParams {
     pub head_dim: u32, pub n_head: u32, pub n_kv_head: u32, pub pos: u32,
-    pub kv_stride: u32, pub q_offset: u32, pub k_cache_offset: u32, pub v_cache_offset: u32,
+    pub kv_stride: u32, pub q_offset: u32,
+    pub k_d_word_offset: u32, pub k_qs_byte_offset: u32,
+    pub v_d_word_offset: u32, pub v_qs_byte_offset: u32,
     pub out_offset: u32, pub scale: f32, pub m_tokens: u32, pub is_prefill: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub(crate) struct AttnSplitParams {
     pub head_dim: u32, pub n_head: u32, pub n_kv_head: u32, pub pos: u32,
-    pub kv_stride: u32, pub q_offset: u32, pub k_cache_offset: u32, pub v_cache_offset: u32,
-    pub n_chunks_active: u32, pub scale: f32, pub _p0: u32, pub _p1: u32,
+    pub kv_stride: u32, pub q_offset: u32,
+    pub k_d_word_offset: u32, pub k_qs_byte_offset: u32,
+    pub v_d_word_offset: u32, pub v_qs_byte_offset: u32,
+    pub n_chunks_active: u32, pub scale: f32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -174,7 +178,14 @@ pub(crate) struct TopKParams {
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub(crate) struct KvWritebackParams {
-    pub k_cur_off: u32, pub v_cur_off: u32, pub dst_off: u32, pub total_elems: u32,
+    pub k_cur_off: u32,           // f16 element offset in act
+    pub v_cur_off: u32,           // f16 element offset in act
+    pub dst_d_word_offset: u32,   // u32-word offset into kv_{k,v} (FP32 d-section, layer base)
+    pub dst_qs_byte_offset: u32,  // byte offset into kv_{k,v} (qs-section, layer base)
+    pub pos_base: u32,            // first absolute cache position to write into
+    pub nb_per_row: u32,          // kv_dim / 32
+    pub kv_dim: u32,
+    pub dispatch_x_dim: u32,
 }
 
 // All of these <= 64 bytes; we pack each into a 256-byte uniform slot.
@@ -365,11 +376,12 @@ pub(crate) const UNIFORM_POOL_SLOTS: u64 = 4096;
 pub struct ModelOptions {
     /// Maximum sequence length (positions in the KV cache). Default: 1024.
     ///
-    /// VRAM cost is linear: KV cache uses
-    /// `n_layer * max_seq * kv_dim * 2 bytes * 2` (K and V combined). The
-    /// RoPE table grows as `max_seq * head_dim * 2 bytes`. The shaders
-    /// themselves don't bake in a sequence-length limit, so any value up to
-    /// the model's `context_length` is supported (subject to VRAM).
+    /// VRAM cost is linear: KV cache (Q8_0 K and V combined) uses roughly
+    /// `n_layer * max_seq * kv_dim * 2.25 bytes` — 32 i8 qs + one FP32 scale
+    /// per 32-element block, doubled for K and V. The RoPE table grows as
+    /// `max_seq * head_dim * 2 bytes`. The shaders themselves don't bake in
+    /// a sequence-length limit, so any value up to the model's
+    /// `context_length` is supported (subject to VRAM).
     pub max_seq: u32,
 }
 
@@ -487,9 +499,22 @@ impl Model {
             rope_table_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
         let rope_buf = make_storage("rope_table", bytemuck::cast_slice(&rope_table_f16));
 
-        // ---- KV cache, activations, scratch --------------------------------
-        let kv_per_layer: u64 = opts.max_seq as u64 * cfg.kv_dim as u64;
-        let kv_total: u64 = kv_per_layer * cfg.n_layer as u64 * std::mem::size_of::<half::f16>() as u64;
+        // ---- KV cache (Q8_0), activations, scratch -------------------------
+        // Layout per buffer (kv_k / kv_v):
+        //   d-section  (FP32 scales): bytes [0, d_total_bytes)
+        //   qs-section (i8 packed):   bytes [d_total_bytes, d_total_bytes + qs_total_bytes)
+        // Block size = 32 elements; one FP32 scale per block. The two sections
+        // are u32-aligned (4 | block-bytes; 4 | row-bytes given kv_dim % 32 == 0
+        // and kv_dim >= 32), so reads/writes are clean word loads.
+        if cfg.kv_dim % 32 != 0 {
+            return Err(PotError::Config("kv_dim must be a multiple of 32 (Q8_0 block size)"));
+        }
+        let nb_per_row = (cfg.kv_dim / 32) as u64;
+        let kv_d_total: u64 =
+            cfg.n_layer as u64 * opts.max_seq as u64 * nb_per_row * 4;
+        let kv_qs_total: u64 =
+            cfg.n_layer as u64 * opts.max_seq as u64 * cfg.kv_dim as u64;
+        let kv_total: u64 = kv_d_total + kv_qs_total;
         let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_k"), size: kv_total,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
