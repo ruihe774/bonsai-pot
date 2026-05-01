@@ -359,4 +359,56 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn from_bytes_bad_version() {
+        let snap = make_snap(36, 1024, 1024, 4);
+        let mut bytes = snap.to_bytes();
+        // VERSION field is at bytes[8..12].
+        let bad = (VERSION + 1).to_le_bytes();
+        bytes[8..12].copy_from_slice(&bad);
+        assert!(KvSnapshot::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn from_bytes_nonzero_reserved() {
+        let snap = make_snap(36, 1024, 1024, 4);
+        let mut bytes = snap.to_bytes();
+        // Reserved field is at bytes[28..32].
+        bytes[28] = 1;
+        assert!(KvSnapshot::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn from_bytes_payload_length_mismatch() {
+        let snap = make_snap(36, 1024, 1024, 4);
+        let bytes = snap.to_bytes();
+        // Truncate the payload by one byte — header says longer than actual.
+        assert!(KvSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn getters_match_header() {
+        let snap = make_snap(36, 1024, 512, 64);
+        assert_eq!(snap.n_layer(), 36);
+        assert_eq!(snap.kv_dim(), 1024);
+        assert_eq!(snap.max_seq(), 512);
+        assert_eq!(snap.pos(), 64);
+    }
+
+    #[test]
+    fn clone_is_deep() {
+        let snap = make_snap(4, 128, 256, 8);
+        let mut clone = snap.clone();
+        if !clone.payload.is_empty() {
+            clone.payload[0] ^= 0xFF;
+            assert_ne!(snap.payload[0], clone.payload[0]);
+        }
+    }
+
+    #[test]
+    fn payload_bytes_zero_pos() {
+        // An empty snapshot (pos=0) has no payload.
+        assert_eq!(payload_bytes(36, 1024, 0), 0);
+    }
 }

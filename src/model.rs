@@ -947,3 +947,92 @@ fn build_cached_bind_groups(
         kv_writeback:    mk("cached_kv_writeback", &bgls.kv_writeback, &[&buffers.act, &buffers.kv_k, &buffers.kv_v]),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bonsai4b_cfg() -> ConfigRaw {
+        ConfigRaw {
+            n_layer: 36, n_embd: 2560, n_ff: 9728, n_head: 32,
+            n_kv_head: 8, head_dim: 128, rope_freq_base: 1_000_000.0,
+            rms_eps: 1e-6, n_vocab: 151_936, eos_token_id: 151_645,
+            padding_token_id: 151_654, add_bos: false, context_length: 32_768,
+            rope_orig_context: 4_096, n_kv_groups: 4, q_dim: 4_096, kv_dim: 1_024,
+            tied_embeddings: true, manifest: HashMap::new(),
+        }
+    }
+
+    fn rope_test_cfg() -> ConfigRaw {
+        ConfigRaw {
+            n_layer: 1, n_embd: 8, n_ff: 8, n_head: 1, n_kv_head: 1,
+            head_dim: 8, rope_freq_base: 10_000.0, rms_eps: 1e-6,
+            n_vocab: 10, eos_token_id: 1, padding_token_id: 0,
+            add_bos: false, context_length: 4, rope_orig_context: 4,
+            n_kv_groups: 1, q_dim: 8, kv_dim: 8, tied_embeddings: false,
+            manifest: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn topk_max_is_thirty_two() {
+        assert_eq!(TOPK_MAX, 32);
+    }
+
+    #[test]
+    fn act_layout_offsets_monotonic() {
+        let cfg = bonsai4b_cfg();
+        let m = ActLayout::build(&cfg, 512);
+        // Each region starts where the previous one ended.
+        assert_eq!(m.x, 0);
+        assert_eq!(m.x_norm, 512 * cfg.n_embd);
+        assert_eq!(m.q, m.x_norm + 512 * cfg.n_embd);
+        assert_eq!(m.k_cur, m.q + 512 * cfg.q_dim);
+        assert_eq!(m.v_cur, m.k_cur + 512 * cfg.kv_dim);
+        assert_eq!(m.attn_out, m.v_cur + 512 * cfg.kv_dim);
+        assert_eq!(m.gate, m.attn_out + 512 * cfg.q_dim);
+        assert_eq!(m.up, m.gate + 512 * cfg.n_ff);
+        assert_eq!(m.ffn_in, m.up + 512 * cfg.n_ff);
+        assert_eq!(m.logits, m.ffn_in + 512 * cfg.n_ff);
+        assert_eq!(m.total_elems, m.logits + cfg.n_vocab);
+        // Regions are strictly ordered.
+        assert!(m.x < m.x_norm && m.x_norm < m.q && m.q < m.k_cur
+            && m.k_cur < m.v_cur && m.v_cur < m.attn_out
+            && m.attn_out < m.gate && m.gate < m.up
+            && m.up < m.ffn_in && m.ffn_in < m.logits);
+    }
+
+    #[test]
+    fn params_struct_sizes_fit_uniform_slot() {
+        let limit = UNIFORM_SLOT_SIZE as usize;
+        assert!(std::mem::size_of::<EmbedParams>()       <= limit);
+        assert!(std::mem::size_of::<RmsNormParams>()     <= limit);
+        assert!(std::mem::size_of::<RopeParams>()        <= limit);
+        assert!(std::mem::size_of::<MatvecParams>()      <= limit);
+        assert!(std::mem::size_of::<MatvecFusedParams>() <= limit);
+        assert!(std::mem::size_of::<QuantParams>()       <= limit);
+        assert!(std::mem::size_of::<MatmulParams>()      <= limit);
+        assert!(std::mem::size_of::<AttnParams>()        <= limit);
+        assert!(std::mem::size_of::<AttnSplitParams>()   <= limit);
+        assert!(std::mem::size_of::<AttnMergeParams>()   <= limit);
+        assert!(std::mem::size_of::<SiluMulParams>()     <= limit);
+        assert!(std::mem::size_of::<TopKParams>()        <= limit);
+        assert!(std::mem::size_of::<KvWritebackParams>() <= limit);
+    }
+
+    #[test]
+    fn build_rope_table_shape_and_values() {
+        let cfg = rope_test_cfg(); // head_dim=8, freq_base=10_000, max_seq not in cfg
+        let max_seq = 4u32;
+        let table = build_rope_table(&cfg, max_seq);
+        assert_eq!(table.len(), (max_seq * cfg.head_dim) as usize);
+        // pos=0: all cos=1.0, sin=0.0
+        assert!((table[0] - 1.0f32).abs() < 1e-6); // cos(0)
+        assert!((table[1] - 0.0f32).abs() < 1e-6); // sin(0)
+        // pos=1, j=0: theta=10000^0=1.0, angle=1.0
+        let cos1 = (1.0f64).cos() as f32;
+        let sin1 = (1.0f64).sin() as f32;
+        assert!((table[8] - cos1).abs() < 1e-5, "cos(1)={} got {}", cos1, table[8]);
+        assert!((table[9] - sin1).abs() < 1e-5, "sin(1)={} got {}", sin1, table[9]);
+    }
+}

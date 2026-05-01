@@ -55,3 +55,58 @@ impl From<wgpu::RequestDeviceError> for PotError {
 }
 
 pub type Result<T> = std::result::Result<T, PotError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    fn make_io_error() -> PotError {
+        PotError::Io {
+            path: std::path::PathBuf::from("/tmp/fake"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        }
+    }
+
+    #[test]
+    fn display_each_variant() {
+        assert!(make_io_error().to_string().contains("/tmp/fake"));
+        assert!(PotError::ConfigParse(serde_json::from_str::<u32>("bad").unwrap_err())
+            .to_string().contains("config.json"));
+        assert!(PotError::MissingTensor("foo.weight".into()).to_string().contains("foo.weight"));
+        assert!(PotError::Vocab("bad magic").to_string().contains("bad magic"));
+        assert!(PotError::NoAdapter.to_string().contains("GPU adapter"));
+        assert!(PotError::FeatureUnsupported("SHADER_F16").to_string().contains("SHADER_F16"));
+        assert!(PotError::BufferMap(wgpu::BufferAsyncError).to_string().contains("buffer"));
+        assert!(PotError::ContextOverflow { pos: 1020, n: 8, max: 1024 }
+            .to_string().contains("pos 1020"));
+        assert!(PotError::ContextOverflow { pos: 1020, n: 8, max: 1024 }
+            .to_string().contains("max_seq 1024"));
+        assert!(PotError::PrefillTooLarge { n: 600, max: 512 }
+            .to_string().contains("600"));
+        assert!(PotError::Config("bad value").to_string().contains("bad value"));
+    }
+
+    #[test]
+    fn source_present_for_wrapped() {
+        assert!(make_io_error().source().is_some());
+        let cfg_err = PotError::ConfigParse(serde_json::from_str::<u32>("bad").unwrap_err());
+        assert!(cfg_err.source().is_some());
+
+        assert!(PotError::MissingTensor("x".into()).source().is_none());
+        assert!(PotError::Vocab("x").source().is_none());
+        assert!(PotError::NoAdapter.source().is_none());
+        assert!(PotError::FeatureUnsupported("x").source().is_none());
+        assert!(PotError::BufferMap(wgpu::BufferAsyncError).source().is_none());
+        assert!(PotError::ContextOverflow { pos: 0, n: 1, max: 1 }.source().is_none());
+        assert!(PotError::PrefillTooLarge { n: 1, max: 1 }.source().is_none());
+        assert!(PotError::Config("x").source().is_none());
+    }
+
+    #[test]
+    fn from_serde_json_error_produces_config_parse() {
+        let e: serde_json::Error = serde_json::from_str::<u32>("not-json").unwrap_err();
+        let pot: PotError = e.into();
+        assert!(matches!(pot, PotError::ConfigParse(_)));
+    }
+}

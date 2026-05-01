@@ -275,3 +275,98 @@ fn uniform_f32(seed: u64) -> f32 {
     let bits24 = (z >> 40) as u32; // 24 bits
     bits24 as f32 / (1u32 << 24) as f32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn greedy() -> Sampler { Sampler { temperature: 0.0, ..Sampler::default() } }
+
+    #[test]
+    fn greedy_temperature_zero() {
+        let logits = vec![3.0f32, 2.0, 1.0];
+        let indices = vec![42u32, 7, 99];
+        assert_eq!(sample_from_topk(&logits, &indices, &greedy(), 0), 42);
+    }
+
+    #[test]
+    fn greedy_top_k_one() {
+        let logits = vec![3.0f32, 2.0, 1.0];
+        let indices = vec![42u32, 7, 99];
+        let s = Sampler { top_k: Some(1), temperature: 1.0, ..Sampler::default() };
+        assert_eq!(sample_from_topk(&logits, &indices, &s, 0), 42);
+    }
+
+    #[test]
+    fn top_p_zero_picks_argmax() {
+        let logits = vec![3.0f32, 2.0, 1.0];
+        let indices = vec![42u32, 7, 99];
+        let s = Sampler { top_p: Some(0.0), temperature: 1.0, ..Sampler::default() };
+        // With top_p=0.0, cumulative >= 0.0 on first element, so keep=1 and
+        // indices[0] is always returned regardless of the random draw.
+        for seed in 0..20u64 {
+            let s2 = Sampler { seed, ..s.clone() };
+            assert_eq!(sample_from_topk(&logits, &indices, &s2, 0), 42);
+        }
+    }
+
+    #[test]
+    fn seed_determinism() {
+        let logits = vec![1.0f32; 8];
+        let indices: Vec<u32> = (0..8).collect();
+        let s = Sampler { temperature: 1e9, seed: 42, ..Sampler::default() };
+        let r1 = sample_from_topk(&logits, &indices, &s, 5);
+        let r2 = sample_from_topk(&logits, &indices, &s, 5);
+        assert_eq!(r1, r2);
+        // Different pos gives a different seed input.
+        let r3 = sample_from_topk(&logits, &indices, &s, 6);
+        assert_ne!(r1, r3);
+    }
+
+    #[test]
+    fn empty_input_returns_zero() {
+        assert_eq!(sample_from_topk(&[], &[], &Sampler::default(), 0), 0);
+    }
+
+    #[test]
+    fn non_finite_falls_back_to_argmax() {
+        // INF logit → INF - INF = NaN in softmax → sum is NaN → fallback.
+        let logits = vec![f32::INFINITY, 1.0, 0.0];
+        let indices = vec![42u32, 7, 99];
+        let s = Sampler { temperature: 1.0, ..Sampler::default() };
+        assert_eq!(sample_from_topk(&logits, &indices, &s, 0), 42);
+    }
+
+    #[test]
+    fn effective_k_caps_to_topk_max() {
+        assert_eq!(effective_k(&Sampler { top_k: None, ..Sampler::default() }), TOPK_MAX);
+        assert_eq!(effective_k(&Sampler { top_k: Some(0), ..Sampler::default() }), TOPK_MAX);
+        assert_eq!(effective_k(&Sampler { top_k: Some(100), ..Sampler::default() }), TOPK_MAX);
+        assert_eq!(effective_k(&Sampler { top_k: Some(5), ..Sampler::default() }), 5);
+    }
+
+    #[test]
+    fn uniform_f32_in_range() {
+        for seed in 0u64..1000 {
+            let v = uniform_f32(seed);
+            assert!(v >= 0.0 && v < 1.0, "uniform_f32({seed}) = {v} not in [0, 1)");
+        }
+    }
+
+    #[test]
+    fn sampler_default_values() {
+        let s = Sampler::default();
+        assert_eq!(s.temperature, 1.0);
+        assert_eq!(s.top_k, None);
+        assert_eq!(s.top_p, None);
+        assert_eq!(s.seed, 0);
+    }
+
+    #[test]
+    fn generate_options_default() {
+        let o = GenerateOptions::default();
+        assert_eq!(o.max_new_tokens, 32);
+        assert_eq!(o.stop_token, None);
+        assert_eq!(o.sampler.temperature, 1.0);
+    }
+}
