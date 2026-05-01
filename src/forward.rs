@@ -313,10 +313,10 @@ async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32
 /// Used by `prefill_matvec_loop_topk` to decide when to flush the encoder so
 /// the uniform pool doesn't overflow on long incremental prefills.
 fn encode_step_matvec_slots(cfg: &Config) -> u64 {
-    // 1 embed + 13 per layer (rms, qkv_fused, q_norm, k_norm, rope_q, rope_k,
-    // kv_writeback, attn, Wo, ffn_norm, gate_up_fused, silu_mul, Wd) +
-    // 3 suffix (output rms, LM head, topk).
-    1 + 13 * cfg.n_layer as u64 + 3
+    // 1 embed + 14 per layer (rms, qkv_fused, q_norm, k_norm, rope_q, rope_k,
+    // kv_writeback, attn_split, attn_merge, Wo, ffn_norm, gate_up_fused,
+    // silu_mul, Wd) + 3 suffix (output rms, LM head, topk).
+    1 + 14 * cfg.n_layer as u64 + 3
 }
 
 /// Encode one tg step into the given encoder. The input token is read from
