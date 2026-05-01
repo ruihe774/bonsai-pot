@@ -419,6 +419,28 @@ impl Model {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
 
+        // Pick the subgroup size we'll bake into shader source. The reduction
+        // shaders (rms_norm, attention*) and the matvec row-shuffle butterfly
+        // both depend on it. We pick `subgroup_max_size` because compute
+        // pipelines on AMD (the primary target) and the major non-AMD vendors
+        // (NVIDIA, Apple, Intel) typically run at that value. Hardware where
+        // min<max (notably AMD RDNA, 32..=64) gets the upper bound, which
+        // RADV's compute scheduler also picks in practice.
+        let info = adapter.get_info();
+        let sg_size = info.subgroup_max_size;
+        if sg_size < 8
+            || sg_size > 64
+            || (sg_size & (sg_size - 1)) != 0
+        {
+            return Err(PotError::Config(
+                "unsupported subgroup_max_size (need power-of-2 in [8, 64])",
+            ));
+        }
+        log::info!(
+            "subgroup size: min={}, max={}, baked={}",
+            info.subgroup_min_size, info.subgroup_max_size, sg_size,
+        );
+
         let mut limits = adapter.limits();
         limits.max_storage_buffer_binding_size = limits
             .max_storage_buffer_binding_size
@@ -539,10 +561,18 @@ impl Model {
         };
 
         // ---- shaders & pipelines -------------------------------------------
+        // `{{SG_SIZE}}` is substituted with the runtime subgroup size at load
+        // time; shaders that don't reference it get pass-through `replace`.
+        let sg_size_str = sg_size.to_string();
         macro_rules! load_shader {
-            ($file:expr) => { device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some($file), source: wgpu::ShaderSource::Wgsl(include_str!(concat!("shaders/", $file)).into()),
-            }) };
+            ($file:expr) => {{
+                let src: &str = include_str!(concat!("shaders/", $file));
+                let templated = src.replace("{{SG_SIZE}}", &sg_size_str);
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some($file),
+                    source: wgpu::ShaderSource::Wgsl(templated.into()),
+                })
+            }};
         }
         let sh_embed = load_shader!("embed.wgsl");
         let sh_rms = load_shader!("rms_norm.wgsl");

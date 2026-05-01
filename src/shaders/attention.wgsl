@@ -35,14 +35,57 @@ struct Params {
 @group(0) @binding(2) var<storage, read> k_cache: array<f16>;
 @group(0) @binding(3) var<storage, read> v_cache: array<f16>;
 
+const SG_SIZE: u32 = {{SG_SIZE}}u;
 const WG: u32 = 64u;
+const N_SG: u32 = WG / SG_SIZE;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
 const UNROLL: u32 = 4u;
+
+// Cross-subgroup partial slots; unused (and dead-coded out) when N_SG == 1.
+var<workgroup> sg_partial4: array<vec4<f32>, N_SG>;
+var<workgroup> sg_partial1: array<f32, N_SG>;
+
+fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
+  let sg_sum = subgroupAdd(local);
+  if (N_SG == 1u) {
+    return sg_sum;
+  }
+  let sg_id = tid / SG_SIZE;
+  if (sg_inv_id == 0u) { sg_partial4[sg_id] = sg_sum; }
+  workgroupBarrier();
+  if (sg_id == 0u) {
+    var combined = vec4<f32>(0.0);
+    if (sg_inv_id < N_SG) { combined = sg_partial4[sg_inv_id]; }
+    let final_sum = subgroupAdd(combined);
+    if (sg_inv_id == 0u) { sg_partial4[0] = final_sum; }
+  }
+  workgroupBarrier();
+  return sg_partial4[0];
+}
+
+fn wg_sum_f32(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
+  let sg_sum = subgroupAdd(local);
+  if (N_SG == 1u) {
+    return sg_sum;
+  }
+  let sg_id = tid / SG_SIZE;
+  if (sg_inv_id == 0u) { sg_partial1[sg_id] = sg_sum; }
+  workgroupBarrier();
+  if (sg_id == 0u) {
+    var combined: f32 = 0.0;
+    if (sg_inv_id < N_SG) { combined = sg_partial1[sg_inv_id]; }
+    let final_sum = subgroupAdd(combined);
+    if (sg_inv_id == 0u) { sg_partial1[0] = final_sum; }
+  }
+  workgroupBarrier();
+  return sg_partial1[0];
+}
 
 @compute @workgroup_size(WG)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_inv_id: u32,
 ) {
   let h = wg.x;
   let m_tok = wg.y;
@@ -82,8 +125,8 @@ fn main(
       let k3 = f32(k_cache[k_base3 + d]);
       local = local + q * vec4<f32>(k0, k1, k2, k3);
     }
-    // Single subgroup-wide reduction (assumes subgroup_size == WG == 64).
-    let dots = subgroupAdd(local);
+    // Workgroup-wide reduction (one subgroupAdd if SG covers WG, else two-step).
+    let dots = wg_sum_v4(local, tid, sg_inv_id);
 
     // 2) Sequential online-softmax + V accumulation for the four positions.
     let scores = dots * p.scale;
@@ -114,7 +157,7 @@ fn main(
     for (var d: u32 = tid; d < hd; d += WG) {
       local_dot = local_dot + f32(act[q_base + d]) * f32(k_cache[k_base + d]);
     }
-    let dot = subgroupAdd(local_dot);
+    let dot = wg_sum_f32(local_dot, tid, sg_inv_id);
 
     let score = dot * p.scale;
     let m_new = max(m_run, score);

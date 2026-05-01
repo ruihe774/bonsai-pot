@@ -36,16 +36,40 @@ struct Params {
 @group(0) @binding(3) var<storage, read> v_cache: array<f16>;
 @group(0) @binding(4) var<storage, read_write> partials: array<f32>;
 
+const SG_SIZE: u32 = {{SG_SIZE}}u;
 const WG: u32 = 64u;
+const N_SG: u32 = WG / SG_SIZE;
 const Q_PER_GROUP: u32 = 4u;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
 const CHUNK_SIZE: u32 = 32u;
 const PARTIAL_STRIDE: u32 = 130u;  // head_dim + 2
 
+// Cross-subgroup partial slots; unused (and dead-coded out) when N_SG == 1.
+var<workgroup> sg_partial4: array<vec4<f32>, N_SG>;
+
+fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
+  let sg_sum = subgroupAdd(local);
+  if (N_SG == 1u) {
+    return sg_sum;
+  }
+  let sg_id = tid / SG_SIZE;
+  if (sg_inv_id == 0u) { sg_partial4[sg_id] = sg_sum; }
+  workgroupBarrier();
+  if (sg_id == 0u) {
+    var combined = vec4<f32>(0.0);
+    if (sg_inv_id < N_SG) { combined = sg_partial4[sg_inv_id]; }
+    let final_sum = subgroupAdd(combined);
+    if (sg_inv_id == 0u) { sg_partial4[0] = final_sum; }
+  }
+  workgroupBarrier();
+  return sg_partial4[0];
+}
+
 @compute @workgroup_size(WG)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(subgroup_invocation_id) sg_inv_id: u32,
 ) {
   let g = wg.x;
   let chunk = wg.y;
@@ -85,8 +109,8 @@ fn main(
       let q3 = f32(act[q_base3 + d]);
       local = local + k * vec4<f32>(q0, q1, q2, q3);
     }
-    // Single subgroup-wide reduction (WG == subgroup_size assumption).
-    let dots = subgroupAdd(local);
+    // Workgroup-wide reduction (one subgroupAdd if SG covers WG, else two-step).
+    let dots = wg_sum_v4(local, tid, sg_inv_id);
     let scores = dots * p.scale;
 
     let m_new = max(m, scores);
