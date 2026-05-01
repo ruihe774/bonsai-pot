@@ -19,6 +19,11 @@ enable f16;
 // Per-thread output accumulator is `array<f32, ELEMS_PER_THREAD>` where each
 // thread owns elements (tid, tid+WG, ...) of the head-dim-sized output vector.
 // For Bonsai-4B (head_dim=128, WG=64), ELEMS_PER_THREAD = 2.
+//
+// Invariant: head_dim == ELEMS_PER_THREAD * WG. The per-element loops below
+// don't bounds-check `d < hd` because every (tid, i) pair indexes a real
+// element under this invariant. Models with a different head_dim would need
+// ELEMS_PER_THREAD retemplated to match.
 
 struct Params {
   head_dim: u32,
@@ -169,10 +174,8 @@ fn main(
 
       for (var j: u32 = 0u; j < ELEMS_PER_THREAD; j++) {
         let d = tid + j * WG;
-        if (d < hd) {
-          let v = load_v(t + i, g_off + d);
-          o[j] = o[j] * correction + weight * v;
-        }
+        let v = load_v(t + i, g_off + d);
+        o[j] = o[j] * correction + weight * v;
       }
     }
 
@@ -196,10 +199,8 @@ fn main(
 
     for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
       let d = tid + i * WG;
-      if (d < hd) {
-        let v = load_v(t, g_off + d);
-        o[i] = o[i] * correction + weight * v;
-      }
+      let v = load_v(t, g_off + d);
+      o[i] = o[i] * correction + weight * v;
     }
     t = t + 1u;
   }
@@ -209,8 +210,6 @@ fn main(
   let inv_l = 1.0 / l_run;
   for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
     let d = tid + i * WG;
-    if (d < hd) {
-      act[out_base + d] = f16(o[i] * inv_l);
-    }
+    act[out_base + d] = f16(o[i] * inv_l);
   }
 }

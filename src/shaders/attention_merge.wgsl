@@ -102,7 +102,9 @@ fn main(
   }
   let l_global = wg_sum(l_local, tid, sg_inv_id);
 
-  // Phase C: per-thread o accumulation using precomputed weights.
+  // Phase C: per-thread o accumulation using precomputed weights. The per-d
+  // loops below assume head_dim == ELEMS_PER_THREAD * WG (true for Bonsai-4B);
+  // models with a different head_dim would need ELEMS_PER_THREAD retemplated.
   var o: array<f32, ELEMS_PER_THREAD>;
   for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) { o[i] = 0.0; }
   for (var c: u32 = 0u; c < n; c++) {
@@ -110,9 +112,7 @@ fn main(
     let weight = weights_sh[c];
     for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
       let d = tid + i * WG;
-      if (d < hd) {
-        o[i] = o[i] + partials[pb + d] * weight;
-      }
+      o[i] = o[i] + partials[pb + d] * weight;
     }
   }
 
@@ -120,8 +120,6 @@ fn main(
   let out_base = p.out_offset + h * hd;
   for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
     let d = tid + i * WG;
-    if (d < hd) {
-      act[out_base + d] = f16(o[i] * inv_l);
-    }
+    act[out_base + d] = f16(o[i] * inv_l);
   }
 }

@@ -21,6 +21,10 @@ enable f16;
 //
 // Output: partials[h_global, chunk] = (o[head_dim], m, l) — 130 f32s per
 // (head, chunk). Stride in the chunk dim is `n_chunks_active`, set by host.
+//
+// Invariant: head_dim == ELEMS_PER_THREAD * WG. The per-element loops below
+// don't bounds-check `d < hd` because every (tid, i) pair indexes a real
+// element under this invariant.
 
 struct Params {
   head_dim: u32,
@@ -157,13 +161,11 @@ fn main(
 
     for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
       let d = tid + i * WG;
-      if (d < hd) {
-        let v = load_v(t, g_off + d);
-        o0[i] = o0[i] * correction.x + weight.x * v;
-        o1[i] = o1[i] * correction.y + weight.y * v;
-        o2[i] = o2[i] * correction.z + weight.z * v;
-        o3[i] = o3[i] * correction.w + weight.w * v;
-      }
+      let v = load_v(t, g_off + d);
+      o0[i] = o0[i] * correction.x + weight.x * v;
+      o1[i] = o1[i] * correction.y + weight.y * v;
+      o2[i] = o2[i] * correction.z + weight.z * v;
+      o3[i] = o3[i] * correction.w + weight.w * v;
     }
   }
 
@@ -179,12 +181,10 @@ fn main(
   let base3 = h3 * stride_h + chunk * PARTIAL_STRIDE;
   for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
     let d = tid + i * WG;
-    if (d < hd) {
-      partials[base0 + d] = o0[i];
-      partials[base1 + d] = o1[i];
-      partials[base2 + d] = o2[i];
-      partials[base3 + d] = o3[i];
-    }
+    partials[base0 + d] = o0[i];
+    partials[base1 + d] = o1[i];
+    partials[base2 + d] = o2[i];
+    partials[base3 + d] = o3[i];
   }
   if (tid == 0u) {
     partials[base0 + hd] = m.x;
