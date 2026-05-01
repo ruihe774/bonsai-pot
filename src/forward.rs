@@ -233,6 +233,18 @@ fn dispatch_topk_reduce(
     pass.dispatch_workgroups(1, 1, 1);
 }
 
+fn dispatch_kv_writeback(
+    model: &Model, uniforms: &mut UniformPool, pass: &mut wgpu::ComputePass<'_>,
+    k_cur_off: u32, v_cur_off: u32, dst_off: u32, total_elems: u32,
+) {
+    let p = KvWritebackParams { k_cur_off, v_cur_off, dst_off, total_elems };
+    let off = uniforms.alloc(&p);
+    pass.set_pipeline(&model.pipes.kv_writeback);
+    pass.set_bind_group(0, &model.cached.kv_writeback, &[off]);
+    let n_wg = (total_elems + 63) / 64;
+    pass.dispatch_workgroups(n_wg, 1, 1);
+}
+
 // ---------- async readback helper -------------------------------------------
 
 /// Await the `sample → readback` copy that was already encoded into the
@@ -273,12 +285,13 @@ pub(crate) fn encode_step_matvec(
     se: &mut StepEncoder, cfg: &Config,
     sample_in: u32, topk_out_u32_base: u32, pos: u32, k: u32,
 ) {
-    let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let StepEncoder { model: m, encoder, uniforms } = se;
     let ot = &m.output_tensors;
-    // Pass 0: embed + layer 0 pre-kv
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("step_matvec"), timestamp_writes: None,
+    });
+    // embed
     {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("phase0"), timestamp_writes: None });
         let p = EmbedParams {
             k: cfg.n_embd,
             d_offset: ot.token_embd_d,
@@ -291,33 +304,27 @@ pub(crate) fn encode_step_matvec(
         pass.set_pipeline(&m.pipes.embed);
         pass.set_bind_group(0, &m.cached.embed, &[off]);
         pass.dispatch_workgroups(1, 1, 1);
-        layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, 0, pos);
     }
     for il in 0..cfg.n_layer {
-        let layer_offset_bytes = (il as u64) * (m.max_seq as u64) * cache_row_bytes;
-        let dst_offset_bytes = layer_offset_bytes + (pos as u64) * cache_row_bytes;
-        let k_src_bytes = (m.act_layout.k_cur as u64) * ACT_ELEM_BYTES;
-        let v_src_bytes = (m.act_layout.v_cur as u64) * ACT_ELEM_BYTES;
-        encoder.copy_buffer_to_buffer(&m.buffers.act, k_src_bytes, &m.buffers.kv_k, dst_offset_bytes, cache_row_bytes);
-        encoder.copy_buffer_to_buffer(&m.buffers.act, v_src_bytes, &m.buffers.kv_v, dst_offset_bytes, cache_row_bytes);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("phase"), timestamp_writes: None,
-        });
+        layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
+        // kv writeback (replaces the copy_buffer_to_buffer that used to break the pass)
+        let dst_off = il * m.max_seq * cfg.kv_dim + pos * cfg.kv_dim;
+        dispatch_kv_writeback(m, uniforms, &mut pass,
+                              m.act_layout.k_cur, m.act_layout.v_cur,
+                              dst_off, cfg.kv_dim);
         layer_post_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
-        if il + 1 < cfg.n_layer {
-            layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, il + 1, pos);
-        } else {
-            dispatch_rms_norm(m, cfg, uniforms, &mut pass,
-                              1, cfg.n_embd, m.act_layout.x, m.act_layout.x_norm,
-                              ot.output_norm_off);
-            dispatch_matvec_q1_0(m, uniforms, &mut pass,
-                                 cfg.n_embd, cfg.n_vocab,
-                                 WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
-                                 m.act_layout.x_norm, m.act_layout.logits, false);
-            dispatch_topk_reduce(m, uniforms, &mut pass, cfg.n_vocab, k,
-                                 m.act_layout.logits, topk_out_u32_base);
-        }
     }
+    // output suffix (was inside the last layer's pass before)
+    dispatch_rms_norm(m, cfg, uniforms, &mut pass,
+                      1, cfg.n_embd, m.act_layout.x, m.act_layout.x_norm,
+                      ot.output_norm_off);
+    dispatch_matvec_q1_0(m, uniforms, &mut pass,
+                         cfg.n_embd, cfg.n_vocab,
+                         WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
+                         m.act_layout.x_norm, m.act_layout.logits, false);
+    dispatch_topk_reduce(m, uniforms, &mut pass, cfg.n_vocab, k,
+                         m.act_layout.logits, topk_out_u32_base);
+    drop(pass);
 }
 
 /// Run one matvec step at `pos`, reading the current token from CPU and
@@ -575,13 +582,10 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     rope(model, cfg, se, model.act_layout.q,     m, cfg.n_head,    pos_base);
     rope(model, cfg, se, model.act_layout.k_cur, m, cfg.n_kv_head, pos_base);
 
-    let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
-    let layer_offset_bytes = (il as u64) * (model.max_seq as u64) * cache_row_bytes;
-    let total_bytes = (m as u64) * cache_row_bytes;
-    se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.k_cur as u64) * ACT_ELEM_BYTES,
-                                     &model.buffers.kv_k, layer_offset_bytes, total_bytes);
-    se.encoder.copy_buffer_to_buffer(&model.buffers.act, (model.act_layout.v_cur as u64) * ACT_ELEM_BYTES,
-                                     &model.buffers.kv_v, layer_offset_bytes, total_bytes);
+    let layer_offset_elems = il * model.max_seq * cfg.kv_dim;
+    kv_writeback(model, se,
+                 model.act_layout.k_cur, model.act_layout.v_cur,
+                 layer_offset_elems, m * cfg.kv_dim);
 
     {
         let p = AttnParams {
@@ -589,8 +593,8 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
             pos: 0,
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
-            v_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
+            k_cache_offset: layer_offset_elems,
+            v_cache_offset: layer_offset_elems,
             out_offset: model.act_layout.attn_out,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
             m_tokens: m, is_prefill: 1,
@@ -729,6 +733,19 @@ fn quantize_act(model: &Model, _cfg: &Config, se: &mut StepEncoder,
     cp.set_bind_group(0, &model.cached.quantize, &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     (d_off, qs_off)
+}
+
+fn kv_writeback(model: &Model, se: &mut StepEncoder,
+                k_cur_off: u32, v_cur_off: u32, dst_off: u32, total_elems: u32) {
+    let p = KvWritebackParams { k_cur_off, v_cur_off, dst_off, total_elems };
+    let off = se.alloc_uniform(&p);
+    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("kv_writeback"), timestamp_writes: None,
+    });
+    cp.set_pipeline(&model.pipes.kv_writeback);
+    cp.set_bind_group(0, &model.cached.kv_writeback, &[off]);
+    let n_wg = (total_elems + 63) / 64;
+    cp.dispatch_workgroups(n_wg, 1, 1);
 }
 
 fn silu_mul(model: &Model, se: &mut StepEncoder,

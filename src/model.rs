@@ -158,6 +158,11 @@ pub(crate) struct SiluMulParams {
 pub(crate) struct TopKParams {
     pub n: u32, pub in_offset: u32, pub out_offset: u32, pub k: u32,
 }
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub(crate) struct KvWritebackParams {
+    pub k_cur_off: u32, pub v_cur_off: u32, pub dst_off: u32, pub total_elems: u32,
+}
 
 // All of these <= 64 bytes; we pack each into a 256-byte uniform slot.
 pub(crate) const UNIFORM_SLOT_SIZE: u64 = 256;
@@ -211,6 +216,7 @@ pub(crate) struct Pipelines {
     pub attention: wgpu::ComputePipeline,
     pub silu_mul: wgpu::ComputePipeline,
     pub topk_reduce: wgpu::ComputePipeline,
+    pub kv_writeback: wgpu::ComputePipeline,
 }
 
 pub(crate) struct Buffers {
@@ -239,6 +245,7 @@ pub(crate) struct BindGroupLayouts {
     pub attn:     wgpu::BindGroupLayout,
     pub silu_mul: wgpu::BindGroupLayout,
     pub topk_reduce: wgpu::BindGroupLayout,
+    pub kv_writeback: wgpu::BindGroupLayout,
 }
 
 /// Pre-built bind groups indexed by (BGL kind, weight buffer). The UBO binding
@@ -262,6 +269,7 @@ pub(crate) struct CachedBindGroups {
     pub attn: wgpu::BindGroup,                   // (uniform, act, kv_k, kv_v)
     pub silu_mul: wgpu::BindGroup,               // (uniform, act)
     pub topk_reduce: wgpu::BindGroup,            // (uniform, act, sample)
+    pub kv_writeback: wgpu::BindGroup,           // (uniform, act, kv_k, kv_v)
 }
 
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
@@ -508,6 +516,7 @@ impl Model {
         let sh_attn = load_shader!("attention.wgsl");
         let sh_silu = load_shader!("silu_mul.wgsl");
         let sh_topk = load_shader!("topk_reduce.wgsl");
+        let sh_kv_writeback = load_shader!("kv_writeback.wgsl");
 
         fn ubo_dyn(binding: u32) -> wgpu::BindGroupLayoutEntry {
             wgpu::BindGroupLayoutEntry {
@@ -551,6 +560,7 @@ impl Model {
             attn:        make_bgl("attn_bgl",        3, 0b001),   // act rw, k ro, v ro
             silu_mul:    make_bgl("silu_mul_bgl",    1, 0b1),     // act rw
             topk_reduce: make_bgl("topk_reduce_bgl", 2, 0b10),    // logits ro, result rw
+            kv_writeback: make_bgl("kv_writeback_bgl", 3, 0b110), // act ro, kv_k rw, kv_v rw
         };
 
         let mk_pipe = |layout: &wgpu::BindGroupLayout, sh: &wgpu::ShaderModule, label: &str| -> wgpu::ComputePipeline {
@@ -579,6 +589,7 @@ impl Model {
             attention:    mk_pipe(&bgls.attn,        &sh_attn,          "attention"),
             silu_mul:     mk_pipe(&bgls.silu_mul,    &sh_silu,          "silu_mul"),
             topk_reduce:  mk_pipe(&bgls.topk_reduce, &sh_topk,          "topk_reduce"),
+            kv_writeback: mk_pipe(&bgls.kv_writeback, &sh_kv_writeback, "kv_writeback"),
         };
 
         // ---- vocab ----------------------------------------------------------
@@ -759,5 +770,6 @@ fn build_cached_bind_groups(
         attn:            mk("cached_attn",         &bgls.attn,        &[&buffers.act,      &buffers.kv_k, &buffers.kv_v]),
         silu_mul:        mk("cached_silu_mul",     &bgls.silu_mul,    &[&buffers.act]),
         topk_reduce:     mk("cached_topk_reduce",  &bgls.topk_reduce, &[&buffers.act, &buffers.sample]),
+        kv_writeback:    mk("cached_kv_writeback", &bgls.kv_writeback, &[&buffers.act, &buffers.kv_k, &buffers.kv_v]),
     }
 }
