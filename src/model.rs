@@ -241,6 +241,65 @@ pub(crate) struct BindGroupLayouts {
     pub topk_reduce: wgpu::BindGroupLayout,
 }
 
+/// Pre-built bind groups indexed by (BGL kind, weight buffer). The UBO binding
+/// in every cached BG is sized to one full uniform slot (`UNIFORM_SLOT_SIZE`)
+/// since we use dynamic offsets and the slot is large enough to hold any of
+/// the per-dispatch params structs. One BG per (kind, weight buffer) is reused
+/// across every dispatch of that kind in a step.
+pub(crate) struct CachedBindGroups {
+    pub embed: wgpu::BindGroup,                  // (uniform, w_embed, act, sample)
+    pub rms_norm: wgpu::BindGroup,               // (uniform, act, w_norms)
+    pub rope: wgpu::BindGroup,                   // (uniform, rope_table, act)
+    pub matvec_w_attn: wgpu::BindGroup,          // (uniform, w_attn,   act)
+    pub matvec_w_ffn_gu: wgpu::BindGroup,        // (uniform, w_ffn_gu, act)
+    pub matvec_w_ffn_d: wgpu::BindGroup,         // (uniform, w_ffn_d,  act)
+    pub matvec_w_embed: wgpu::BindGroup,         // (uniform, w_embed,  act) — LM head
+    pub quantize: wgpu::BindGroup,               // (uniform, act, act_q8)
+    pub matmul_w_attn: wgpu::BindGroup,          // (uniform, w_attn,   act_q8, act)
+    pub matmul_w_ffn_gu: wgpu::BindGroup,
+    pub matmul_w_ffn_d: wgpu::BindGroup,
+    pub matmul_w_embed: wgpu::BindGroup,
+    pub attn: wgpu::BindGroup,                   // (uniform, act, kv_k, kv_v)
+    pub silu_mul: wgpu::BindGroup,               // (uniform, act)
+    pub topk_reduce: wgpu::BindGroup,            // (uniform, act, sample)
+}
+
+/// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
+/// directly to one of the cached bind groups in [`CachedBindGroups`].
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum WeightSet { Attn, FfnGU, FfnD, Embed }
+
+/// Per-layer Q1_0 weight + norm-vector offsets, precomputed at load time so
+/// the per-step encoder doesn't go through `format!` + `HashMap` lookup +
+/// `TensorEntry::clone` for every dispatch. The per-Q1_0-tensor pair is
+/// `(d_offset, qs_offset)`; norm offsets are pre-divided by `ACT_ELEM_BYTES`
+/// so they're directly usable as the element-offset that the shader expects.
+#[derive(Clone, Debug)]
+pub(crate) struct LayerTensors {
+    // per-layer Q1_0 weights (d_offset, qs_offset) — values are byte offsets
+    // into the corresponding weight buffer (w_attn / w_ffn_gu / w_ffn_d).
+    pub wq: (u32, u32),
+    pub wk: (u32, u32),
+    pub wv: (u32, u32),
+    pub wo: (u32, u32),
+    pub wg: (u32, u32),  // ffn_gate
+    pub wu: (u32, u32),  // ffn_up
+    pub wd: (u32, u32),  // ffn_down
+    // per-layer F16 norm element offsets (already divided by ACT_ELEM_BYTES)
+    pub attn_norm_off: u32,
+    pub attn_q_norm_off: u32,
+    pub attn_k_norm_off: u32,
+    pub ffn_norm_off: u32,
+}
+
+/// Precomputed offsets for global / output-side tensors (LM head + output_norm).
+#[derive(Clone, Debug)]
+pub(crate) struct OutputTensors {
+    pub token_embd_d: u32,
+    pub token_embd_qs: u32,
+    pub output_norm_off: u32,
+}
+
 /// GPU-bearing handle to a loaded Bonsai model. Holds weights, pipelines,
 /// activations, and the KV cache. Cheap to share across [`crate::Session`]s
 /// (they each carry only their own `pos` cursor); but only one inference can
@@ -255,7 +314,9 @@ pub struct Model {
     pub(crate) max_seq: u32,
     pub(crate) buffers: Buffers,
     pub(crate) pipes: Pipelines,
-    pub(crate) bgls: BindGroupLayouts,
+    pub(crate) cached: CachedBindGroups,
+    pub(crate) layer_tensors: Vec<LayerTensors>,
+    pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
 }
 
@@ -537,11 +598,57 @@ impl Model {
             vocab.push(s);
         }
 
+        // ---- precompute per-layer tensor offsets ---------------------------
+        let layer_tensors: Vec<LayerTensors> = (0..cfg.n_layer).map(|il| {
+            let q  = tensor(&cfg, &format!("blk.{il}.attn_q.weight"));
+            let k  = tensor(&cfg, &format!("blk.{il}.attn_k.weight"));
+            let v  = tensor(&cfg, &format!("blk.{il}.attn_v.weight"));
+            let o  = tensor(&cfg, &format!("blk.{il}.attn_output.weight"));
+            let g  = tensor(&cfg, &format!("blk.{il}.ffn_gate.weight"));
+            let u  = tensor(&cfg, &format!("blk.{il}.ffn_up.weight"));
+            let d  = tensor(&cfg, &format!("blk.{il}.ffn_down.weight"));
+            let an = tensor(&cfg, &format!("blk.{il}.attn_norm.weight"));
+            let qn = tensor(&cfg, &format!("blk.{il}.attn_q_norm.weight"));
+            let kn = tensor(&cfg, &format!("blk.{il}.attn_k_norm.weight"));
+            let fn_ = tensor(&cfg, &format!("blk.{il}.ffn_norm.weight"));
+            let act_elem_bytes = std::mem::size_of::<half::f16>() as u64;
+            LayerTensors {
+                wq: (q.d_offset as u32, q.qs_offset as u32),
+                wk: (k.d_offset as u32, k.qs_offset as u32),
+                wv: (v.d_offset as u32, v.qs_offset as u32),
+                wo: (o.d_offset as u32, o.qs_offset as u32),
+                wg: (g.d_offset as u32, g.qs_offset as u32),
+                wu: (u.d_offset as u32, u.qs_offset as u32),
+                wd: (d.d_offset as u32, d.qs_offset as u32),
+                attn_norm_off:    (an.offset  / act_elem_bytes) as u32,
+                attn_q_norm_off:  (qn.offset  / act_elem_bytes) as u32,
+                attn_k_norm_off:  (kn.offset  / act_elem_bytes) as u32,
+                ffn_norm_off:     (fn_.offset / act_elem_bytes) as u32,
+            }
+        }).collect();
+
+        let output_tensors = {
+            let te = tensor(&cfg, "token_embd.weight");
+            let on = tensor(&cfg, "output_norm.weight");
+            let act_elem_bytes = std::mem::size_of::<half::f16>() as u64;
+            OutputTensors {
+                token_embd_d:    te.d_offset as u32,
+                token_embd_qs:   te.qs_offset as u32,
+                output_norm_off: (on.offset / act_elem_bytes) as u32,
+            }
+        };
+
+        // ---- build cached bind groups --------------------------------------
+        // The UBO binding is sized to one full uniform slot (256 B). Every
+        // params struct is <= 64 B and is packed into a 256-B-aligned slot, so
+        // this size is correct for every dispatch that reuses the cached BG.
+        let cached = build_cached_bind_groups(&device, &bgls, &buffers);
+
         Ok(Self {
             device, queue, cfg, public_cfg, act_layout,
             m_max: M_MAX,
             max_seq: opts.max_seq,
-            buffers, pipes, bgls, vocab,
+            buffers, pipes, cached, layer_tensors, output_tensors, vocab,
         })
     }
 
@@ -600,4 +707,47 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
 
 pub(crate) fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
     cfg.manifest.get(name).unwrap_or_else(|| panic!("missing tensor {name}"))
+}
+
+/// Build the full set of cached bind groups in one go. Called once at load.
+fn build_cached_bind_groups(
+    device: &wgpu::Device,
+    bgls: &BindGroupLayouts,
+    buffers: &Buffers,
+) -> CachedBindGroups {
+    // The UBO binding always uses UNIFORM_SLOT_SIZE — every params struct
+    // fits in one slot, and the dynamic offset selects which slot.
+    let ubo_size = std::num::NonZeroU64::new(UNIFORM_SLOT_SIZE).unwrap();
+    let ubo = || wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &buffers.uniform, offset: 0, size: Some(ubo_size),
+    });
+    let mk = |label: &str, layout: &wgpu::BindGroupLayout, storages: &[&wgpu::Buffer]| -> wgpu::BindGroup {
+        let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: ubo() }];
+        for (i, b) in storages.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: i as u32 + 1,
+                resource: b.as_entire_binding(),
+            });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label), layout, entries: &entries,
+        })
+    };
+    CachedBindGroups {
+        embed:           mk("cached_embed",        &bgls.embed,       &[&buffers.w_embed,  &buffers.act, &buffers.sample]),
+        rms_norm:        mk("cached_rms_norm",     &bgls.rms_norm,    &[&buffers.act,      &buffers.w_norms]),
+        rope:            mk("cached_rope",         &bgls.rope,        &[&buffers.rope_table, &buffers.act]),
+        matvec_w_attn:   mk("cached_matvec_attn",  &bgls.matvec,      &[&buffers.w_attn,   &buffers.act]),
+        matvec_w_ffn_gu: mk("cached_matvec_ffngu", &bgls.matvec,      &[&buffers.w_ffn_gu, &buffers.act]),
+        matvec_w_ffn_d:  mk("cached_matvec_ffnd",  &bgls.matvec,      &[&buffers.w_ffn_d,  &buffers.act]),
+        matvec_w_embed:  mk("cached_matvec_embed", &bgls.matvec,      &[&buffers.w_embed,  &buffers.act]),
+        quantize:        mk("cached_quantize",     &bgls.quantize,    &[&buffers.act,      &buffers.act_q8]),
+        matmul_w_attn:   mk("cached_matmul_attn",  &bgls.matmul,      &[&buffers.w_attn,   &buffers.act_q8, &buffers.act]),
+        matmul_w_ffn_gu: mk("cached_matmul_ffngu", &bgls.matmul,      &[&buffers.w_ffn_gu, &buffers.act_q8, &buffers.act]),
+        matmul_w_ffn_d:  mk("cached_matmul_ffnd",  &bgls.matmul,      &[&buffers.w_ffn_d,  &buffers.act_q8, &buffers.act]),
+        matmul_w_embed:  mk("cached_matmul_embed", &bgls.matmul,      &[&buffers.w_embed,  &buffers.act_q8, &buffers.act]),
+        attn:            mk("cached_attn",         &bgls.attn,        &[&buffers.act,      &buffers.kv_k, &buffers.kv_v]),
+        silu_mul:        mk("cached_silu_mul",     &bgls.silu_mul,    &[&buffers.act]),
+        topk_reduce:     mk("cached_topk_reduce",  &bgls.topk_reduce, &[&buffers.act, &buffers.sample]),
+    }
 }

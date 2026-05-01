@@ -14,6 +14,13 @@
 //! `topk_reduce` GPU dispatch that writes the top-K logit values + indices to
 //! the `sample` buffer. The caller reads them back and applies its own
 //! temperature / top-p / multinomial logic on CPU.
+//!
+//! Per-token encoder hot path: per-layer tensor offsets are precomputed at
+//! load time (`Model::layer_tensors`) so we don't re-do
+//! `format!` + HashMap lookup + clone on every dispatch; bind groups are also
+//! precomputed at load time (`Model::cached`) and shared across all dispatches
+//! of a given (kind, weight buffer) pair, since the dynamic uniform offset is
+//! the only per-dispatch variation.
 
 use crate::error::{PotError, Result};
 use crate::model::*;
@@ -72,29 +79,24 @@ impl<'a> StepEncoder<'a> {
     }
 }
 
-// ---------- bind-group helpers ----------------------------------------------
+// ---------- weight-set selection -------------------------------------------
 
-fn ubo_entry<'a>(buffer: &'a wgpu::Buffer, size_bytes: u64) -> wgpu::BindingResource<'a> {
-    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-        buffer, offset: 0, size: Some(std::num::NonZeroU64::new(size_bytes).unwrap()),
-    })
+fn matvec_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
+    match ws {
+        WeightSet::Attn  => &model.cached.matvec_w_attn,
+        WeightSet::FfnGU => &model.cached.matvec_w_ffn_gu,
+        WeightSet::FfnD  => &model.cached.matvec_w_ffn_d,
+        WeightSet::Embed => &model.cached.matvec_w_embed,
+    }
 }
 
-fn make_bg(model: &Model, layout: &wgpu::BindGroupLayout, label: &str,
-           uniform_size: u64, storages: &[&wgpu::Buffer]) -> wgpu::BindGroup {
-    let mut entries = vec![wgpu::BindGroupEntry {
-        binding: 0,
-        resource: ubo_entry(&model.buffers.uniform, uniform_size),
-    }];
-    for (i, b) in storages.iter().enumerate() {
-        entries.push(wgpu::BindGroupEntry {
-            binding: i as u32 + 1,
-            resource: b.as_entire_binding(),
-        });
+fn matmul_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
+    match ws {
+        WeightSet::Attn  => &model.cached.matmul_w_attn,
+        WeightSet::FfnGU => &model.cached.matmul_w_ffn_gu,
+        WeightSet::FfnD  => &model.cached.matmul_w_ffn_d,
+        WeightSet::Embed => &model.cached.matmul_w_embed,
     }
-    model.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label), layout, entries: &entries,
-    })
 }
 
 // ---------- in-pass kernel dispatch helpers ---------------------------------
@@ -114,11 +116,8 @@ fn dispatch_rms_norm(
         ..Default::default()
     };
     let off = uniforms.alloc(&p);
-    let bg = make_bg(model, &model.bgls.rms_norm, "rms_bg",
-                     std::mem::size_of::<RmsNormParams>() as u64,
-                     &[&model.buffers.act, &model.buffers.w_norms]);
     pass.set_pipeline(&model.pipes.rms_norm);
-    pass.set_bind_group(0, &bg, &[off]);
+    pass.set_bind_group(0, &model.cached.rms_norm, &[off]);
     pass.dispatch_workgroups(n_groups, 1, 1);
 }
 
@@ -133,18 +132,15 @@ fn dispatch_rope(
         ..Default::default()
     };
     let off = uniforms.alloc(&p);
-    let bg = make_bg(model, &model.bgls.rope, "rope_bg",
-                     std::mem::size_of::<RopeParams>() as u64,
-                     &[&model.buffers.rope_table, &model.buffers.act]);
     pass.set_pipeline(&model.pipes.rope_neox);
-    pass.set_bind_group(0, &bg, &[off]);
+    pass.set_bind_group(0, &model.cached.rope, &[off]);
     pass.dispatch_workgroups(n_tokens, n_heads, 1);
 }
 
 fn dispatch_matvec_q1_0(
     model: &Model, uniforms: &mut UniformPool, pass: &mut wgpu::ComputePass<'_>,
     k: u32, n: u32,
-    weights: &wgpu::Buffer, w_d: u32, w_qs: u32,
+    weights: WeightSet, w_d: u32, w_qs: u32,
     in_off: u32, out_off: u32, accumulate: bool,
 ) {
     const ROWS_PER_WG: u32 = 8;
@@ -159,17 +155,14 @@ fn dispatch_matvec_q1_0(
         dispatch_x_dim: dispatch_x,
     };
     let off = uniforms.alloc(&p);
-    let bg = make_bg(model, &model.bgls.matvec, "matvec_bg",
-                     std::mem::size_of::<MatvecParams>() as u64,
-                     &[weights, &model.buffers.act]);
     pass.set_pipeline(&model.pipes.matvec);
-    pass.set_bind_group(0, &bg, &[off]);
+    pass.set_bind_group(0, matvec_bg(model, weights), &[off]);
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
 fn dispatch_matvec_q1_0_fused(
     model: &Model, uniforms: &mut UniformPool, pass: &mut wgpu::ComputePass<'_>,
-    k: u32, input_offset: u32, weights: &wgpu::Buffer,
+    k: u32, input_offset: u32, weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
     debug_assert!(ranges.len() == 2 || ranges.len() == 3);
@@ -190,11 +183,8 @@ fn dispatch_matvec_q1_0_fused(
         d_offset_2: d2, qs_offset_2: qs2, n_2: n2, output_offset_2: o2,
     };
     let off = uniforms.alloc(&p);
-    let bg = make_bg(model, &model.bgls.matvec, "matvec_fused_bg",
-                     std::mem::size_of::<MatvecFusedParams>() as u64,
-                     &[weights, &model.buffers.act]);
     pass.set_pipeline(&model.pipes.matvec_fused);
-    pass.set_bind_group(0, &bg, &[off]);
+    pass.set_bind_group(0, matvec_bg(model, weights), &[off]);
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -212,11 +202,8 @@ fn dispatch_silu_mul(
         ..Default::default()
     };
     let off = uniforms.alloc(&p);
-    let bg = make_bg(model, &model.bgls.silu_mul, "silu_bg",
-                     std::mem::size_of::<SiluMulParams>() as u64,
-                     &[&model.buffers.act]);
     pass.set_pipeline(&model.pipes.silu_mul);
-    pass.set_bind_group(0, &bg, &[off]);
+    pass.set_bind_group(0, &model.cached.silu_mul, &[off]);
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -226,11 +213,8 @@ fn dispatch_topk_reduce(
 ) {
     let p = TopKParams { n, in_offset: in_off, out_offset: out_off_u32, k };
     let off = uniforms.alloc(&p);
-    let bg = make_bg(model, &model.bgls.topk_reduce, "topk_bg",
-                     std::mem::size_of::<TopKParams>() as u64,
-                     &[&model.buffers.act, &model.buffers.sample]);
     pass.set_pipeline(&model.pipes.topk_reduce);
-    pass.set_bind_group(0, &bg, &[off]);
+    pass.set_bind_group(0, &model.cached.topk_reduce, &[off]);
     pass.dispatch_workgroups(1, 1, 1);
 }
 
@@ -277,24 +261,22 @@ pub(crate) fn encode_step_matvec(
 ) {
     let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let StepEncoder { model: m, encoder, uniforms } = se;
+    let ot = &m.output_tensors;
     // Pass 0: embed + layer 0 pre-kv
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("phase0"), timestamp_writes: None });
-        let tok_embd = tensor(cfg, "token_embd.weight").clone();
         let p = EmbedParams {
             k: cfg.n_embd,
-            d_offset: tok_embd.d_offset as u32,
-            qs_offset: tok_embd.qs_offset as u32,
+            d_offset: ot.token_embd_d,
+            qs_offset: ot.token_embd_qs,
             output_offset: m.act_layout.x,
             sample_offset: sample_in,
             m_token: 0,
             ..Default::default()
         };
         let off = uniforms.alloc(&p);
-        let bg = make_bg(m, &m.bgls.embed, "embed_bg", std::mem::size_of::<EmbedParams>() as u64,
-                         &[&m.buffers.w_embed, &m.buffers.act, &m.buffers.sample]);
         pass.set_pipeline(&m.pipes.embed);
-        pass.set_bind_group(0, &bg, &[off]);
+        pass.set_bind_group(0, &m.cached.embed, &[off]);
         pass.dispatch_workgroups(1, 1, 1);
         layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, 0, pos);
     }
@@ -312,14 +294,12 @@ pub(crate) fn encode_step_matvec(
         if il + 1 < cfg.n_layer {
             layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, il + 1, pos);
         } else {
-            let on = tensor(cfg, "output_norm.weight").clone();
             dispatch_rms_norm(m, cfg, uniforms, &mut pass,
                               1, cfg.n_embd, m.act_layout.x, m.act_layout.x_norm,
-                              (on.offset / ACT_ELEM_BYTES) as u32);
-            let lm_w = tensor(cfg, "token_embd.weight").clone();
+                              ot.output_norm_off);
             dispatch_matvec_q1_0(m, uniforms, &mut pass,
                                  cfg.n_embd, cfg.n_vocab,
-                                 &m.buffers.w_embed, lm_w.d_offset as u32, lm_w.qs_offset as u32,
+                                 WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
                                  m.act_layout.x_norm, m.act_layout.logits, false);
             dispatch_topk_reduce(m, uniforms, &mut pass, cfg.n_vocab, k,
                                  m.act_layout.logits, topk_out_u32_base);
@@ -360,26 +340,21 @@ fn layer_pre_kv_in_pass(
     model: &Model, cfg: &Config, uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>, il: u32, pos: u32,
 ) {
-    let attn_norm = tensor(cfg, &format!("blk.{il}.attn_norm.weight")).clone();
+    let lt = &model.layer_tensors[il as usize];
     dispatch_rms_norm(model, cfg, uniforms, pass, 1, cfg.n_embd,
-                      model.act_layout.x, model.act_layout.x_norm, (attn_norm.offset / ACT_ELEM_BYTES) as u32);
+                      model.act_layout.x, model.act_layout.x_norm, lt.attn_norm_off);
 
-    let wq = tensor(cfg, &format!("blk.{il}.attn_q.weight")).clone();
-    let wk = tensor(cfg, &format!("blk.{il}.attn_k.weight")).clone();
-    let wv = tensor(cfg, &format!("blk.{il}.attn_v.weight")).clone();
     dispatch_matvec_q1_0_fused(model, uniforms, pass, cfg.n_embd, model.act_layout.x_norm,
-                               &model.buffers.w_attn, &[
-        (wq.d_offset as u32, wq.qs_offset as u32, cfg.q_dim,  model.act_layout.q),
-        (wk.d_offset as u32, wk.qs_offset as u32, cfg.kv_dim, model.act_layout.k_cur),
-        (wv.d_offset as u32, wv.qs_offset as u32, cfg.kv_dim, model.act_layout.v_cur),
+                               WeightSet::Attn, &[
+        (lt.wq.0, lt.wq.1, cfg.q_dim,  model.act_layout.q),
+        (lt.wk.0, lt.wk.1, cfg.kv_dim, model.act_layout.k_cur),
+        (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
     ]);
 
-    let qn = tensor(cfg, &format!("blk.{il}.attn_q_norm.weight")).clone();
     dispatch_rms_norm(model, cfg, uniforms, pass, cfg.n_head, cfg.head_dim,
-                      model.act_layout.q, model.act_layout.q, (qn.offset / ACT_ELEM_BYTES) as u32);
-    let kn = tensor(cfg, &format!("blk.{il}.attn_k_norm.weight")).clone();
+                      model.act_layout.q, model.act_layout.q, lt.attn_q_norm_off);
     dispatch_rms_norm(model, cfg, uniforms, pass, cfg.n_kv_head, cfg.head_dim,
-                      model.act_layout.k_cur, model.act_layout.k_cur, (kn.offset / ACT_ELEM_BYTES) as u32);
+                      model.act_layout.k_cur, model.act_layout.k_cur, lt.attn_k_norm_off);
 
     dispatch_rope(model, cfg, uniforms, pass, model.act_layout.q,     1, cfg.n_head,    pos);
     dispatch_rope(model, cfg, uniforms, pass, model.act_layout.k_cur, 1, cfg.n_kv_head, pos);
@@ -391,6 +366,7 @@ fn layer_post_kv_in_pass(
     model: &Model, cfg: &Config, uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>, il: u32, pos: u32,
 ) {
+    let lt = &model.layer_tensors[il as usize];
     let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let layer_offset_bytes = (il as u64) * (model.max_seq as u64) * cache_row_bytes;
 
@@ -407,36 +383,29 @@ fn layer_post_kv_in_pass(
             m_tokens: 1, is_prefill: 0,
         };
         let off = uniforms.alloc(&p);
-        let bg = make_bg(model, &model.bgls.attn, "attn_bg", std::mem::size_of::<AttnParams>() as u64,
-                         &[&model.buffers.act, &model.buffers.kv_k, &model.buffers.kv_v]);
         pass.set_pipeline(&model.pipes.attention);
-        pass.set_bind_group(0, &bg, &[off]);
+        pass.set_bind_group(0, &model.cached.attn, &[off]);
         pass.dispatch_workgroups(cfg.n_head, 1, 1);
     }
 
-    let wo = tensor(cfg, &format!("blk.{il}.attn_output.weight")).clone();
     dispatch_matvec_q1_0(model, uniforms, pass, cfg.q_dim, cfg.n_embd,
-                         &model.buffers.w_attn, wo.d_offset as u32, wo.qs_offset as u32,
+                         WeightSet::Attn, lt.wo.0, lt.wo.1,
                          model.act_layout.attn_out, model.act_layout.x, true /*accumulate*/);
 
-    let fn_n = tensor(cfg, &format!("blk.{il}.ffn_norm.weight")).clone();
     dispatch_rms_norm(model, cfg, uniforms, pass, 1, cfg.n_embd,
-                      model.act_layout.x, model.act_layout.x_norm, (fn_n.offset / ACT_ELEM_BYTES) as u32);
+                      model.act_layout.x, model.act_layout.x_norm, lt.ffn_norm_off);
 
-    let wg = tensor(cfg, &format!("blk.{il}.ffn_gate.weight")).clone();
-    let wu = tensor(cfg, &format!("blk.{il}.ffn_up.weight")).clone();
     dispatch_matvec_q1_0_fused(model, uniforms, pass, cfg.n_embd, model.act_layout.x_norm,
-                               &model.buffers.w_ffn_gu, &[
-        (wg.d_offset as u32, wg.qs_offset as u32, cfg.n_ff, model.act_layout.gate),
-        (wu.d_offset as u32, wu.qs_offset as u32, cfg.n_ff, model.act_layout.up),
+                               WeightSet::FfnGU, &[
+        (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
+        (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
     ]);
 
     dispatch_silu_mul(model, uniforms, pass, cfg.n_ff, 1,
                       model.act_layout.gate, model.act_layout.up, model.act_layout.ffn_in);
 
-    let wd = tensor(cfg, &format!("blk.{il}.ffn_down.weight")).clone();
     dispatch_matvec_q1_0(model, uniforms, pass, cfg.n_ff, cfg.n_embd,
-                         &model.buffers.w_ffn_d, wd.d_offset as u32, wd.qs_offset as u32,
+                         WeightSet::FfnD, lt.wd.0, lt.wd.1,
                          model.act_layout.ffn_in, model.act_layout.x, true /*accumulate*/);
 }
 
@@ -486,29 +455,27 @@ pub(crate) async fn prefill_matmul_topk(
         return Err(PotError::PrefillTooLarge { n: m, max: model.m_max });
     }
     let cfg = &model.cfg;
+    let ot = &model.output_tensors;
     let k = k.min(TOPK_MAX).max(1);
 
     // ---- 1. Embed all M tokens (one shader call per token; cheap) ----------
     model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(prompt));
     {
         let mut se = StepEncoder::new(model);
-        let tok_embd = tensor(cfg, "token_embd.weight").clone();
         let mut pass = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("prefill_embed"), timestamp_writes: None });
         for (mi, _tid) in prompt.iter().enumerate() {
             let p = EmbedParams {
                 k: cfg.n_embd,
-                d_offset: tok_embd.d_offset as u32,
-                qs_offset: tok_embd.qs_offset as u32,
+                d_offset: ot.token_embd_d,
+                qs_offset: ot.token_embd_qs,
                 output_offset: model.act_layout.x,
                 sample_offset: mi as u32,
                 m_token: mi as u32,
                 ..Default::default()
             };
             let off = se.uniforms.alloc(&p);
-            let bg = make_bg(model, &model.bgls.embed, "embed_bg", std::mem::size_of::<EmbedParams>() as u64,
-                             &[&model.buffers.w_embed, &model.buffers.act, &model.buffers.sample]);
             pass.set_pipeline(&model.pipes.embed);
-            pass.set_bind_group(0, &bg, &[off]);
+            pass.set_bind_group(0, &model.cached.embed, &[off]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         drop(pass);
@@ -529,15 +496,13 @@ pub(crate) async fn prefill_matmul_topk(
     // ---- 3. Final RMSNorm + LM head + topk_reduce on the LAST token --------
     {
         let mut se = StepEncoder::new(model);
-        let on = tensor(cfg, "output_norm.weight").clone();
         rms_norm(model, cfg, &mut se, m, cfg.n_embd,
-                 model.act_layout.x, model.act_layout.x_norm, (on.offset / ACT_ELEM_BYTES) as u32);
+                 model.act_layout.x, model.act_layout.x_norm, ot.output_norm_off);
 
         let last_input_offset = model.act_layout.x_norm + (m - 1) * cfg.n_embd;
-        let lm_w = tensor(cfg, "token_embd.weight").clone();
         matvec_q1_0(model, cfg, &mut se,
                     cfg.n_embd, cfg.n_vocab,
-                    &model.buffers.w_embed, lm_w.d_offset as u32, lm_w.qs_offset as u32,
+                    WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
                     last_input_offset, model.act_layout.logits, false);
         // topk_reduce in its own (small) compute pass.
         {
@@ -546,12 +511,9 @@ pub(crate) async fn prefill_matmul_topk(
                 out_offset: 0, k,
             };
             let off = se.alloc_uniform(&p);
-            let bg = make_bg(model, &model.bgls.topk_reduce, "topk_bg",
-                             std::mem::size_of::<TopKParams>() as u64,
-                             &[&model.buffers.act, &model.buffers.sample]);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("topk_reduce"), timestamp_writes: None });
             cp.set_pipeline(&model.pipes.topk_reduce);
-            cp.set_bind_group(0, &bg, &[off]);
+            cp.set_bind_group(0, &model.cached.topk_reduce, &[off]);
             cp.dispatch_workgroups(1, 1, 1);
         }
         let cb = se.finish();
@@ -563,32 +525,27 @@ pub(crate) async fn prefill_matmul_topk(
 
 fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32, m: u32) {
     let pos_base = 0u32;
+    let lt = &model.layer_tensors[il as usize];
 
-    let an = tensor(cfg, &format!("blk.{il}.attn_norm.weight")).clone();
     rms_norm(model, cfg, se, m, cfg.n_embd,
-             model.act_layout.x, model.act_layout.x_norm, (an.offset / ACT_ELEM_BYTES) as u32);
+             model.act_layout.x, model.act_layout.x_norm, lt.attn_norm_off);
 
     let (a_d_off, a_qs_off) = quantize_act(model, cfg, se, cfg.n_embd, m, model.act_layout.x_norm);
 
-    let wq = tensor(cfg, &format!("blk.{il}.attn_q.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.n_embd, cfg.q_dim, m,
-                &model.buffers.w_attn, wq.d_offset as u32, wq.qs_offset as u32,
+                WeightSet::Attn, lt.wq.0, lt.wq.1,
                 a_d_off, a_qs_off, model.act_layout.q, false);
-    let wk = tensor(cfg, &format!("blk.{il}.attn_k.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.n_embd, cfg.kv_dim, m,
-                &model.buffers.w_attn, wk.d_offset as u32, wk.qs_offset as u32,
+                WeightSet::Attn, lt.wk.0, lt.wk.1,
                 a_d_off, a_qs_off, model.act_layout.k_cur, false);
-    let wv = tensor(cfg, &format!("blk.{il}.attn_v.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.n_embd, cfg.kv_dim, m,
-                &model.buffers.w_attn, wv.d_offset as u32, wv.qs_offset as u32,
+                WeightSet::Attn, lt.wv.0, lt.wv.1,
                 a_d_off, a_qs_off, model.act_layout.v_cur, false);
 
-    let qn = tensor(cfg, &format!("blk.{il}.attn_q_norm.weight")).clone();
     rms_norm(model, cfg, se, m * cfg.n_head, cfg.head_dim,
-             model.act_layout.q, model.act_layout.q, (qn.offset / ACT_ELEM_BYTES) as u32);
-    let kn = tensor(cfg, &format!("blk.{il}.attn_k_norm.weight")).clone();
+             model.act_layout.q, model.act_layout.q, lt.attn_q_norm_off);
     rms_norm(model, cfg, se, m * cfg.n_kv_head, cfg.head_dim,
-             model.act_layout.k_cur, model.act_layout.k_cur, (kn.offset / ACT_ELEM_BYTES) as u32);
+             model.act_layout.k_cur, model.act_layout.k_cur, lt.attn_k_norm_off);
 
     rope(model, cfg, se, model.act_layout.q,     m, cfg.n_head,    pos_base);
     rope(model, cfg, se, model.act_layout.k_cur, m, cfg.n_kv_head, pos_base);
@@ -614,40 +571,33 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
             m_tokens: m, is_prefill: 1,
         };
         let off = se.alloc_uniform(&p);
-        let bg = make_bg(model, &model.bgls.attn, "attn_bg", std::mem::size_of::<AttnParams>() as u64,
-                         &[&model.buffers.act, &model.buffers.kv_k, &model.buffers.kv_v]);
         let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("attn"), timestamp_writes: None });
         cp.set_pipeline(&model.pipes.attention);
-        cp.set_bind_group(0, &bg, &[off]);
+        cp.set_bind_group(0, &model.cached.attn, &[off]);
         cp.dispatch_workgroups(cfg.n_head, m, 1);
     }
 
     let (a_d2, a_qs2) = quantize_act(model, cfg, se, cfg.q_dim, m, model.act_layout.attn_out);
-    let wo = tensor(cfg, &format!("blk.{il}.attn_output.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.q_dim, cfg.n_embd, m,
-                &model.buffers.w_attn, wo.d_offset as u32, wo.qs_offset as u32,
+                WeightSet::Attn, lt.wo.0, lt.wo.1,
                 a_d2, a_qs2, model.act_layout.x, true);
 
-    let fn_n = tensor(cfg, &format!("blk.{il}.ffn_norm.weight")).clone();
     rms_norm(model, cfg, se, m, cfg.n_embd,
-             model.act_layout.x, model.act_layout.x_norm, (fn_n.offset / ACT_ELEM_BYTES) as u32);
+             model.act_layout.x, model.act_layout.x_norm, lt.ffn_norm_off);
 
     let (a_d3, a_qs3) = quantize_act(model, cfg, se, cfg.n_embd, m, model.act_layout.x_norm);
-    let wg = tensor(cfg, &format!("blk.{il}.ffn_gate.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.n_embd, cfg.n_ff, m,
-                &model.buffers.w_ffn_gu, wg.d_offset as u32, wg.qs_offset as u32,
+                WeightSet::FfnGU, lt.wg.0, lt.wg.1,
                 a_d3, a_qs3, model.act_layout.gate, false);
-    let wu = tensor(cfg, &format!("blk.{il}.ffn_up.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.n_embd, cfg.n_ff, m,
-                &model.buffers.w_ffn_gu, wu.d_offset as u32, wu.qs_offset as u32,
+                WeightSet::FfnGU, lt.wu.0, lt.wu.1,
                 a_d3, a_qs3, model.act_layout.up, false);
 
     silu_mul(model, se, cfg.n_ff, m, model.act_layout.gate, model.act_layout.up, model.act_layout.ffn_in);
 
     let (a_d4, a_qs4) = quantize_act(model, cfg, se, cfg.n_ff, m, model.act_layout.ffn_in);
-    let wd = tensor(cfg, &format!("blk.{il}.ffn_down.weight")).clone();
     matmul_q1_0(model, cfg, se, cfg.n_ff, cfg.n_embd, m,
-                &model.buffers.w_ffn_d, wd.d_offset as u32, wd.qs_offset as u32,
+                WeightSet::FfnD, lt.wd.0, lt.wd.1,
                 a_d4, a_qs4, model.act_layout.x, true);
 }
 
@@ -662,11 +612,9 @@ fn rms_norm(model: &Model, cfg: &Config, se: &mut StepEncoder,
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.rms_norm, "rms_bg", std::mem::size_of::<RmsNormParams>() as u64,
-                     &[&model.buffers.act, &model.buffers.w_norms]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rms_norm"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.rms_norm);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, &model.cached.rms_norm, &[off]);
     cp.dispatch_workgroups(n_groups, 1, 1);
 }
 
@@ -678,18 +626,16 @@ fn rope(model: &Model, cfg: &Config, se: &mut StepEncoder,
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.rope, "rope_bg", std::mem::size_of::<RopeParams>() as u64,
-                     &[&model.buffers.rope_table, &model.buffers.act]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rope"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.rope_neox);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, &model.cached.rope, &[off]);
     cp.dispatch_workgroups(n_tokens, n_heads, 1);
 }
 
 #[cfg(feature = "bench-internals")]
 fn matvec_q1_0_fused_pass(
     model: &Model, se: &mut StepEncoder,
-    k: u32, input_offset: u32, weights: &wgpu::Buffer,
+    k: u32, input_offset: u32, weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
     debug_assert!(ranges.len() == 2 || ranges.len() == 3);
@@ -710,18 +656,15 @@ fn matvec_q1_0_fused_pass(
         d_offset_2: d2, qs_offset_2: qs2, n_2: n2, output_offset_2: o2,
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.matvec, "matvec_fused_bg",
-                     std::mem::size_of::<MatvecFusedParams>() as u64,
-                     &[weights, &model.buffers.act]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("matvec_fused"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.matvec_fused);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
 fn matvec_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
                k: u32, n: u32,
-               weights: &wgpu::Buffer, w_d: u32, w_qs: u32,
+               weights: WeightSet, w_d: u32, w_qs: u32,
                in_off: u32, out_off: u32, accumulate: bool) {
     const ROWS_PER_WG: u32 = 8;
     let n_wg = (n + ROWS_PER_WG - 1) / ROWS_PER_WG;
@@ -735,11 +678,9 @@ fn matvec_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
         dispatch_x_dim: dispatch_x,
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.matvec, "matvec_bg", std::mem::size_of::<MatvecParams>() as u64,
-                     &[weights, &model.buffers.act]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("matvec"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.matvec);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -758,11 +699,9 @@ fn quantize_act(model: &Model, _cfg: &Config, se: &mut StepEncoder,
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.quantize, "quant_bg", std::mem::size_of::<QuantParams>() as u64,
-                     &[&model.buffers.act, &model.buffers.act_q8]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("quantize"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.quantize);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, &model.cached.quantize, &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     (d_off, qs_off)
 }
@@ -779,17 +718,15 @@ fn silu_mul(model: &Model, se: &mut StepEncoder,
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.silu_mul, "silu_bg", std::mem::size_of::<SiluMulParams>() as u64,
-                     &[&model.buffers.act]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("silu_mul"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.silu_mul);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, &model.cached.silu_mul, &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
 fn matmul_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
                k: u32, n: u32, m: u32,
-               weights: &wgpu::Buffer, w_d: u32, w_qs: u32,
+               weights: WeightSet, w_d: u32, w_qs: u32,
                a_d: u32, a_qs: u32, out_off: u32, accumulate: bool) {
     let p = MatmulParams {
         k, n, m,
@@ -800,11 +737,9 @@ fn matmul_q1_0(model: &Model, _cfg: &Config, se: &mut StepEncoder,
         ..Default::default()
     };
     let off = se.alloc_uniform(&p);
-    let bg = make_bg(model, &model.bgls.matmul, "matmul_bg", std::mem::size_of::<MatmulParams>() as u64,
-                     &[weights, &model.buffers.act_q8, &model.buffers.act]);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("matmul"), timestamp_writes: None });
     cp.set_pipeline(&model.pipes.matmul);
-    cp.set_bind_group(0, &bg, &[off]);
+    cp.set_bind_group(0, matmul_bg(model, weights), &[off]);
     cp.dispatch_workgroups((n + 63) / 64, (m + 63) / 64, 1);
 }
 
@@ -882,60 +817,49 @@ pub mod bench_internals {
         type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
         let mut entries: Vec<(String, u32, DispatchFn)> = Vec::new();
 
-        let matvec_shapes: &[(&str, u32, u32, u32, &str, &str)] = &[
-            ("matvec Wo         K=4096 N=2560 ", cfg.q_dim,  cfg.n_embd, 36, "blk.0.attn_output.weight", "w_attn"),
-            ("matvec Wdown      K=9728 N=2560 ", cfg.n_ff,   cfg.n_embd, 36, "blk.0.ffn_down.weight",    "w_ffn_d"),
-            ("matvec LM_head    K=2560 N=152K ", cfg.n_embd, cfg.n_vocab, 1, "token_embd.weight",        "w_embed"),
+        // (label, k, n, calls/step, weight_set, w_d_offset, w_qs_offset)
+        let lt0 = &model.layer_tensors[0];
+        let ot = &model.output_tensors;
+        let matvec_shapes: &[(&str, u32, u32, u32, WeightSet, u32, u32)] = &[
+            ("matvec Wo         K=4096 N=2560 ", cfg.q_dim,  cfg.n_embd, 36, WeightSet::Attn,  lt0.wo.0,        lt0.wo.1),
+            ("matvec Wdown      K=9728 N=2560 ", cfg.n_ff,   cfg.n_embd, 36, WeightSet::FfnD,  lt0.wd.0,        lt0.wd.1),
+            ("matvec LM_head    K=2560 N=152K ", cfg.n_embd, cfg.n_vocab, 1, WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs),
         ];
-        for &(label, k, n, calls, ten_name, buf_name) in matvec_shapes {
-            let ten_name_s = ten_name.to_string();
-            let buf_name_s = buf_name.to_string();
+        for &(label, k, n, calls, ws, w_d, w_qs) in matvec_shapes {
             entries.push((label.to_string(), calls, Box::new(move |model, cfg, se| {
-                let t = tensor(cfg, &ten_name_s).clone();
-                let buf = match buf_name_s.as_str() {
-                    "w_attn"   => &model.buffers.w_attn,
-                    "w_ffn_gu" => &model.buffers.w_ffn_gu,
-                    "w_ffn_d"  => &model.buffers.w_ffn_d,
-                    "w_embed"  => &model.buffers.w_embed,
-                    _ => unreachable!(),
-                };
-                matvec_q1_0(model, cfg, se, k, n, buf, t.d_offset as u32, t.qs_offset as u32,
+                matvec_q1_0(model, cfg, se, k, n, ws, w_d, w_qs,
                             model.act_layout.x_norm, model.act_layout.x, false);
             })));
         }
 
         entries.push(("matvec QKV  fused N=4608        ".to_string(), 36, Box::new(move |model, cfg, se| {
-            let wq = tensor(cfg, "blk.0.attn_q.weight").clone();
-            let wk = tensor(cfg, "blk.0.attn_k.weight").clone();
-            let wv = tensor(cfg, "blk.0.attn_v.weight").clone();
+            let lt = &model.layer_tensors[0];
             matvec_q1_0_fused_pass(model, se, cfg.n_embd, model.act_layout.x_norm,
-                              &model.buffers.w_attn, &[
-                (wq.d_offset as u32, wq.qs_offset as u32, cfg.q_dim,  model.act_layout.q),
-                (wk.d_offset as u32, wk.qs_offset as u32, cfg.kv_dim, model.act_layout.k_cur),
-                (wv.d_offset as u32, wv.qs_offset as u32, cfg.kv_dim, model.act_layout.v_cur),
+                              WeightSet::Attn, &[
+                (lt.wq.0, lt.wq.1, cfg.q_dim,  model.act_layout.q),
+                (lt.wk.0, lt.wk.1, cfg.kv_dim, model.act_layout.k_cur),
+                (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
             ]);
         })));
         entries.push(("matvec gate_up fused N=19456    ".to_string(), 36, Box::new(move |model, cfg, se| {
-            let wg = tensor(cfg, "blk.0.ffn_gate.weight").clone();
-            let wu = tensor(cfg, "blk.0.ffn_up.weight").clone();
+            let lt = &model.layer_tensors[0];
             matvec_q1_0_fused_pass(model, se, cfg.n_embd, model.act_layout.x_norm,
-                              &model.buffers.w_ffn_gu, &[
-                (wg.d_offset as u32, wg.qs_offset as u32, cfg.n_ff, model.act_layout.gate),
-                (wu.d_offset as u32, wu.qs_offset as u32, cfg.n_ff, model.act_layout.up),
+                              WeightSet::FfnGU, &[
+                (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
+                (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
             ]);
         })));
 
-        let rms_shapes: &[(&str, u32, u32, u32, &str)] = &[
-            ("rms_norm  ng=1  gs=2560        ", 1,  cfg.n_embd,    36 + 36 + 1, "blk.0.attn_norm.weight"),
-            ("rms_norm  ng=32 gs=128         ", cfg.n_head,    cfg.head_dim, 36, "blk.0.attn_q_norm.weight"),
-            ("rms_norm  ng=8  gs=128         ", cfg.n_kv_head, cfg.head_dim, 36, "blk.0.attn_k_norm.weight"),
+        // (label, n_groups, group_size, calls/step, norm_off)
+        let rms_shapes: &[(&str, u32, u32, u32, u32)] = &[
+            ("rms_norm  ng=1  gs=2560        ", 1,             cfg.n_embd,    36 + 36 + 1, lt0.attn_norm_off),
+            ("rms_norm  ng=32 gs=128         ", cfg.n_head,    cfg.head_dim,  36,          lt0.attn_q_norm_off),
+            ("rms_norm  ng=8  gs=128         ", cfg.n_kv_head, cfg.head_dim,  36,          lt0.attn_k_norm_off),
         ];
-        for &(label, ng, gs, calls, ten_name) in rms_shapes {
-            let ten_name_s = ten_name.to_string();
+        for &(label, ng, gs, calls, norm_off) in rms_shapes {
             entries.push((label.to_string(), calls, Box::new(move |model, cfg, se| {
-                let t = tensor(cfg, &ten_name_s).clone();
                 rms_norm(model, cfg, se, ng, gs,
-                         model.act_layout.x_norm, model.act_layout.x_norm, (t.offset / ACT_ELEM_BYTES) as u32);
+                         model.act_layout.x_norm, model.act_layout.x_norm, norm_off);
             })));
         }
 
@@ -964,42 +888,36 @@ pub mod bench_internals {
                 m_tokens: 1, is_prefill: 0,
             };
             let off = se.alloc_uniform(&p);
-            let bg = make_bg(model, &model.bgls.attn, "attn_bg", std::mem::size_of::<AttnParams>() as u64,
-                             &[&model.buffers.act, &model.buffers.kv_k, &model.buffers.kv_v]);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("attn"), timestamp_writes: None });
             cp.set_pipeline(&model.pipes.attention);
-            cp.set_bind_group(0, &bg, &[off]);
+            cp.set_bind_group(0, &model.cached.attn, &[off]);
             cp.dispatch_workgroups(cfg.n_head, 1, 1);
         })));
 
         entries.push(("embed                           ".to_string(), 1, Box::new(move |model, cfg, se| {
-            let t = tensor(cfg, "token_embd.weight").clone();
+            let ot = &model.output_tensors;
             let p = EmbedParams {
                 k: cfg.n_embd,
-                d_offset: t.d_offset as u32,
-                qs_offset: t.qs_offset as u32,
+                d_offset: ot.token_embd_d,
+                qs_offset: ot.token_embd_qs,
                 output_offset: model.act_layout.x,
                 sample_offset: 0,
                 m_token: 0,
                 ..Default::default()
             };
             let off = se.alloc_uniform(&p);
-            let bg = make_bg(model, &model.bgls.embed, "embed_bg", std::mem::size_of::<EmbedParams>() as u64,
-                             &[&model.buffers.w_embed, &model.buffers.act, &model.buffers.sample]);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("embed"), timestamp_writes: None });
             cp.set_pipeline(&model.pipes.embed);
-            cp.set_bind_group(0, &bg, &[off]);
+            cp.set_bind_group(0, &model.cached.embed, &[off]);
             cp.dispatch_workgroups(1, 1, 1);
         })));
 
         entries.push(("topk_reduce n=n_vocab           ".to_string(), 1, Box::new(move |model, _cfg, se| {
             let p = TopKParams { n: model.cfg.n_vocab, in_offset: model.act_layout.logits, out_offset: 0, k: 1 };
             let off = se.alloc_uniform(&p);
-            let bg = make_bg(model, &model.bgls.topk_reduce, "topk_bg", std::mem::size_of::<TopKParams>() as u64,
-                             &[&model.buffers.act, &model.buffers.sample]);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("topk_reduce"), timestamp_writes: None });
             cp.set_pipeline(&model.pipes.topk_reduce);
-            cp.set_bind_group(0, &bg, &[off]);
+            cp.set_bind_group(0, &model.cached.topk_reduce, &[off]);
             cp.dispatch_workgroups(1, 1, 1);
         })));
 
