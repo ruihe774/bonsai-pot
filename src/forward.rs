@@ -244,7 +244,7 @@ async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32
         std::result::Result<(), wgpu::BufferAsyncError>,
     >();
     slice.map_async(wgpu::MapMode::Read, move |res| { let _ = s.send(res); });
-    let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+    model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
     match r.receive().await {
         Some(Ok(())) => {}
         Some(Err(e)) => return Err(PotError::BufferMap(e)),
@@ -428,24 +428,23 @@ fn layer_post_kv_in_pass(
 pub(crate) async fn prefill_matvec_loop_topk(
     model: &Model, prompt: &[u32], pos_base: u32, k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
-    if prompt.is_empty() {
+    let Some((&last, rest)) = prompt.split_last() else {
         return Err(PotError::PrefillTooLarge { n: 0, max: model.m_max });
-    }
-    let last = prompt.len() - 1;
+    };
     // For the (n - 1) non-last tokens we just need to fill the KV cache; we
     // can encode them all back-to-back into a SINGLE command buffer + submit,
     // then run the final token through `step_matvec_topk` (which does the
     // CPU readback for sampling).
-    if last > 0 {
+    if !rest.is_empty() {
         // One up-front write covers every non-last token's input slot. The
         // embed shader for step `i` reads `sample[i]`. The topk_reduce output
         // for steps 0..last-1 is routed to a scratch slot beyond the prompt
         // region (sample buffer is 1024 u32 slots / 4 KB; M_MAX = 512, so
         // `TOPK_SCRATCH_BASE = 768` is well clear of any prompt tokens).
         const TOPK_SCRATCH_BASE: u32 = 768;
-        model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(&prompt[..last]));
+        model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(rest));
         let mut se = StepEncoder::new(model);
-        for t in 0..last {
+        for t in 0..rest.len() {
             encode_step_matvec(
                 &mut se, &model.cfg,
                 /*sample_in=*/ t as u32,
@@ -457,7 +456,7 @@ pub(crate) async fn prefill_matvec_loop_topk(
         let cb = se.finish();
         model.queue.submit(Some(cb));
     }
-    step_matvec_topk(model, prompt[last], pos_base + last as u32, k).await
+    step_matvec_topk(model, last, pos_base + rest.len() as u32, k).await
 }
 
 // ---------- matmul (batched prefill) ---------------------------------------
@@ -785,14 +784,14 @@ pub mod bench_internals {
         // ----- warm up -----
         let _ = prefill_matmul_topk(model, &prompt[..pp_n.min(model.m_max) as usize], 0, 1).await?;
         step_matvec_no_sample(model, 1u32, 0);
-        let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+        model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
 
         // ----- pp{pp_n} -----
         let mut pp_times = Vec::with_capacity(repeats as usize);
         for _ in 0..repeats {
             let t = std::time::Instant::now();
             let _ = prefill_matmul_topk(model, &prompt, 0, 1).await?;
-            let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+            model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
             pp_times.push(t.elapsed().as_secs_f32());
         }
         let pp_mean = pp_times.iter().sum::<f32>() / pp_times.len() as f32;
@@ -807,7 +806,7 @@ pub mod bench_internals {
             for pos in 0..tg_n {
                 let (_, _) = step_matvec_topk(model, 1u32, pos, 1).await?;
             }
-            let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+            model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
             tg_times.push(t.elapsed().as_secs_f32());
         }
         let tg_mean = tg_times.iter().sum::<f32>() / tg_times.len() as f32;
@@ -951,7 +950,7 @@ pub mod bench_internals {
             se.encoder.copy_buffer_to_buffer(&model.buffers.act, 0, &model.buffers.kv_k, 0, kv_row_bytes);
             let cb = se.finish();
             model.queue.submit(Some(cb));
-            let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+            model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
         }
 
         let mut breakdown: Vec<(String, u32, f32)> = Vec::new();
@@ -963,7 +962,7 @@ pub mod bench_internals {
                 for _ in 0..n_per_cb { build(model, cfg, &mut se); }
                 let cb = se.finish();
                 model.queue.submit(Some(cb));
-                let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+                model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -981,7 +980,7 @@ pub mod bench_internals {
                     enc.copy_buffer_to_buffer(&model.buffers.act, 0, &model.buffers.kv_v, 0, kv_row_bytes);
                 }
                 model.queue.submit(Some(enc.finish()));
-                let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
+                model.device.poll(wgpu::PollType::wait_indefinitely()).expect("device.poll failed");
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;

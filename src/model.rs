@@ -685,6 +685,14 @@ impl Model {
     pub fn vocab_token(&self, id: u32) -> Option<&str> {
         self.vocab.get(id as usize).map(|s| s.as_str())
     }
+
+    /// Reverse lookup: find the token id whose raw vocab string matches
+    /// `token` exactly. Linear scan over the vocab — only intended for
+    /// occasional startup-time lookups (e.g. resolving `<|im_end|>` in a chat
+    /// REPL), not per-token decode work.
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.vocab.iter().position(|s| s == token).map(|i| i as u32)
+    }
 }
 
 /// Precompute cos/sin table for NEOX rope: per position p (0..max_seq),
@@ -706,7 +714,7 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
 // ----- public(crate) helpers used by forward.rs -----------------------------
 
 pub(crate) fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
-    cfg.manifest.get(name).unwrap_or_else(|| panic!("missing tensor {name}"))
+    cfg.manifest.get(name).unwrap_or_else(|| panic!("missing tensor in manifest: {name}"))
 }
 
 /// Build the full set of cached bind groups in one go. Called once at load.

@@ -25,11 +25,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-// Qwen2/3 special-token IDs (see model/vocab.bin). The chat template uses
-// IM_END as the assistant-turn terminator.
-const IM_END: u32 = 151645;
-const ENDOFTEXT: u32 = 151643;
-
 struct Args {
     model_dir: PathBuf,
     bpe: String,
@@ -85,6 +80,14 @@ EXAMPLE:
         --system \"You are a terse Rust expert.\"
 ";
 
+fn parse_or_die<T: std::str::FromStr>(flag: &str, raw: &str) -> T
+where T::Err: std::fmt::Display {
+    raw.parse::<T>().unwrap_or_else(|e| {
+        eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
+        std::process::exit(1);
+    })
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     // Handle -h / --help before requiring a positional model_dir.
@@ -121,12 +124,12 @@ fn parse_args() -> Args {
         match argv[i].as_str() {
             "--bpe" => { a.bpe = val(); i += 2; }
             "--system" => { a.system = val(); i += 2; }
-            "--temperature" => { a.temperature = val().parse().unwrap(); i += 2; }
-            "--top-p" => { a.top_p = Some(val().parse().unwrap()); i += 2; }
-            "--top-k" => { a.top_k = Some(val().parse().unwrap()); i += 2; }
-            "--seed" => { a.seed = val().parse().unwrap(); i += 2; }
-            "--max-new-tokens" => { a.max_new_tokens = val().parse().unwrap(); i += 2; }
-            "--max-seq" => { a.max_seq = val().parse().unwrap(); i += 2; }
+            "--temperature" => { a.temperature = parse_or_die("--temperature", &val()); i += 2; }
+            "--top-p" => { a.top_p = Some(parse_or_die("--top-p", &val())); i += 2; }
+            "--top-k" => { a.top_k = Some(parse_or_die("--top-k", &val())); i += 2; }
+            "--seed" => { a.seed = parse_or_die("--seed", &val()); i += 2; }
+            "--max-new-tokens" => { a.max_new_tokens = parse_or_die("--max-new-tokens", &val()); i += 2; }
+            "--max-seq" => { a.max_seq = parse_or_die("--max-seq", &val()); i += 2; }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 std::process::exit(1);
@@ -168,12 +171,22 @@ fn main() {
     env_logger::builder().filter_level(log::LevelFilter::Warn).init();
     let args = parse_args();
 
+    eprintln!("seed: {}", args.seed);
+
     pollster::block_on(async move {
         eprintln!("loading model from {}…", args.model_dir.display());
         let model = Model::load_with_options(
             &args.model_dir,
             ModelOptions { max_seq: args.max_seq },
         ).await.expect("load model");
+        let im_end = model.token_id("<|im_end|>").unwrap_or_else(|| {
+            eprintln!("error: vocab missing <|im_end|>");
+            std::process::exit(2);
+        });
+        let endoftext = model.token_id("<|endoftext|>").unwrap_or_else(|| {
+            eprintln!("error: vocab missing <|endoftext|>");
+            std::process::exit(2);
+        });
         let sampler = Sampler {
             temperature: args.temperature,
             top_k: args.top_k,
@@ -242,7 +255,7 @@ fn main() {
             stdout.flush().ok();
             let mut hit_overflow = false;
             for _ in 0..args.max_new_tokens {
-                if next == IM_END || next == ENDOFTEXT { break; }
+                if next == im_end || next == endoftext { break; }
                 stdout.write_all(&model.decode_token(next)).ok();
                 stdout.flush().ok();
                 match sess.step(next, &sampler).await {

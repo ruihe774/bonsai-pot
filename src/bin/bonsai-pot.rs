@@ -76,6 +76,14 @@ EXAMPLES:
     bonsai-pot ./model --mode bench --pp 512 --tg 128
 ";
 
+fn parse_or_die<T: std::str::FromStr>(flag: &str, raw: &str) -> T
+where T::Err: std::fmt::Display {
+    raw.parse::<T>().unwrap_or_else(|e| {
+        eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
+        std::process::exit(1);
+    })
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
@@ -107,14 +115,14 @@ fn parse_args() -> Args {
         });
         match argv[i].as_str() {
             "--mode" => { a.mode = next(); i += 2; }
-            "--max-new-tokens" => { a.n_gen = next().parse().unwrap(); i += 2; }
-            "--pp" => { a.pp_n = next().parse().unwrap(); i += 2; }
-            "--tg" => { a.tg_n = next().parse().unwrap(); i += 2; }
-            "--repeats" => { a.repeats = next().parse().unwrap(); i += 2; }
-            "--temperature" => { a.temperature = next().parse().unwrap(); i += 2; }
-            "--top-k" => { a.top_k = Some(next().parse().unwrap()); i += 2; }
-            "--top-p" => { a.top_p = Some(next().parse().unwrap()); i += 2; }
-            "--seed" => { a.seed = next().parse().unwrap(); i += 2; }
+            "--max-new-tokens" => { a.n_gen = parse_or_die("--max-new-tokens", &next()); i += 2; }
+            "--pp" => { a.pp_n = parse_or_die("--pp", &next()); i += 2; }
+            "--tg" => { a.tg_n = parse_or_die("--tg", &next()); i += 2; }
+            "--repeats" => { a.repeats = parse_or_die("--repeats", &next()); i += 2; }
+            "--temperature" => { a.temperature = parse_or_die("--temperature", &next()); i += 2; }
+            "--top-k" => { a.top_k = Some(parse_or_die("--top-k", &next())); i += 2; }
+            "--top-p" => { a.top_p = Some(parse_or_die("--top-p", &next())); i += 2; }
+            "--seed" => { a.seed = parse_or_die("--seed", &next()); i += 2; }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 std::process::exit(1);
