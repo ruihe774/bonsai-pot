@@ -4,7 +4,9 @@ enable f16;
 // Reads the row index (token_id) from `sample[sample_offset + wg.x]`; this lets us
 // chain steps on the GPU without a CPU round-trip — argmax of step N writes
 // the input token for step N+1.
-// dispatch: (m, 1, 1) workgroups; one workgroup per output row, 64 threads each.
+// dispatch: (m, 1, 1) workgroups; one workgroup per output row, 32 threads each.
+// (Only nb = n_embd/128 threads do useful work; for n_embd=2560 that's 20.
+// 32 keeps the workgroup small and SIMD-aligned.)
 
 struct Params {
   k: u32,             // n_embd
@@ -31,7 +33,7 @@ fn load_byte_at(b_offset: u32) -> u32 {
   return (word >> ((b_offset & 3u) * 8u)) & 0xFFu;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(32)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wg: vec3<u32>) {
   let nb = p.k / 128u;

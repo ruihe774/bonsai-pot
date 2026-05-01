@@ -1,12 +1,14 @@
 enable f16;
 
 // Single-workgroup top-K reduction over `n` halves.
-// Phase 1: each thread maintains a per-thread top-K_MAX as a MIN-HEAP in
-//          shared memory (insertion = O(log K) sift-down).
-// Phase 2a: each thread heap-sorts its K_MAX entries into ASCENDING order
-//          (extract-min K times, in-place).
+// Phase 1:  each thread maintains a per-thread top-K_MAX as a MIN-HEAP in
+//           shared memory (insertion = O(log K) sift-down).
+// Phase 2a: each thread heap-sorts its K_MAX entries into DESCENDING order
+//           (extract-min K times, in-place; min ends up at the back, so the
+//           front-to-back order is descending).
 // Phase 2b: pairwise tree merge across threads, in-place in shared memory,
-//          via two-pointer-from-the-top.
+//           via two-pointer-from-the-front, writing the merged run descending.
+// Phase 3:  thread 0 writes sh[base..+kk] directly to `result` (descending).
 // dispatch: (1, 1, 1)
 //
 // Output (at u32 offset `out_offset` into `result`):
@@ -71,13 +73,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     }
   }
 
-  // ---- Phase 2a: heap-sort to ascending. Repeatedly swap root (min) with
-  //                last element of the active heap, then sift down on the
-  //                shrunken heap. Result: sh[base..base+K_MAX] sorted DESC.
-  // Then reverse to get ASC. (We could also extract-min into the staged array
-  // and copy back, but in-place is simpler.)
-  // -- Sort descending: at each step, swap heap[0] (min) with heap[active-1],
-  //                     then re-sift the [0..active-1] sub-heap.
+  // ---- Phase 2a: heap-sort to descending. At each step, swap heap[0] (min)
+  //                with heap[active-1], then re-sift the [0..active-1) sub-heap.
+  //                The minimum ends up at the back, the second-minimum just
+  //                before it, etc. — so sh[base..base+K_MAX] is DESCENDING
+  //                front-to-back when this loop finishes.
   for (var active_minus1: u32 = K_MAX - 1u; active_minus1 > 0u; active_minus1 = active_minus1 - 1u) {
     let last = base + active_minus1;
     let tv = sh_val[base]; sh_val[base] = sh_val[last]; sh_val[last] = tv;
@@ -96,36 +96,30 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
       i = smallest;
     }
   }
-  // Now sh[base..base+K_MAX] is sorted DESCENDING. Reverse to ASCENDING for the
-  // two-pointer merge convention used in phase 2b.
-  for (var i: u32 = 0u; i < K_MAX / 2u; i = i + 1u) {
-    let j = K_MAX - 1u - i;
-    let tv = sh_val[base + i]; sh_val[base + i] = sh_val[base + j]; sh_val[base + j] = tv;
-    let ti = sh_idx[base + i]; sh_idx[base + i] = sh_idx[base + j]; sh_idx[base + j] = ti;
-  }
   workgroupBarrier();
 
   // ---- Phase 2b: tree reduction. Each level halves the active thread count.
+  // Two-pointer merge from the front: both halves are descending, so the
+  // larger of the two heads is the next-largest overall.
   var s: u32 = WG / 2u;
   loop {
     if (s == 0u) { break; }
     if (tid < s) {
       let a = base;
       let b = (tid + s) * K_MAX;
-      var ia: i32 = i32(K_MAX) - 1;
-      var ib: i32 = i32(K_MAX) - 1;
+      var ia: u32 = 0u;
+      var ib: u32 = 0u;
       for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
-        let va = sh_val[a + u32(ia)];
-        let vb = sh_val[b + u32(ib)];
-        let dst = K_MAX - 1u - i;
+        let va = sh_val[a + ia];
+        let vb = sh_val[b + ib];
         if (va > vb) {
-          staged_val[dst] = va;
-          staged_idx[dst] = sh_idx[a + u32(ia)];
-          ia = ia - 1;
+          staged_val[i] = va;
+          staged_idx[i] = sh_idx[a + ia];
+          ia = ia + 1u;
         } else {
-          staged_val[dst] = vb;
-          staged_idx[dst] = sh_idx[b + u32(ib)];
-          ib = ib - 1;
+          staged_val[i] = vb;
+          staged_idx[i] = sh_idx[b + ib];
+          ib = ib + 1u;
         }
       }
       for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
@@ -141,7 +135,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   if (tid == 0u) {
     let kk = min(p.k, K_MAX);
     for (var i: u32 = 0u; i < kk; i = i + 1u) {
-      let src = K_MAX - 1u - i;
+      let src = i;
       result[p.out_offset + i]      = bitcast<u32>(sh_val[src]);
       result[p.out_offset + kk + i] = sh_idx[src];
     }
