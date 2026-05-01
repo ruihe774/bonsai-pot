@@ -79,7 +79,7 @@ mod tests {
         // Mirror the GPT-2 bytes_to_unicode forward map and verify every byte
         // survives a round-trip through decode_token_bytes.
         fn encode_byte(b: u8) -> char {
-            let printable_single: Vec<u8> = (b'!' ..= b'~')
+            let printable_single: Vec<u8> = (b'!'..=b'~')
                 .chain(0xa1..=0xac)
                 .chain(0xae..=0xff)
                 .collect();

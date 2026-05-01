@@ -22,8 +22,8 @@ pub enum PotError {
 impl Display for PotError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         use PotError::{
-            BufferMap, Config, ConfigParse, ContextOverflow, DeviceRequest, FeatureUnsupported,
-            Io, MissingTensor, NoAdapter, PrefillTooLarge, Vocab,
+            BufferMap, Config, ConfigParse, ContextOverflow, DeviceRequest, FeatureUnsupported, Io,
+            MissingTensor, NoAdapter, PrefillTooLarge, Vocab,
         };
         match self {
             Io { path, source } => write!(f, "io error reading {}: {}", path.display(), source),
@@ -31,11 +31,18 @@ impl Display for PotError {
             MissingTensor(name) => write!(f, "missing tensor in manifest: {name}"),
             Vocab(msg) => write!(f, "vocab.bin / vocab_offsets.bin: {msg}"),
             NoAdapter => write!(f, "no compatible GPU adapter found"),
-            FeatureUnsupported(feat) => write!(f, "adapter does not support required feature: {feat}"),
+            FeatureUnsupported(feat) => {
+                write!(f, "adapter does not support required feature: {feat}")
+            }
             DeviceRequest(e) => write!(f, "wgpu device request failed: {e}"),
             BufferMap(e) => write!(f, "buffer mapping failed: {e:?}"),
-            ContextOverflow { pos, n, max } => write!(f, "context overflow: pos {pos} + tokens {n} > max_seq {max}"),
-            PrefillTooLarge { n, max } => write!(f, "prefill batch {n} exceeds max_prefill_tokens {max}"),
+            ContextOverflow { pos, n, max } => write!(
+                f,
+                "context overflow: pos {pos} + tokens {n} > max_seq {max}"
+            ),
+            PrefillTooLarge { n, max } => {
+                write!(f, "prefill batch {n} exceeds max_prefill_tokens {max}")
+            }
             Config(msg) => write!(f, "invalid config: {msg}"),
         }
     }
@@ -53,21 +60,26 @@ impl Error for PotError {
 }
 
 impl From<serde_json::Error> for PotError {
-    fn from(e: serde_json::Error) -> Self { Self::ConfigParse(e) }
+    fn from(e: serde_json::Error) -> Self {
+        Self::ConfigParse(e)
+    }
 }
 
 impl From<wgpu::RequestDeviceError> for PotError {
-    fn from(e: wgpu::RequestDeviceError) -> Self { Self::DeviceRequest(e) }
+    fn from(e: wgpu::RequestDeviceError) -> Self {
+        Self::DeviceRequest(e)
+    }
 }
 
 pub type Result<T> = StdResult<T, PotError>;
 
 #[cfg(test)]
 mod tests {
-    use super::PotError;
     use std::error::Error;
     use std::io;
     use std::path::PathBuf;
+
+    use super::PotError;
 
     fn make_io_error() -> PotError {
         PotError::Io {
@@ -79,20 +91,44 @@ mod tests {
     #[test]
     fn display_each_variant() {
         assert!(make_io_error().to_string().contains("/tmp/fake"));
-        assert!(PotError::ConfigParse(serde_json::from_str::<u32>("bad").unwrap_err())
-            .to_string().contains("config.json"));
-        assert!(PotError::MissingTensor("foo.weight".into()).to_string().contains("foo.weight"));
-        assert!(PotError::Vocab("bad magic").to_string().contains("bad magic"));
+        assert!(
+            PotError::ConfigParse(serde_json::from_str::<u32>("bad").unwrap_err())
+                .to_string()
+                .contains("config.json")
+        );
+        assert!(PotError::MissingTensor("foo.weight".into())
+            .to_string()
+            .contains("foo.weight"));
+        assert!(PotError::Vocab("bad magic")
+            .to_string()
+            .contains("bad magic"));
         assert!(PotError::NoAdapter.to_string().contains("GPU adapter"));
-        assert!(PotError::FeatureUnsupported("SHADER_F16").to_string().contains("SHADER_F16"));
-        assert!(PotError::BufferMap(wgpu::BufferAsyncError).to_string().contains("buffer"));
-        assert!(PotError::ContextOverflow { pos: 1020, n: 8, max: 1024 }
-            .to_string().contains("pos 1020"));
-        assert!(PotError::ContextOverflow { pos: 1020, n: 8, max: 1024 }
-            .to_string().contains("max_seq 1024"));
+        assert!(PotError::FeatureUnsupported("SHADER_F16")
+            .to_string()
+            .contains("SHADER_F16"));
+        assert!(PotError::BufferMap(wgpu::BufferAsyncError)
+            .to_string()
+            .contains("buffer"));
+        assert!(PotError::ContextOverflow {
+            pos: 1020,
+            n: 8,
+            max: 1024
+        }
+        .to_string()
+        .contains("pos 1020"));
+        assert!(PotError::ContextOverflow {
+            pos: 1020,
+            n: 8,
+            max: 1024
+        }
+        .to_string()
+        .contains("max_seq 1024"));
         assert!(PotError::PrefillTooLarge { n: 600, max: 512 }
-            .to_string().contains("600"));
-        assert!(PotError::Config("bad value").to_string().contains("bad value"));
+            .to_string()
+            .contains("600"));
+        assert!(PotError::Config("bad value")
+            .to_string()
+            .contains("bad value"));
     }
 
     #[test]
@@ -105,9 +141,19 @@ mod tests {
         assert!(PotError::Vocab("x").source().is_none());
         assert!(PotError::NoAdapter.source().is_none());
         assert!(PotError::FeatureUnsupported("x").source().is_none());
-        assert!(PotError::BufferMap(wgpu::BufferAsyncError).source().is_none());
-        assert!(PotError::ContextOverflow { pos: 0, n: 1, max: 1 }.source().is_none());
-        assert!(PotError::PrefillTooLarge { n: 1, max: 1 }.source().is_none());
+        assert!(PotError::BufferMap(wgpu::BufferAsyncError)
+            .source()
+            .is_none());
+        assert!(PotError::ContextOverflow {
+            pos: 0,
+            n: 1,
+            max: 1
+        }
+        .source()
+        .is_none());
+        assert!(PotError::PrefillTooLarge { n: 1, max: 1 }
+            .source()
+            .is_none());
         assert!(PotError::Config("x").source().is_none());
     }
 

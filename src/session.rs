@@ -25,7 +25,12 @@ pub struct Sampler {
 
 impl Default for Sampler {
     fn default() -> Self {
-        Self { temperature: 1.0, top_k: None, top_p: None, seed: 0 }
+        Self {
+            temperature: 1.0,
+            top_k: None,
+            top_p: None,
+            seed: 0,
+        }
     }
 }
 
@@ -49,7 +54,11 @@ pub struct GenerateOptions {
 
 impl Default for GenerateOptions {
     fn default() -> Self {
-        Self { max_new_tokens: 32, stop_token: None, sampler: Sampler::default() }
+        Self {
+            max_new_tokens: 32,
+            stop_token: None,
+            sampler: Sampler::default(),
+        }
     }
 }
 
@@ -70,11 +79,15 @@ impl<'m> Session<'m> {
 
     /// Current position (number of tokens consumed so far).
     #[must_use]
-    pub const fn pos(&self) -> u32 { self.pos }
+    pub const fn pos(&self) -> u32 {
+        self.pos
+    }
 
     /// Reset to a fresh conversation. O(1) — the KV cache is overwritten in
     /// place by subsequent prefill / step calls, so no GPU work is needed.
-    pub const fn reset(&mut self) { self.pos = 0; }
+    pub const fn reset(&mut self) {
+        self.pos = 0;
+    }
 
     /// Read back the live `[0..pos)` slice of the GPU KV cache to host memory.
     ///
@@ -133,10 +146,15 @@ impl<'m> Session<'m> {
         }
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
-            return Err(PotError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
+            return Err(PotError::ContextOverflow {
+                pos: self.pos,
+                n,
+                max: self.model.max_seq,
+            });
         }
         let k = effective_k(sampler);
-        let (logits, indices) = forward::prefill_matmul_topk(self.model, tokens, self.pos, k).await?;
+        let (logits, indices) =
+            forward::prefill_matmul_topk(self.model, tokens, self.pos, k).await?;
         let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
         self.pos += n;
         Ok(chosen)
@@ -150,13 +168,22 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if the prompt would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
-    pub async fn prefill_one_at_a_time(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
+    pub async fn prefill_one_at_a_time(
+        &mut self,
+        tokens: &[u32],
+        sampler: &Sampler,
+    ) -> Result<u32> {
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
-            return Err(PotError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
+            return Err(PotError::ContextOverflow {
+                pos: self.pos,
+                n,
+                max: self.model.max_seq,
+            });
         }
         let k = effective_k(sampler);
-        let (logits, indices) = forward::prefill_matvec_loop_topk(self.model, tokens, self.pos, k).await?;
+        let (logits, indices) =
+            forward::prefill_matvec_loop_topk(self.model, tokens, self.pos, k).await?;
         let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
         self.pos += n;
         Ok(chosen)
@@ -171,7 +198,11 @@ impl<'m> Session<'m> {
     /// the underlying GPU dispatch fails.
     pub async fn step(&mut self, token: u32, sampler: &Sampler) -> Result<u32> {
         if self.pos + 1 > self.model.max_seq {
-            return Err(PotError::ContextOverflow { pos: self.pos, n: 1, max: self.model.max_seq });
+            return Err(PotError::ContextOverflow {
+                pos: self.pos,
+                n: 1,
+                max: self.model.max_seq,
+            });
         }
         let k = effective_k(sampler);
         let (logits, indices) = forward::step_matvec_topk(self.model, token, self.pos, k).await?;
@@ -194,7 +225,9 @@ impl<'m> Session<'m> {
         opts: &GenerateOptions,
     ) -> Result<(Vec<u32>, StopReason)> {
         let mut out = Vec::with_capacity(opts.max_new_tokens as usize);
-        let stop = self.generate_streaming(first_token, opts, |id| out.push(id)).await?;
+        let stop = self
+            .generate_streaming(first_token, opts, |id| out.push(id))
+            .await?;
         Ok((out, stop))
     }
 
@@ -213,16 +246,21 @@ impl<'m> Session<'m> {
         opts: &GenerateOptions,
         mut on_token: F,
     ) -> Result<StopReason> {
-        let stop_id = opts.stop_token.unwrap_or_else(|| self.model.config().eos_token_id);
+        let stop_id = opts
+            .stop_token
+            .unwrap_or_else(|| self.model.config().eos_token_id);
         let mut next = first_token;
         for _ in 0..opts.max_new_tokens {
             if self.pos + 1 > self.model.max_seq {
                 return Err(PotError::ContextOverflow {
-                    pos: self.pos, n: 1, max: self.model.max_seq,
+                    pos: self.pos,
+                    n: 1,
+                    max: self.model.max_seq,
                 });
             }
             let k = effective_k(&opts.sampler);
-            let (logits, indices) = forward::step_matvec_topk(self.model, next, self.pos, k).await?;
+            let (logits, indices) =
+                forward::step_matvec_topk(self.model, next, self.pos, k).await?;
             let chosen = sample_from_topk(&logits, &indices, &opts.sampler, self.pos);
             self.pos += 1;
             if chosen == stop_id {
@@ -248,7 +286,9 @@ fn effective_k(s: &Sampler) -> u32 {
 fn sample_from_topk(logits: &[f32], indices: &[u32], s: &Sampler, pos: u32) -> u32 {
     debug_assert_eq!(logits.len(), indices.len());
     let n = logits.len();
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
 
     // Argmax fast path: logits[0] is already the max because the GPU returns
     // K candidates sorted descending.
@@ -265,12 +305,16 @@ fn sample_from_topk(logits: &[f32], indices: &[u32], s: &Sampler, pos: u32) -> u
     // Temperature-scaled softmax over top-kk.
     let inv_t = 1.0 / s.temperature;
     let max_l = logits[0] * inv_t;
-    let mut probs: Vec<f32> = (0..kk).map(|i| logits[i].mul_add(inv_t, -max_l).exp()).collect();
+    let mut probs: Vec<f32> = (0..kk)
+        .map(|i| logits[i].mul_add(inv_t, -max_l).exp())
+        .collect();
     let sum: f32 = probs.iter().sum();
     if sum <= 0.0 || !sum.is_finite() {
         return indices[0];
     }
-    for p in &mut probs { *p /= sum; }
+    for p in &mut probs {
+        *p /= sum;
+    }
 
     // Top-p (nucleus) filter on the (already descending) probabilities.
     let cutoff = s.top_p.map_or(1.0, |p| p.clamp(0.0, 1.0));
@@ -278,7 +322,10 @@ fn sample_from_topk(logits: &[f32], indices: &[u32], s: &Sampler, pos: u32) -> u
     let mut keep = kk;
     for (i, &p) in probs.iter().enumerate().take(kk) {
         cum += p;
-        if cum >= cutoff { keep = i + 1; break; }
+        if cum >= cutoff {
+            keep = i + 1;
+            break;
+        }
     }
     let kept = &probs[..keep];
     let kept_sum: f32 = kept.iter().sum();
@@ -315,7 +362,12 @@ fn uniform_f32(seed: u64) -> f32 {
 mod tests {
     use super::*;
 
-    fn greedy() -> Sampler { Sampler { temperature: 0.0, ..Sampler::default() } }
+    fn greedy() -> Sampler {
+        Sampler {
+            temperature: 0.0,
+            ..Sampler::default()
+        }
+    }
 
     #[test]
     fn greedy_temperature_zero() {
@@ -328,7 +380,11 @@ mod tests {
     fn greedy_top_k_one() {
         let logits = vec![3.0f32, 2.0, 1.0];
         let indices = vec![42u32, 7, 99];
-        let s = Sampler { top_k: Some(1), temperature: 1.0, ..Sampler::default() };
+        let s = Sampler {
+            top_k: Some(1),
+            temperature: 1.0,
+            ..Sampler::default()
+        };
         assert_eq!(sample_from_topk(&logits, &indices, &s, 0), 42);
     }
 
@@ -336,7 +392,11 @@ mod tests {
     fn top_p_zero_picks_argmax() {
         let logits = vec![3.0f32, 2.0, 1.0];
         let indices = vec![42u32, 7, 99];
-        let s = Sampler { top_p: Some(0.0), temperature: 1.0, ..Sampler::default() };
+        let s = Sampler {
+            top_p: Some(0.0),
+            temperature: 1.0,
+            ..Sampler::default()
+        };
         // With top_p=0.0, cumulative >= 0.0 on first element, so keep=1 and
         // indices[0] is always returned regardless of the random draw.
         for seed in 0..20u64 {
@@ -349,7 +409,11 @@ mod tests {
     fn seed_determinism() {
         let logits = vec![1.0f32; 8];
         let indices: Vec<u32> = (0..8).collect();
-        let s = Sampler { temperature: 1e9, seed: 42, ..Sampler::default() };
+        let s = Sampler {
+            temperature: 1e9,
+            seed: 42,
+            ..Sampler::default()
+        };
         let r1 = sample_from_topk(&logits, &indices, &s, 5);
         let r2 = sample_from_topk(&logits, &indices, &s, 5);
         assert_eq!(r1, r2);
@@ -368,23 +432,53 @@ mod tests {
         // INF logit → INF - INF = NaN in softmax → sum is NaN → fallback.
         let logits = vec![f32::INFINITY, 1.0, 0.0];
         let indices = vec![42u32, 7, 99];
-        let s = Sampler { temperature: 1.0, ..Sampler::default() };
+        let s = Sampler {
+            temperature: 1.0,
+            ..Sampler::default()
+        };
         assert_eq!(sample_from_topk(&logits, &indices, &s, 0), 42);
     }
 
     #[test]
     fn effective_k_caps_to_topk_max() {
-        assert_eq!(effective_k(&Sampler { top_k: None, ..Sampler::default() }), TOPK_MAX);
-        assert_eq!(effective_k(&Sampler { top_k: Some(0), ..Sampler::default() }), TOPK_MAX);
-        assert_eq!(effective_k(&Sampler { top_k: Some(100), ..Sampler::default() }), TOPK_MAX);
-        assert_eq!(effective_k(&Sampler { top_k: Some(5), ..Sampler::default() }), 5);
+        assert_eq!(
+            effective_k(&Sampler {
+                top_k: None,
+                ..Sampler::default()
+            }),
+            TOPK_MAX
+        );
+        assert_eq!(
+            effective_k(&Sampler {
+                top_k: Some(0),
+                ..Sampler::default()
+            }),
+            TOPK_MAX
+        );
+        assert_eq!(
+            effective_k(&Sampler {
+                top_k: Some(100),
+                ..Sampler::default()
+            }),
+            TOPK_MAX
+        );
+        assert_eq!(
+            effective_k(&Sampler {
+                top_k: Some(5),
+                ..Sampler::default()
+            }),
+            5
+        );
     }
 
     #[test]
     fn uniform_f32_in_range() {
         for seed in 0u64..1000 {
             let v = uniform_f32(seed);
-            assert!((0.0..1.0).contains(&v), "uniform_f32({seed}) = {v} not in [0, 1)");
+            assert!(
+                (0.0..1.0).contains(&v),
+                "uniform_f32({seed}) = {v} not in [0, 1)"
+            );
         }
     }
 

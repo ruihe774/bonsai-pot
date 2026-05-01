@@ -1,5 +1,6 @@
-use bonsai_pot::{GenerateOptions, KvSnapshot, Model, PotError, Sampler, StopReason};
 use std::path::Path;
+
+use bonsai_pot::{GenerateOptions, KvSnapshot, Model, PotError, Sampler, StopReason};
 
 fn model_dir() -> &'static Path {
     Path::new("./model")
@@ -10,7 +11,10 @@ fn load_model() -> Model {
 }
 
 fn greedy_sampler() -> Sampler {
-    Sampler { temperature: 0.0, ..Sampler::default() }
+    Sampler {
+        temperature: 0.0,
+        ..Sampler::default()
+    }
 }
 
 /// A short prompt using low-index token ids that are guaranteed to exist in
@@ -54,7 +58,8 @@ fn model_load_bad_path_is_io_error() {
 fn vocab_round_trip_specials() {
     let model = load_model();
     for tok in ["<|im_start|>", "<|im_end|>", "<|endoftext|>"] {
-        let id = model.token_id(tok)
+        let id = model
+            .token_id(tok)
             .unwrap_or_else(|| panic!("token '{tok}' not in vocab"));
         assert_eq!(model.vocab_token(id), Some(tok));
     }
@@ -92,7 +97,10 @@ fn prefill_too_large_rejected() {
     let too_many: Vec<u32> = vec![1u32; 513]; // > M_MAX=512
     let err = pollster::block_on(sess.prefill(&too_many, &greedy_sampler())).unwrap_err();
     assert!(
-        matches!(err, PotError::PrefillTooLarge { .. } | PotError::ContextOverflow { .. }),
+        matches!(
+            err,
+            PotError::PrefillTooLarge { .. } | PotError::ContextOverflow { .. }
+        ),
         "unexpected error: {err}"
     );
 }
@@ -128,17 +136,24 @@ fn matvec_matmul_parity_first_token() {
     let first_matmul = pollster::block_on(sess_matmul.prefill(&prompt, &greedy)).unwrap();
 
     let mut sess_matvec = model.new_session();
-    let first_matvec = pollster::block_on(sess_matvec.prefill_one_at_a_time(&prompt, &greedy)).unwrap();
+    let first_matvec =
+        pollster::block_on(sess_matvec.prefill_one_at_a_time(&prompt, &greedy)).unwrap();
 
-    assert_eq!(first_matmul, first_matvec,
-        "matmul prefill ({first_matmul}) != matvec prefill ({first_matvec})");
+    assert_eq!(
+        first_matmul, first_matvec,
+        "matmul prefill ({first_matmul}) != matvec prefill ({first_matvec})"
+    );
 }
 
 #[test]
 fn seeded_sampler_reproducibility() {
     let model = load_model();
     let prompt = short_prompt();
-    let seeded = Sampler { temperature: 1.0, seed: 42, ..Sampler::default() };
+    let seeded = Sampler {
+        temperature: 1.0,
+        seed: 42,
+        ..Sampler::default()
+    };
     let opts = GenerateOptions {
         max_new_tokens: 8,
         stop_token: Some(u32::MAX),
@@ -146,7 +161,10 @@ fn seeded_sampler_reproducibility() {
     };
 
     let run = |s: &Sampler| -> (u32, Vec<u32>) {
-        let opts_local = GenerateOptions { sampler: s.clone(), ..opts.clone() };
+        let opts_local = GenerateOptions {
+            sampler: s.clone(),
+            ..opts.clone()
+        };
         let mut sess = model.new_session();
         let first = pollster::block_on(sess.prefill(&prompt, s)).unwrap();
         let (toks, _) = pollster::block_on(sess.generate(first, &opts_local)).unwrap();
@@ -174,11 +192,16 @@ fn seeded_sampler_reproducibility() {
 fn generate_max_tokens_zero_returns_immediately() {
     let model = load_model();
     let mut sess = model.new_session();
-    let opts = GenerateOptions { max_new_tokens: 0, stop_token: Some(u32::MAX), sampler: greedy_sampler() };
+    let opts = GenerateOptions {
+        max_new_tokens: 0,
+        stop_token: Some(u32::MAX),
+        sampler: greedy_sampler(),
+    };
     let mut fired = false;
-    let stop = pollster::block_on(
-        sess.generate_streaming(0, &opts, |_| { fired = true; })
-    ).unwrap();
+    let stop = pollster::block_on(sess.generate_streaming(0, &opts, |_| {
+        fired = true;
+    }))
+    .unwrap();
     assert_eq!(stop, StopReason::MaxTokens);
     assert!(!fired, "on_token callback fired when max_new_tokens=0");
 }
@@ -203,8 +226,10 @@ fn snapshot_restore_round_trip_continues_identically() {
     assert_eq!(sess2.pos(), snap.pos());
     let (toks_restored, _) = pollster::block_on(sess2.generate(first, &greedy_opts(8))).unwrap();
 
-    assert_eq!(toks_orig, toks_restored,
-        "continuation after snapshot/restore diverged from original");
+    assert_eq!(
+        toks_orig, toks_restored,
+        "continuation after snapshot/restore diverged from original"
+    );
 }
 
 #[test]
@@ -225,8 +250,10 @@ fn snapshot_to_bytes_round_trip() {
     sess2.restore(&snap2).unwrap();
     let (toks_via_disk, _) = pollster::block_on(sess2.generate(first, &greedy_opts(4))).unwrap();
 
-    assert_eq!(toks_orig, toks_via_disk,
-        "continuation via to_bytes/from_bytes round-trip diverged");
+    assert_eq!(
+        toks_orig, toks_via_disk,
+        "continuation via to_bytes/from_bytes round-trip diverged"
+    );
 }
 
 #[test]

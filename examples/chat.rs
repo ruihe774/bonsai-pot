@@ -20,7 +20,6 @@
 //!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use bonsai_pot::{PotError, KvSnapshot, Model, ModelOptions, Sampler};
 use std::env;
 use std::fmt::Display;
 use std::io::{stdin, stdout, Write};
@@ -28,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use bonsai_pot::{KvSnapshot, Model, ModelOptions, PotError, Sampler};
 
 struct Args {
     model_dir: PathBuf,
@@ -86,7 +87,9 @@ EXAMPLE:
 ";
 
 fn parse_or_die<T: FromStr>(flag: &str, raw: &str) -> T
-where T::Err: Display {
+where
+    T::Err: Display,
+{
     raw.parse::<T>().unwrap_or_else(|e| {
         eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
         exit(1);
@@ -127,14 +130,38 @@ fn parse_args() -> Args {
             })
         };
         match argv[i].as_str() {
-            "--bpe" => { a.bpe = val(); i += 2; }
-            "--system" => { a.system = val(); i += 2; }
-            "--temperature" => { a.temperature = parse_or_die("--temperature", &val()); i += 2; }
-            "--top-p" => { a.top_p = Some(parse_or_die("--top-p", &val())); i += 2; }
-            "--top-k" => { a.top_k = Some(parse_or_die("--top-k", &val())); i += 2; }
-            "--seed" => { a.seed = parse_or_die("--seed", &val()); i += 2; }
-            "--max-new-tokens" => { a.max_new_tokens = parse_or_die("--max-new-tokens", &val()); i += 2; }
-            "--max-seq" => { a.max_seq = parse_or_die("--max-seq", &val()); i += 2; }
+            "--bpe" => {
+                a.bpe = val();
+                i += 2;
+            }
+            "--system" => {
+                a.system = val();
+                i += 2;
+            }
+            "--temperature" => {
+                a.temperature = parse_or_die("--temperature", &val());
+                i += 2;
+            }
+            "--top-p" => {
+                a.top_p = Some(parse_or_die("--top-p", &val()));
+                i += 2;
+            }
+            "--top-k" => {
+                a.top_k = Some(parse_or_die("--top-k", &val()));
+                i += 2;
+            }
+            "--seed" => {
+                a.seed = parse_or_die("--seed", &val());
+                i += 2;
+            }
+            "--max-new-tokens" => {
+                a.max_new_tokens = parse_or_die("--max-new-tokens", &val());
+                i += 2;
+            }
+            "--max-seq" => {
+                a.max_seq = parse_or_die("--max-seq", &val());
+                i += 2;
+            }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 exit(1);
@@ -172,7 +199,9 @@ fn read_user_line() -> Option<String> {
 }
 
 fn main() {
-    env_logger::builder().filter_level(log::LevelFilter::Warn).init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .init();
     let args = parse_args();
 
     eprintln!("seed: {}", args.seed);
@@ -181,8 +210,12 @@ fn main() {
         eprintln!("loading model from {}…", args.model_dir.display());
         let model = Model::load_with_options(
             &args.model_dir,
-            ModelOptions { max_seq: args.max_seq },
-        ).await.expect("load model");
+            ModelOptions {
+                max_seq: args.max_seq,
+            },
+        )
+        .await
+        .expect("load model");
         let im_end = model.token_id("<|im_end|>").unwrap_or_else(|| {
             eprintln!("error: vocab missing <|im_end|>");
             exit(2);
@@ -203,20 +236,17 @@ fn main() {
         // Prefill the system prompt once with the fast batched-matmul path
         // (requires pos == 0), then snapshot the KV state. /reset restores
         // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
-        let system_segment = format!(
-            "<|im_start|>system\n{}<|im_end|>\n",
-            args.system,
-        );
+        let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system,);
         let system_tokens = tokenize(&args.bpe, &args.model_dir, &system_segment);
         eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
-        sess.prefill(&system_tokens, &sampler).await.expect("system prefill");
+        sess.prefill(&system_tokens, &sampler)
+            .await
+            .expect("system prefill");
         let system_snap: KvSnapshot = sess.snapshot().await.expect("system snapshot");
 
         let mut turn: u32 = 0;
 
-        eprintln!(
-            "ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).",
-        );
+        eprintln!("ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).",);
 
         loop {
             write!(stdout, "\nYou: ").ok();
@@ -226,8 +256,12 @@ fn main() {
                 break;
             };
             let user = user.trim();
-            if user.is_empty() { continue; }
-            if user == "/quit" || user == "/exit" { break; }
+            if user.is_empty() {
+                continue;
+            }
+            if user == "/quit" || user == "/exit" {
+                break;
+            }
             if user == "/reset" {
                 sess.restore(&system_snap).expect("restore system snapshot");
                 turn = 0;
@@ -257,14 +291,18 @@ fn main() {
             // All user-turn prefills use the matvec-loop path (pos > 0 after
             // the system prompt). The first sampled token is not yet in KV —
             // it is fed back via `step` in the streaming loop below.
-            let mut next = sess.prefill_one_at_a_time(&tokens, &sampler).await
+            let mut next = sess
+                .prefill_one_at_a_time(&tokens, &sampler)
+                .await
                 .expect("prefill_one_at_a_time");
 
             write!(stdout, "Assistant: ").ok();
             stdout.flush().ok();
             let mut hit_overflow = false;
             for _ in 0..args.max_new_tokens {
-                if next == im_end || next == endoftext { break; }
+                if next == im_end || next == endoftext {
+                    break;
+                }
                 stdout.write_all(&model.decode_token(next)).ok();
                 stdout.flush().ok();
                 match sess.step(next, &sampler).await {
@@ -282,7 +320,8 @@ fn main() {
                     stdout,
                     "(context full at {} tokens — use /reset to start a new conversation)",
                     sess.pos(),
-                ).ok();
+                )
+                .ok();
             }
             turn += 1;
         }

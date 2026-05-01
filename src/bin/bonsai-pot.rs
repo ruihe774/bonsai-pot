@@ -10,14 +10,14 @@
 //!   bonsai-pot ./model --temperature 0.8 --top-k 50 --top-p 0.95 --seed 42 \
 //!       < ./model/prompt.bin
 
-use bonsai_pot::__bench;
-use bonsai_pot::{GenerateOptions, Model, ModelOptions, Sampler};
 use std::env;
 use std::fmt::Display;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
+
+use bonsai_pot::{__bench, GenerateOptions, Model, ModelOptions, Sampler};
 
 struct Args {
     model_dir: PathBuf,
@@ -87,7 +87,9 @@ EXAMPLES:
 ";
 
 fn parse_or_die<T: FromStr>(flag: &str, raw: &str) -> T
-where T::Err: Display {
+where
+    T::Err: Display,
+{
     raw.parse::<T>().unwrap_or_else(|e| {
         eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
         exit(1);
@@ -121,21 +123,53 @@ fn parse_args() -> Args {
     };
     let mut i = 2;
     while i < argv.len() {
-        let next = || argv.get(i + 1).cloned().unwrap_or_else(|| {
-            eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
-            exit(1)
-        });
+        let next = || {
+            argv.get(i + 1).cloned().unwrap_or_else(|| {
+                eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
+                exit(1)
+            })
+        };
         match argv[i].as_str() {
-            "--mode" => { a.mode = next(); i += 2; }
-            "--max-new-tokens" => { a.n_gen = parse_or_die("--max-new-tokens", &next()); i += 2; }
-            "--pp" => { a.pp_n = parse_or_die("--pp", &next()); i += 2; }
-            "--tg" => { a.tg_n = parse_or_die("--tg", &next()); i += 2; }
-            "--repeats" => { a.repeats = parse_or_die("--repeats", &next()); i += 2; }
-            "--max-seq" => { a.max_seq = parse_or_die("--max-seq", &next()); i += 2; }
-            "--temperature" => { a.temperature = parse_or_die("--temperature", &next()); i += 2; }
-            "--top-k" => { a.top_k = Some(parse_or_die("--top-k", &next())); i += 2; }
-            "--top-p" => { a.top_p = Some(parse_or_die("--top-p", &next())); i += 2; }
-            "--seed" => { a.seed = parse_or_die("--seed", &next()); i += 2; }
+            "--mode" => {
+                a.mode = next();
+                i += 2;
+            }
+            "--max-new-tokens" => {
+                a.n_gen = parse_or_die("--max-new-tokens", &next());
+                i += 2;
+            }
+            "--pp" => {
+                a.pp_n = parse_or_die("--pp", &next());
+                i += 2;
+            }
+            "--tg" => {
+                a.tg_n = parse_or_die("--tg", &next());
+                i += 2;
+            }
+            "--repeats" => {
+                a.repeats = parse_or_die("--repeats", &next());
+                i += 2;
+            }
+            "--max-seq" => {
+                a.max_seq = parse_or_die("--max-seq", &next());
+                i += 2;
+            }
+            "--temperature" => {
+                a.temperature = parse_or_die("--temperature", &next());
+                i += 2;
+            }
+            "--top-k" => {
+                a.top_k = Some(parse_or_die("--top-k", &next()));
+                i += 2;
+            }
+            "--top-p" => {
+                a.top_p = Some(parse_or_die("--top-p", &next()));
+                i += 2;
+            }
+            "--seed" => {
+                a.seed = parse_or_die("--seed", &next());
+                i += 2;
+            }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 exit(1);
@@ -149,20 +183,32 @@ fn parse_args() -> Args {
 }
 
 fn main() {
-    env_logger::builder().filter_level(log::LevelFilter::Warn).init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .init();
     let args = parse_args();
 
     pollster::block_on(async move {
         let model = Model::load_with_options(
             &args.model_dir,
-            ModelOptions { max_seq: args.max_seq },
-        ).await
-            .unwrap_or_else(|e| { eprintln!("load error: {e}"); exit(2) });
+            ModelOptions {
+                max_seq: args.max_seq,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("load error: {e}");
+            exit(2)
+        });
 
         match args.mode.as_str() {
             "bench" => {
-                __bench::bench(&model, args.pp_n, args.tg_n, args.repeats).await
-                    .unwrap_or_else(|e| { eprintln!("bench error: {e}"); exit(3) });
+                __bench::bench(&model, args.pp_n, args.tg_n, args.repeats)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("bench error: {e}");
+                        exit(3)
+                    });
             }
             "microbench" => {
                 __bench::microbench_tg(&model, args.repeats).await;
@@ -190,7 +236,9 @@ fn main() {
                 let first = if args.use_matmul_prefill {
                     sess.prefill(&prompt, &sampler).await.expect("prefill")
                 } else {
-                    sess.prefill_one_at_a_time(&prompt, &sampler).await.expect("prefill")
+                    sess.prefill_one_at_a_time(&prompt, &sampler)
+                        .await
+                        .expect("prefill")
                 };
 
                 let mut stdout = stdout().lock();
@@ -209,7 +257,9 @@ fn main() {
                 sess.generate_streaming(first, &opts, |id| {
                     stdout.write_all(&model.decode_token(id)).ok();
                     stdout.flush().ok();
-                }).await.expect("generate");
+                })
+                .await
+                .expect("generate");
                 writeln!(stdout).ok();
             }
             other => {
