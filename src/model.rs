@@ -57,7 +57,7 @@ pub struct Config {
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct EmbedParams {
     pub k: u32, pub d_offset: u32, pub qs_offset: u32, pub output_offset: u32,
-    pub token_id: u32, pub m_token: u32, pub _p0: u32, pub _p1: u32,
+    pub sample_offset: u32, pub m_token: u32, pub _p0: u32, pub _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -76,6 +76,14 @@ pub struct RopeParams {
 pub struct MatvecParams {
     pub k: u32, pub n: u32, pub d_offset: u32, pub qs_offset: u32,
     pub input_offset: u32, pub output_offset: u32, pub accumulate: u32, pub dispatch_x_dim: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct MatvecFusedParams {
+    pub k: u32, pub n_total: u32, pub input_offset: u32, pub dispatch_x_dim: u32,
+    pub d_offset_0: u32, pub qs_offset_0: u32, pub n_0: u32, pub output_offset_0: u32,
+    pub d_offset_1: u32, pub qs_offset_1: u32, pub n_1: u32, pub output_offset_1: u32,
+    pub d_offset_2: u32, pub qs_offset_2: u32, pub n_2: u32, pub output_offset_2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -151,6 +159,7 @@ pub struct Pipelines {
     pub rms_norm: wgpu::ComputePipeline,
     pub rope_neox: wgpu::ComputePipeline,
     pub matvec: wgpu::ComputePipeline,
+    pub matvec_fused: wgpu::ComputePipeline,
     pub quantize: wgpu::ComputePipeline,
     pub matmul: wgpu::ComputePipeline,
     pub attention: wgpu::ComputePipeline,
@@ -316,14 +325,19 @@ impl Model {
             mapped_at_creation: false,
         });
 
-        // Sample storage + readback
+        // Sample storage + readback. SAMPLE_SLOTS u32s — slot 0 holds the
+        // current "input token" for embed; argmax writes the next slot. For
+        // pipelined gen we encode N steps in one CB, indexing slots 0..=N. The
+        // matmul-prefill path also writes M=batch_size token ids here at the
+        // start of a prompt so each embed dispatch can read its own slot.
+        const SAMPLE_BYTES: u64 = 4 * 1024;
         let sample = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sample"), size: 4,
+            label: Some("sample"), size: SAMPLE_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"), size: 4,
+            label: Some("readback"), size: SAMPLE_BYTES,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -344,6 +358,7 @@ impl Model {
         let sh_rms = load_shader!("rms_norm.wgsl");
         let sh_rope = load_shader!("rope_neox.wgsl");
         let sh_matvec = load_shader!("matvec_q1_0.wgsl");
+        let sh_matvec_fused = load_shader!("matvec_q1_0_fused.wgsl");
         let sh_quant = load_shader!("quantize_q8_0.wgsl");
         let sh_matmul = load_shader!("matmul_q1_0_q8_0.wgsl");
         let sh_attn = load_shader!("attention.wgsl");
@@ -387,7 +402,7 @@ impl Model {
         // read_write binding so we never have the same buffer aliased as both
         // read and read_write within a dispatch.
         let bgls = BindGroupLayouts {
-            embed:    make_bgl("embed_bgl",     2, 0b10),    // weights ro, act rw
+            embed:    make_bgl("embed_bgl",     3, 0b010),   // weights ro, act rw, sample ro
             rms_norm: make_bgl("rms_norm_bgl",  2, 0b01),    // act rw, w ro
             rope:     make_bgl("rope_bgl",      2, 0b10),    // rope_cs ro, act rw
             matvec:   make_bgl("matvec_bgl",    2, 0b10),    // weights ro, act rw
@@ -418,6 +433,7 @@ impl Model {
             rms_norm:  mk_pipe(&bgls.rms_norm, &sh_rms,    "rms_norm"),
             rope_neox: mk_pipe(&bgls.rope,     &sh_rope,   "rope_neox"),
             matvec:    mk_pipe(&bgls.matvec,   &sh_matvec, "matvec"),
+            matvec_fused: mk_pipe(&bgls.matvec, &sh_matvec_fused, "matvec_fused"),
             quantize:  mk_pipe(&bgls.quantize, &sh_quant,  "quantize"),
             matmul:    mk_pipe(&bgls.matmul,   &sh_matmul, "matmul"),
             attention: mk_pipe(&bgls.attn,     &sh_attn,   "attention"),

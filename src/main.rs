@@ -29,6 +29,8 @@ fn main() {
         let mut m = model::Model::load(&model_dir).await;
         if mode == "bench" {
             forward::bench(&mut m, pp_n, tg_n, repeats).await;
+        } else if mode == "microbench" {
+            forward::microbench_tg(&mut m, repeats).await;
         } else {
             forward::generate(&mut m, n_gen, &mode).await;
         }

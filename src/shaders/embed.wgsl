@@ -1,14 +1,15 @@
 // Q1_0 row gather: dequant ONE row of the embedding matrix into FP32.
+// Reads the row index (token_id) from `sample[sample_offset]`; this lets us
+// chain steps on the GPU without a CPU round-trip — argmax of step N writes
+// the input token for step N+1.
 // dispatch: (1, 1, 1) workgroups; one workgroup, 64 threads.
-// One thread handles one Q1_0 block (128 outputs). For n_embd=2560 we have
-// nb=20 blocks per row, so 44 of the 64 threads idle — fine for this rare op.
 
 struct Params {
   k: u32,             // n_embd
-  d_offset: u32,      // bytes into weights buffer
-  qs_offset: u32,     // bytes
+  d_offset: u32,
+  qs_offset: u32,
   output_offset: u32, // f32 elements
-  token_id: u32,
+  sample_offset: u32, // index into sample[] for the input token
   m_token: u32,       // which output row in the M batch
   _p0: u32, _p1: u32,
 };
@@ -16,6 +17,7 @@ struct Params {
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> weights: array<u32>;
 @group(0) @binding(2) var<storage, read_write> x: array<f32>;
+@group(0) @binding(3) var<storage, read> sample: array<u32>;
 
 fn load_f16_at(b_offset: u32) -> f32 {
   let word = weights[b_offset >> 2u];
@@ -31,7 +33,7 @@ fn load_byte_at(b_offset: u32) -> u32 {
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   let nb = p.k / 128u;
-  let row = p.token_id;
+  let row = sample[p.sample_offset];
   let tid = lid.x;
   if (tid >= nb) { return; }
   let b = tid;
