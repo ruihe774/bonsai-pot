@@ -8,8 +8,11 @@ enable f16;
 // Phase 2a: each thread heap-sorts its K_MAX entries into DESCENDING order
 //           (extract-min K times, in-place; min ends up at the back, so the
 //           front-to-back order is descending).
-// Phase 2b: pairwise tree merge across threads, in-place in shared memory,
-//           via two-pointer-from-the-front, writing the merged run descending.
+// Phase 2b: pairwise tree merge across threads, parallelized across all WG
+//           threads via bitonic merge. Each merge takes two K_MAX-sorted-
+//           descending halves and produces one K_MAX-sorted-descending run
+//           (top-K of the union) using one stride-K_MAX max-pick stage plus
+//           log2(K_MAX) bitonic-sort stages.
 // Phase 3:  thread 0 writes sh[base..+kk] directly to `result` (descending).
 // dispatch: (1, 1, 1)
 //
@@ -35,9 +38,6 @@ const K_MAX: u32 = 32u;
 
 var<workgroup> sh_val: array<f32, 2048u>;   // WG * K_MAX
 var<workgroup> sh_idx: array<u32, 2048u>;
-
-var<private> staged_val: array<f32, 32u>;
-var<private> staged_idx: array<u32, 32u>;
 
 // Sift-down for a min-heap rooted at `base`, restoring heap property after
 // (potentially) replacing the root.
@@ -118,36 +118,69 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   }
   workgroupBarrier();
 
-  // ---- Phase 2b: tree reduction. Each level halves the active thread count.
-  // Two-pointer merge from the front: both halves are descending, so the
-  // larger of the two heads is the next-largest overall.
+  // ---- Phase 2b: parallel pairwise bitonic merge. At each tree level, pairs
+  // (a, b) of K_MAX-sorted-descending arrays are merged into one (top-K of
+  // their union). The merge is implemented as a bitonic merge of the virtual
+  // sequence c = a ++ reverse(b) of length 2*K_MAX:
+  //   Stage 0: compare-swap c[i] vs c[i + K_MAX]; we keep the MAX in the lower
+  //            half (a's slot) and discard the upper half (b's slot becomes
+  //            dead). Reading c[i + K_MAX] = b[K_MAX - 1 - i] inlines the
+  //            "reverse(b)" without touching memory.
+  //   Stages 1..LOG2_K_MAX: in-place bitonic-sort of a's slot, descending,
+  //            using strides K_MAX/2, K_MAX/4, ..., 1.
+  // Every thread participates in every stage; work units are distributed by
+  // tid stride so a single wave covers the work without idle gaps until the
+  // final levels. On wave64 hardware (e.g. RDNA), workgroupBarrier across a
+  // 64-thread workgroup is essentially free, so the extra per-stage barriers
+  // don't dominate.
   var s: u32 = WG / 2u;
   loop {
     if (s == 0u) { break; }
-    if (tid < s) {
-      let a = base;
-      let b = (tid + s) * K_MAX;
-      var ia: u32 = 0u;
-      var ib: u32 = 0u;
-      for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
-        let va = sh_val[a + ia];
-        let vb = sh_val[b + ib];
-        if (va > vb) {
-          staged_val[i] = va;
-          staged_idx[i] = sh_idx[a + ia];
-          ia = ia + 1u;
-        } else {
-          staged_val[i] = vb;
-          staged_idx[i] = sh_idx[b + ib];
-          ib = ib + 1u;
-        }
-      }
-      for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
-        sh_val[a + i] = staged_val[i];
-        sh_idx[a + i] = staged_idx[i];
+
+    // Stage 0: a[i] = max(a[i], reverse(b)[i]) for all (pair, i). Discards b.
+    let n_stage0 = s * K_MAX;
+    for (var k: u32 = tid; k < n_stage0; k = k + WG) {
+      let pair_id = k / K_MAX;
+      let i = k % K_MAX;
+      let a_base = pair_id * K_MAX;
+      let b_base = (pair_id + s) * K_MAX;
+      let bi = K_MAX - 1u - i;
+      let av = sh_val[a_base + i];
+      let bv = sh_val[b_base + bi];
+      if (bv > av) {
+        sh_val[a_base + i] = bv;
+        sh_idx[a_base + i] = sh_idx[b_base + bi];
       }
     }
     workgroupBarrier();
+
+    // Stages 1..LOG2_K_MAX: bitonic sort each pair's a-slot descending.
+    let n_perstage = s * (K_MAX / 2u);
+    var stride: u32 = K_MAX / 2u;
+    loop {
+      if (stride == 0u) { break; }
+      for (var k: u32 = tid; k < n_perstage; k = k + WG) {
+        let pair_id = k / (K_MAX / 2u);
+        let local = k % (K_MAX / 2u);
+        // For stride-block of 2*stride elements, enumerate the "lower-index"
+        // of each compare-swap pair: lo = ((local & ~(stride-1)) << 1) | (local & (stride-1)).
+        let lo = ((local & ~(stride - 1u)) << 1u) | (local & (stride - 1u));
+        let hi = lo | stride;
+        let a_base = pair_id * K_MAX;
+        let vlo = sh_val[a_base + lo];
+        let vhi = sh_val[a_base + hi];
+        if (vhi > vlo) {
+          let ilo = sh_idx[a_base + lo];
+          sh_val[a_base + lo] = vhi;
+          sh_val[a_base + hi] = vlo;
+          sh_idx[a_base + lo] = sh_idx[a_base + hi];
+          sh_idx[a_base + hi] = ilo;
+        }
+      }
+      workgroupBarrier();
+      stride = stride / 2u;
+    }
+
     s = s / 2u;
   }
 
