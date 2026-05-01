@@ -38,8 +38,6 @@ struct Params {
 const WG: u32 = 64u;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
 const UNROLL: u32 = 4u;
-var<workgroup> partial4: array<vec4<f32>, WG>;
-var<workgroup> partial1: array<f32, WG>;
 
 @compute @workgroup_size(WG)
 fn main(
@@ -84,18 +82,8 @@ fn main(
       let k3 = f32(k_cache[k_base3 + d]);
       local = local + q * vec4<f32>(k0, k1, k2, k3);
     }
-    partial4[tid] = local;
-    workgroupBarrier();
-    var s: u32 = WG / 2u;
-    while (s > 0u) {
-      if (tid < s) { partial4[tid] = partial4[tid] + partial4[tid + s]; }
-      workgroupBarrier();
-      s = s / 2u;
-    }
-    let dots = partial4[0];
-    // Required: prevent the next iteration from clobbering partial4[0] before
-    // every thread has read it via this iteration's reduction.
-    workgroupBarrier();
+    // Single subgroup-wide reduction (assumes subgroup_size == WG == 64).
+    let dots = subgroupAdd(local);
 
     // 2) Sequential online-softmax + V accumulation for the four positions.
     let scores = dots * p.scale;
@@ -126,16 +114,7 @@ fn main(
     for (var d: u32 = tid; d < hd; d += WG) {
       local_dot = local_dot + f32(act[q_base + d]) * f32(k_cache[k_base + d]);
     }
-    partial1[tid] = local_dot;
-    workgroupBarrier();
-    var s: u32 = WG / 2u;
-    while (s > 0u) {
-      if (tid < s) { partial1[tid] = partial1[tid] + partial1[tid + s]; }
-      workgroupBarrier();
-      s = s / 2u;
-    }
-    let dot = partial1[0];
-    workgroupBarrier();
+    let dot = subgroupAdd(local_dot);
 
     let score = dot * p.scale;
     let m_new = max(m_run, score);
