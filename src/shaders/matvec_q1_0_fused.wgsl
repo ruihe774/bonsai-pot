@@ -8,6 +8,8 @@ enable f16;
 // Per-WG layout matches matvec_q1_0.wgsl: WG_X=8 threads cooperate per row,
 // ROWS_PER_WG=8 rows per workgroup. Range sizes (n_0, n_1, n_2) must all be
 // multiples of ROWS_PER_WG so no workgroup straddles a range boundary.
+// Activation `x` is staged into LDS in tiles to share loads across ty-rows
+// and to enable vec4<f16> reads in the inner loop.
 
 struct Params {
   k: u32,
@@ -34,7 +36,15 @@ fn load_f16_at(b_offset: u32) -> f32 {
 
 const WG_X: u32 = 8u;
 const WG_Y: u32 = 8u;
+const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
+
+// Fused matvec is only ever called with K = n_embd = 2560, but the loop and
+// partial-tile handling are written generically (matches matvec_q1_0.wgsl).
+const TILE_K: u32 = 2048u;
+const TILE_VEC4: u32 = TILE_K / 4u;
+
+var<workgroup> x_sh: array<vec4<f16>, TILE_VEC4>;
 
 @compute @workgroup_size(WG_X, WG_Y)
 fn main(
@@ -45,6 +55,7 @@ fn main(
   let global_row = wg_idx * ROWS_PER_WG + lid.y;
   let tx = lid.x;
   let ty = lid.y;
+  let tid = ty * WG_X + tx;
   let valid = global_row < p.n_total;
   let nb = p.k / 128u;
 
@@ -68,26 +79,52 @@ fn main(
     }
   }
 
+  let row_d_byte  = d_off  + local_row * nb * 2u;
+  let row_qs_byte = qs_off + local_row * nb * 16u;
+
   var acc: f32 = 0.0;
-  if (valid) {
-    let row_d_byte  = d_off  + local_row * nb * 2u;
-    let row_qs_byte = qs_off + local_row * nb * 16u;
-    for (var b: u32 = tx; b < nb; b += WG_X) {
-      let d = load_f16_at(row_d_byte + b * 2u);
-      let qs_word_base = (row_qs_byte + b * 16u) >> 2u;
-      let x_base = p.input_offset + b * 128u;
-      var block_acc: f32 = 0.0;
-      for (var w: u32 = 0u; w < 4u; w++) {
-        let qword = weights[qs_word_base + w];
-        let x_word_off = x_base + w * 32u;
-        for (var i: u32 = 0u; i < 32u; i++) {
-          let xv = f32(act[x_word_off + i]);
-          let bit_set = ((qword >> i) & 1u) != 0u;
-          block_acc = block_acc + select(-xv, xv, bit_set);
-        }
-      }
-      acc = acc + d * block_acc;
+
+  for (var tile_start: u32 = 0u; tile_start < p.k; tile_start += TILE_K) {
+    let tile_size = min(TILE_K, p.k - tile_start);
+    let tile_v4 = tile_size >> 2u;
+    let nb_tile = tile_size / 128u;
+
+    let in_v4_off = (p.input_offset + tile_start) >> 2u;
+    for (var v: u32 = tid; v < tile_v4; v += WG) {
+      let base = (in_v4_off + v) << 2u;
+      x_sh[v] = vec4<f16>(
+        act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u],
+      );
     }
+    workgroupBarrier();
+
+    if (valid) {
+      let b_base = tile_start / 128u;
+      for (var b_local: u32 = tx; b_local < nb_tile; b_local += WG_X) {
+        let b = b_base + b_local;
+        let d = load_f16_at(row_d_byte + b * 2u);
+        let qs_word_base = (row_qs_byte + b * 16u) >> 2u;
+        let x_v4_base = b_local * 32u;
+        var block_acc: vec4<f32> = vec4<f32>(0.0);
+        for (var w: u32 = 0u; w < 4u; w++) {
+          let qword = weights[qs_word_base + w];
+          for (var i: u32 = 0u; i < 8u; i++) {
+            let bits = (qword >> (i * 4u)) & 0xFu;
+            let mask4 = vec4<bool>(
+              (bits & 1u) != 0u,
+              (bits & 2u) != 0u,
+              (bits & 4u) != 0u,
+              (bits & 8u) != 0u,
+            );
+            let xv4 = x_sh[x_v4_base + w * 8u + i];
+            let signed4 = select(-xv4, xv4, mask4);
+            block_acc += vec4<f32>(signed4);
+          }
+        }
+        acc = acc + d * (block_acc.x + block_acc.y + block_acc.z + block_acc.w);
+      }
+    }
+    workgroupBarrier();
   }
 
   // 8-lane row-wise reduction via subgroup-shuffle butterfly (see matvec_q1_0

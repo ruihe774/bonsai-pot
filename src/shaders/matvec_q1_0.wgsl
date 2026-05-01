@@ -7,6 +7,11 @@ enable f16;
 //   d[r, 0..nb] : 2·nb bytes starting at d_offset + r*nb*2
 //   qs[r, 0..nb, 0..16]: nb*16 bytes starting at qs_offset + r*nb*16
 //   (qs region is u32-aligned by extract.py's pad4)
+//
+// Activation `x` is staged into an LDS tile so the 8 ty-rows in each WG share
+// loads instead of redundantly fetching from global per-row, and so the inner
+// body can issue vec4<f16> reads to halve instruction count vs. scalar
+// f16-per-bit.
 
 struct Params {
   k: u32,
@@ -31,7 +36,19 @@ fn load_f16_at(b_offset: u32) -> f32 {
 
 const WG_X: u32 = 8u;
 const WG_Y: u32 = 8u;
+const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
+
+// LDS tile size for the staged input activations. K values used by
+// matvec_q1_0 dispatches (n_embd=2560, q_dim=4096, n_ff=9728) aren't all
+// multiples of TILE_K, so the loop handles a partial trailing tile (K and
+// all tile boundaries are multiples of 128 = the q1_0 block size).
+// 2048 was empirically the sweet spot at 64 threads/WG on RDNA4 — 4 KiB of
+// LDS keeps occupancy high while still amortizing redundant per-row reads.
+const TILE_K: u32 = 2048u;
+const TILE_VEC4: u32 = TILE_K / 4u;
+
+var<workgroup> x_sh: array<vec4<f16>, TILE_VEC4>;
 
 @compute @workgroup_size(WG_X, WG_Y)
 fn main(
@@ -42,29 +59,58 @@ fn main(
   let row = wg_idx * ROWS_PER_WG + lid.y;
   let tx = lid.x;
   let ty = lid.y;
+  let tid = ty * WG_X + tx;
   let valid = row < p.n;
   let nb = p.k / 128u;
 
+  let row_d_byte  = p.d_offset  + row * nb * 2u;
+  let row_qs_byte = p.qs_offset + row * nb * 16u;
+
   var acc: f32 = 0.0;
-  if (valid) {
-    let row_d_byte  = p.d_offset  + row * nb * 2u;
-    let row_qs_byte = p.qs_offset + row * nb * 16u;
-    for (var b: u32 = tx; b < nb; b += WG_X) {
-      let d = load_f16_at(row_d_byte + b * 2u);
-      let qs_word_base = (row_qs_byte + b * 16u) >> 2u;  // 4 u32 words per block
-      let x_base = p.input_offset + b * 128u;
-      var block_acc: f32 = 0.0;
-      for (var w: u32 = 0u; w < 4u; w++) {
-        let qword = weights[qs_word_base + w];
-        let x_word_off = x_base + w * 32u;
-        for (var i: u32 = 0u; i < 32u; i++) {
-          let xv = f32(act[x_word_off + i]);
-          let bit_set = ((qword >> i) & 1u) != 0u;
-          block_acc = block_acc + select(-xv, xv, bit_set);
-        }
-      }
-      acc = acc + d * block_acc;
+
+  for (var tile_start: u32 = 0u; tile_start < p.k; tile_start += TILE_K) {
+    let tile_size = min(TILE_K, p.k - tile_start);
+    let tile_v4 = tile_size >> 2u;
+    let nb_tile = tile_size / 128u;
+
+    // Cooperative vec4<f16> load of the activation tile into LDS.
+    let in_v4_off = (p.input_offset + tile_start) >> 2u;
+    for (var v: u32 = tid; v < tile_v4; v += WG) {
+      let base = (in_v4_off + v) << 2u;
+      x_sh[v] = vec4<f16>(
+        act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u],
+      );
     }
+    workgroupBarrier();
+
+    if (valid) {
+      let b_base = tile_start / 128u;
+      for (var b_local: u32 = tx; b_local < nb_tile; b_local += WG_X) {
+        let b = b_base + b_local;
+        let d = load_f16_at(row_d_byte + b * 2u);
+        let qs_word_base = (row_qs_byte + b * 16u) >> 2u;
+        let x_v4_base = b_local * 32u;  // 128 elements / 4 = 32 vec4s per block
+        var block_acc: vec4<f32> = vec4<f32>(0.0);
+        for (var w: u32 = 0u; w < 4u; w++) {
+          let qword = weights[qs_word_base + w];
+          // Process 32 sign bits in 8 groups of 4, one vec4<f16> per group.
+          for (var i: u32 = 0u; i < 8u; i++) {
+            let bits = (qword >> (i * 4u)) & 0xFu;
+            let mask4 = vec4<bool>(
+              (bits & 1u) != 0u,
+              (bits & 2u) != 0u,
+              (bits & 4u) != 0u,
+              (bits & 8u) != 0u,
+            );
+            let xv4 = x_sh[x_v4_base + w * 8u + i];
+            let signed4 = select(-xv4, xv4, mask4);
+            block_acc += vec4<f32>(signed4);
+          }
+        }
+        acc = acc + d * (block_acc.x + block_acc.y + block_acc.z + block_acc.w);
+      }
+    }
+    workgroupBarrier();
   }
 
   // 8-lane row-wise reduction via subgroup-shuffle butterfly. Local invocation
