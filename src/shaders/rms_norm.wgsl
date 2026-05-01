@@ -23,7 +23,6 @@ struct Params {
 @group(0) @binding(2) var<storage, read> w: array<f16>;
 
 const WG: u32 = 64u;
-var<workgroup> partial: array<f32, WG>;
 
 @compute @workgroup_size(WG)
 fn main(
@@ -42,15 +41,9 @@ fn main(
     let v = f32(act[in_base + i]);
     s += v * v;
   }
-  partial[tid] = s;
-  workgroupBarrier();
-  var step: u32 = WG / 2u;
-  while (step > 0u) {
-    if (tid < step) { partial[tid] += partial[tid + step]; }
-    workgroupBarrier();
-    step = step / 2u;
-  }
-  let inv_h = f16(inverseSqrt(partial[0] / f32(n) + p.eps));
+  // Single-instruction subgroup reduction (assumes subgroup_size == WG == 64).
+  let total = subgroupAdd(s);
+  let inv_h = f16(inverseSqrt(total / f32(n) + p.eps));
   for (var i: u32 = tid; i < n; i += WG) {
     act[out_base + i] = act[in_base + i] * inv_h * w[p.weight_offset + i];
   }

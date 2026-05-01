@@ -36,8 +36,6 @@ const WG_X: u32 = 8u;
 const WG_Y: u32 = 8u;
 const ROWS_PER_WG: u32 = WG_Y;
 
-var<workgroup> partial: array<f32, 64u>;
-
 @compute @workgroup_size(WG_X, WG_Y)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
@@ -92,19 +90,12 @@ fn main(
     }
   }
 
-  let slot = ty * WG_X + tx;
-  partial[slot] = acc;
-  workgroupBarrier();
-  var step: u32 = WG_X / 2u;
-  while (step > 0u) {
-    if (tx < step) {
-      partial[slot] = partial[slot] + partial[slot + step];
-    }
-    workgroupBarrier();
-    step = step / 2u;
-  }
+  // 8-lane row-wise reduction via subgroup-shuffle butterfly (see matvec_q1_0).
+  acc = acc + subgroupShuffleXor(acc, 1u);
+  acc = acc + subgroupShuffleXor(acc, 2u);
+  acc = acc + subgroupShuffleXor(acc, 4u);
   if (tx == 0u && valid) {
     let yi = out_off + local_row;
-    act[yi] = f16(partial[ty * WG_X]);  // fused matvecs don't accumulate; outputs are fresh
+    act[yi] = f16(acc);  // fused matvecs don't accumulate; outputs are fresh
   }
 }
