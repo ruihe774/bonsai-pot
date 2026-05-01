@@ -1,6 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --quiet
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "gguf",
+#   "numpy",
+# ]
+#
+# [tool.uv.sources]
+# # PyPI's `gguf` lags upstream and (as of this writing) doesn't ship the
+# # Q1_0 quantization type. Pull from llama.cpp master, which does.
+# gguf = { git = "https://github.com/ggml-org/llama.cpp", rev = "a95a11e", subdirectory = "gguf-py" }
+# ///
 """
-Extract Bonsai-4B.gguf into a flat directory the Rust runtime can load.
+Extract a Bonsai-4B Q1_0 GGUF into a flat directory the Rust runtime can load.
 
 Output layout (under --out, default ./model):
   config.json       hyperparams + tensor manifest (offsets & shapes within
@@ -12,7 +24,9 @@ Output layout (under --out, default ./model):
   weights_embed_lmhead.bin
   vocab.bin         flat utf-8 bytes for all tokens
   vocab_offsets.bin u32 array of length n_vocab+1: byte offsets into vocab.bin
-  prompt.bin        u32 array of token IDs
+  merges.txt        BPE merges in rank order (one "a b\n" per line). Used by
+                    `scripts/bpe.py` to encode prompts; not consumed by
+                    the Rust runtime.
 
 Q1_0 tensors are stored as their raw 18-byte blocks (LSB-first sign bits +
 FP16 d at the front). Per-row stride is (n_in / 128) * 18 bytes; rows are
@@ -20,88 +34,29 @@ contiguous, total = n_out rows. Each tensor's region is 4-byte padded.
 
 Norms (originally F32 in the GGUF) are downcast to F16 on disk so the
 runtime can bind them as `array<f16>` without a load-time conversion.
+
+Prompts are NOT encoded here. Run `scripts/bpe.py` for that.
+
+Usage:
+  uv run scripts/extract.py path/to/Bonsai-4B.gguf --out ./model
 """
-import argparse, json, os, struct, sys
-sys.path.insert(0, '/tmp/llama.cpp/gguf-py')
-import numpy as np
+import argparse, json, os, struct
 import gguf
+import numpy as np
 
-# --- minimal byte-level BPE encoder for GPT-2-style (+ Qwen2 pre-tok) ----------
-
-def gpt2_bytes_to_unicode():
-    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
-    cs = bs[:]
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-    return dict(zip(bs, [chr(c) for c in cs]))
-
-# Qwen2 pretokenizer regex (from
-# /tmp/llama.cpp/src/llama-vocab.cpp, qwen2 branch):
-import regex as re_u
-QWEN2_PRETOK_RE = re_u.compile(
-    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
-    r"[^\r\n\p{L}\p{N}]?\p{L}+|"
-    r"\p{N}|"
-    r" ?[^\s\p{L}\p{N}]+[\r\n]*|"
-    r"\s*[\r\n]+|"
-    r"\s+(?!\S)|"
-    r"\s+"
-)
-
-def bpe_encode(text: str, vocab: dict, merges_rank: dict) -> list[int]:
-    """Encode one chunk's worth of bytes through the BPE merge table."""
-    b2u = gpt2_bytes_to_unicode()
-    ids = []
-    for m in QWEN2_PRETOK_RE.finditer(text):
-        chunk = m.group(0)
-        # byte->unicode then split into single-char tokens
-        word = [b2u[b] for b in chunk.encode("utf-8")]
-        if not word:
-            continue
-        # BPE merge loop
-        while len(word) > 1:
-            pairs = [(word[i], word[i+1]) for i in range(len(word)-1)]
-            best = min(pairs, key=lambda p: merges_rank.get(p, 1<<30))
-            if best not in merges_rank:
-                break
-            new = []
-            i = 0
-            while i < len(word):
-                if i < len(word)-1 and (word[i], word[i+1]) == best:
-                    new.append(word[i] + word[i+1])
-                    i += 2
-                else:
-                    new.append(word[i])
-                    i += 1
-            word = new
-        for tok in word:
-            tid = vocab.get(tok)
-            if tid is None:
-                # fall back to single byte tokens (always present in GPT-2 vocab)
-                for ch in tok:
-                    tid2 = vocab.get(ch)
-                    if tid2 is None:
-                        raise RuntimeError(f"BPE: unknown token piece {ch!r}")
-                    ids.append(tid2)
-            else:
-                ids.append(tid)
-    return ids
-
-# --- main extraction ----------------------------------------------------------
 
 def field_str(f):
     if f is None: return None
     return f.contents()
 
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Extract Bonsai-4B GGUF weights/vocab into a flat model dir.",
+    )
     ap.add_argument("gguf", help="path to Bonsai-4B.gguf")
-    ap.add_argument("--out", default="./model")
-    ap.add_argument("--prompt", default="Once upon a time")
+    ap.add_argument("--out", default="./model",
+                    help="output directory (default: ./model)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -137,10 +92,6 @@ def main():
 
     QK1_0 = 128
     BLK_BYTES = 18
-    def q1_row_bytes(n_in):
-        assert n_in % QK1_0 == 0
-        return (n_in // QK1_0) * BLK_BYTES
-
     def pad4(n):
         return (n + 3) & ~3
 
@@ -166,7 +117,6 @@ def main():
             n_in, n_out = shape[0], shape[1] if len(shape) > 1 else 1
             nb = n_in // QK1_0
             raw = data.reshape(n_out, nb, BLK_BYTES)  # (n_out, nb, 18)
-            # split: d_arr (n_out, nb, 2 bytes), qs_arr (n_out, nb, 16 bytes)
             d_arr  = np.ascontiguousarray(raw[:, :, :2])
             qs_arr = np.ascontiguousarray(raw[:, :, 2:])
             d_offset = out_f.tell()
@@ -242,16 +192,13 @@ def main():
 
     # ---- vocab dump --------------------------------------------------------
     tokens_field = r.fields["tokenizer.ggml.tokens"]
-    # tokens_field.data is a list of indices into tokens_field.parts;
-    # each entry's bytes view is the actual UTF-8 token bytes.
     n_vocab = len(tokens_field.data)
-    assert n_vocab == cfg["n_vocab"]
+    assert n_vocab == cfg["n_vocab"], \
+        f"n_vocab mismatch: gguf has {n_vocab}, cfg has {cfg['n_vocab']}"
     vocab_bytes = bytearray()
     offsets = [0]
-    token_strs = []
     for i in tokens_field.data:
         b = bytes(tokens_field.parts[i])
-        token_strs.append(b.decode("utf-8", errors="replace"))
         vocab_bytes.extend(b)
         offsets.append(len(vocab_bytes))
     with open(os.path.join(args.out, "vocab.bin"), "wb") as f:
@@ -259,32 +206,28 @@ def main():
     with open(os.path.join(args.out, "vocab_offsets.bin"), "wb") as f:
         f.write(struct.pack(f"<{n_vocab+1}I", *offsets))
 
-    # ---- BPE encode prompt --------------------------------------------------
-    vocab_dict = {s: i for i, s in enumerate(token_strs)}
+    # ---- merges (for offline tokenization via scripts/bpe.py) ----------
+    # Each merge is a space-separated pair of byte-level-encoded strings, in
+    # rank order (one per line). Plain UTF-8 text — no header.
     merges_field = r.fields["tokenizer.ggml.merges"]
-    merges_rank = {}
-    for rank, idx in enumerate(merges_field.data):
-        b = bytes(merges_field.parts[idx]).decode("utf-8")
-        a, c = b.split(" ", 1)
-        merges_rank[(a, c)] = rank
-
-    prompt_ids = bpe_encode(args.prompt, vocab_dict, merges_rank)
-    print(f"prompt ({args.prompt!r}) -> {len(prompt_ids)} tokens: {prompt_ids}")
-    print(f"  decoded: {''.join(token_strs[t] for t in prompt_ids)!r}")
-
-    with open(os.path.join(args.out, "prompt.bin"), "wb") as f:
-        f.write(struct.pack(f"<{len(prompt_ids)}I", *prompt_ids))
+    with open(os.path.join(args.out, "merges.txt"), "w", encoding="utf-8") as f:
+        for idx in merges_field.data:
+            line = bytes(merges_field.parts[idx]).decode("utf-8")
+            # Sanity: a merges entry is "<a> <b>". Pass through unchanged.
+            f.write(line)
+            if not line.endswith("\n"):
+                f.write("\n")
 
     # ---- final config -------------------------------------------------------
     cfg["manifest"] = manifest["tensors"]
-    cfg["prompt_text"] = args.prompt
-    cfg["prompt_n"] = len(prompt_ids)
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
 
     sizes = {os.path.basename(p): os.path.getsize(os.path.join(args.out, p))
              for p in os.listdir(args.out) if p.endswith(".bin")}
     print("output bytes:", sizes)
+    print(f"merges.txt:  {os.path.getsize(os.path.join(args.out, 'merges.txt'))} bytes")
+
 
 if __name__ == "__main__":
     main()
