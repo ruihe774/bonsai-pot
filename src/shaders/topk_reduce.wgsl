@@ -2,7 +2,9 @@ enable f16;
 
 // Single-workgroup top-K reduction over `n` halves.
 // Phase 1:  each thread maintains a per-thread top-K_MAX as a MIN-HEAP in
-//           shared memory (insertion = O(log K) sift-down).
+//           shared memory (insertion = O(log K) sift-down). Logits are read
+//           as u32 (= 2 packed f16) and processed in pairs to halve issued
+//           load instructions.
 // Phase 2a: each thread heap-sorts its K_MAX entries into DESCENDING order
 //           (extract-min K times, in-place; min ends up at the back, so the
 //           front-to-back order is descending).
@@ -16,14 +18,16 @@ enable f16;
 //   result[k..2*k]    = top-K vocab indices (u32), aligned with the values
 
 struct Params {
-  n: u32,
-  in_offset: u32,
+  n: u32,            // number of f16 logits
+  in_offset: u32,    // f16 element offset; must be even (ActLayout guarantees this)
   out_offset: u32,
   k: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> logits: array<f16>;
+// Bound to the same act buffer as the shaders that produce logits (which use
+// `array<f16>`), but viewed here as u32 so each load returns 2 packed f16.
+@group(0) @binding(1) var<storage, read> logits: array<u32>;
 @group(0) @binding(2) var<storage, read_write> result: array<u32>;
 
 const WG: u32 = 64u;
@@ -64,12 +68,28 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     sh_val[base + i] = -1e30;
     sh_idx[base + i] = 0u;
   }
-  for (var i: u32 = tid; i < p.n; i = i + WG) {
-    let v = f32(logits[p.in_offset + i]);
-    if (v > sh_val[base]) {
-      sh_val[base] = v;
-      sh_idx[base] = i;
+  // Iterate in u32 words (= 2 f16 packed). `in_offset` is f16 element offset
+  // and is guaranteed even by ActLayout. The tail of an odd `n` is handled
+  // by clamping the second f16's index against n (its value is don't-care).
+  let in_word_off = p.in_offset >> 1u;
+  let n_words = (p.n + 1u) >> 1u;
+  for (var w: u32 = tid; w < n_words; w = w + WG) {
+    let pair = unpack2x16float(logits[in_word_off + w]);
+    let i0 = w << 1u;
+    let i1 = i0 + 1u;
+    let v0 = pair.x;
+    if (v0 > sh_val[base]) {
+      sh_val[base] = v0;
+      sh_idx[base] = i0;
       sift_down(base);
+    }
+    if (i1 < p.n) {
+      let v1 = pair.y;
+      if (v1 > sh_val[base]) {
+        sh_val[base] = v1;
+        sh_idx[base] = i1;
+        sift_down(base);
+      }
     }
   }
 
