@@ -1,11 +1,11 @@
 //! Bonsai-4B (Qwen3 architecture) Q1_0 inference on wgpu compute shaders.
 //!
 //! See the README for a one-page tour of the engine. This crate exposes the
-//! engine as a library; the `bonsai-wgpu` binary is a thin CLI on top of this
+//! engine as a library; the `bonsai-pot` binary is a thin CLI on top of this
 //! API that reads pre-tokenized prompts from stdin.
 //!
 //! ```ignore
-//! use bonsai_wgpu::{Model, GenerateOptions, Sampler};
+//! use bonsai_pot::{Model, GenerateOptions, Sampler};
 //!
 //! pollster::block_on(async {
 //!     let model = Model::load(std::path::Path::new("./model")).await.unwrap();
@@ -28,7 +28,7 @@ pub(crate) mod forward;
 mod model;
 mod session;
 
-pub use error::{BonsaiError, Result};
+pub use error::{PotError, Result};
 pub use model::{Model, ModelConfig, ModelOptions, TOPK_MAX};
 pub use session::{GenerateOptions, Sampler, Session, StopReason};
 

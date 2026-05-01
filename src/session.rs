@@ -1,4 +1,4 @@
-use crate::error::{BonsaiError, Result};
+use crate::error::{PotError, Result};
 use crate::forward;
 use crate::model::{Model, TOPK_MAX};
 
@@ -83,7 +83,7 @@ impl<'m> Session<'m> {
     pub async fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
-            return Err(BonsaiError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
+            return Err(PotError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
         }
         let k = effective_k(sampler);
         let (logits, indices) = forward::prefill_matmul_topk(self.model, tokens, self.pos, k).await?;
@@ -98,7 +98,7 @@ impl<'m> Session<'m> {
     pub async fn prefill_one_at_a_time(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
-            return Err(BonsaiError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
+            return Err(PotError::ContextOverflow { pos: self.pos, n, max: self.model.max_seq });
         }
         let k = effective_k(sampler);
         let (logits, indices) = forward::prefill_matvec_loop_topk(self.model, tokens, self.pos, k).await?;
@@ -111,7 +111,7 @@ impl<'m> Session<'m> {
     /// the next sampled token.
     pub async fn step(&mut self, token: u32, sampler: &Sampler) -> Result<u32> {
         if self.pos + 1 > self.model.max_seq {
-            return Err(BonsaiError::ContextOverflow { pos: self.pos, n: 1, max: self.model.max_seq });
+            return Err(PotError::ContextOverflow { pos: self.pos, n: 1, max: self.model.max_seq });
         }
         let k = effective_k(sampler);
         let (logits, indices) = forward::step_matvec_topk(self.model, token, self.pos, k).await?;
@@ -147,7 +147,7 @@ impl<'m> Session<'m> {
         let mut next = first_token;
         for _ in 0..opts.max_new_tokens {
             if self.pos + 1 > self.model.max_seq {
-                return Err(BonsaiError::ContextOverflow {
+                return Err(PotError::ContextOverflow {
                     pos: self.pos, n: 1, max: self.model.max_seq,
                 });
             }

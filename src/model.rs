@@ -5,7 +5,7 @@
 //! Q8_0 activations (used by the dot4I8Packed matmul path). Norm weights and the
 //! RoPE cos/sin table are also f16; Q8_0 scales remain f32.
 
-use crate::error::{BonsaiError, Result};
+use crate::error::{PotError, Result};
 use bytemuck::{Pod, Zeroable};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -298,11 +298,11 @@ impl Model {
     /// pre-tokenized prompts via [`crate::Session`].
     pub async fn load_with_options(model_dir: &Path, opts: ModelOptions) -> Result<Self> {
         if opts.max_seq == 0 {
-            return Err(BonsaiError::Config("max_seq must be > 0"));
+            return Err(PotError::Config("max_seq must be > 0"));
         }
         let cfg_path = model_dir.join("config.json");
         let cfg_text = std::fs::read_to_string(&cfg_path)
-            .map_err(|e| BonsaiError::Io { path: cfg_path.clone(), source: e })?;
+            .map_err(|e| PotError::Io { path: cfg_path.clone(), source: e })?;
         let cfg: Config = serde_json::from_str(&cfg_text)?;
         let public_cfg = ModelConfig::from_raw(&cfg);
 
@@ -315,11 +315,11 @@ impl Model {
                 force_fallback_adapter: false,
             })
             .await
-            .map_err(|_| BonsaiError::NoAdapter)?;
+            .map_err(|_| PotError::NoAdapter)?;
         log::info!("adapter: {:?}", adapter.get_info());
 
         if !adapter.features().contains(wgpu::Features::SHADER_F16) {
-            return Err(BonsaiError::FeatureUnsupported("SHADER_F16"));
+            return Err(PotError::FeatureUnsupported("SHADER_F16"));
         }
 
         let mut limits = adapter.limits();
@@ -346,7 +346,7 @@ impl Model {
         // ---- load weight buffers from disk ---------------------------------
         let load = |fname: &str| -> Result<Vec<u8>> {
             let p = model_dir.join(fname);
-            std::fs::read(&p).map_err(|e| BonsaiError::Io { path: p, source: e })
+            std::fs::read(&p).map_err(|e| PotError::Io { path: p, source: e })
         };
         let w_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         let make_storage = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
@@ -522,12 +522,12 @@ impl Model {
         let vocab_path = model_dir.join("vocab.bin");
         let offs_path = model_dir.join("vocab_offsets.bin");
         let vocab_bytes = std::fs::read(&vocab_path)
-            .map_err(|e| BonsaiError::Io { path: vocab_path, source: e })?;
+            .map_err(|e| PotError::Io { path: vocab_path, source: e })?;
         let offs_bytes = std::fs::read(&offs_path)
-            .map_err(|e| BonsaiError::Io { path: offs_path, source: e })?;
+            .map_err(|e| PotError::Io { path: offs_path, source: e })?;
         let offs: &[u32] = bytemuck::cast_slice(&offs_bytes);
         if offs.len() as u32 != cfg.n_vocab + 1 {
-            return Err(BonsaiError::Vocab("offsets length doesn't match n_vocab + 1"));
+            return Err(PotError::Vocab("offsets length doesn't match n_vocab + 1"));
         }
         let mut vocab = Vec::with_capacity(cfg.n_vocab as usize);
         for i in 0..cfg.n_vocab as usize {

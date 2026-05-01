@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Debug)]
-pub enum BonsaiError {
+pub enum PotError {
     Io { path: PathBuf, source: std::io::Error },
     ConfigParse(serde_json::Error),
     MissingTensor(String),
@@ -16,9 +16,9 @@ pub enum BonsaiError {
     Config(&'static str),
 }
 
-impl fmt::Display for BonsaiError {
+impl fmt::Display for PotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use BonsaiError::*;
+        use PotError::*;
         match self {
             Io { path, source } => write!(f, "io error reading {}: {}", path.display(), source),
             ConfigParse(e) => write!(f, "failed to parse config.json: {e}"),
@@ -35,23 +35,23 @@ impl fmt::Display for BonsaiError {
     }
 }
 
-impl std::error::Error for BonsaiError {
+impl std::error::Error for PotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            BonsaiError::Io { source, .. } => Some(source),
-            BonsaiError::ConfigParse(e) => Some(e),
-            BonsaiError::DeviceRequest(e) => Some(e),
+            PotError::Io { source, .. } => Some(source),
+            PotError::ConfigParse(e) => Some(e),
+            PotError::DeviceRequest(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<serde_json::Error> for BonsaiError {
-    fn from(e: serde_json::Error) -> Self { BonsaiError::ConfigParse(e) }
+impl From<serde_json::Error> for PotError {
+    fn from(e: serde_json::Error) -> Self { PotError::ConfigParse(e) }
 }
 
-impl From<wgpu::RequestDeviceError> for BonsaiError {
-    fn from(e: wgpu::RequestDeviceError) -> Self { BonsaiError::DeviceRequest(e) }
+impl From<wgpu::RequestDeviceError> for PotError {
+    fn from(e: wgpu::RequestDeviceError) -> Self { PotError::DeviceRequest(e) }
 }
 
-pub type Result<T> = std::result::Result<T, BonsaiError>;
+pub type Result<T> = std::result::Result<T, PotError>;

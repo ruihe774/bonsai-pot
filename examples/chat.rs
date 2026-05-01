@@ -1,4 +1,4 @@
-//! Interactive chat REPL on top of the `bonsai_wgpu` library.
+//! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
 //! Bonsai-4B is an instruction-tuned model, so we render each turn into the
 //! Qwen-style ChatML template (`<|im_start|>...<|im_end|>`), shell out to
@@ -20,7 +20,7 @@
 //!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use bonsai_wgpu::{BonsaiError, Model, ModelOptions, Sampler};
+use bonsai_pot::{PotError, Model, ModelOptions, Sampler};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,7 +43,7 @@ struct Args {
 }
 
 const HELP: &str = "\
-Interactive ChatML REPL for the bonsai-wgpu engine.
+Interactive ChatML REPL for the bonsai-pot engine.
 
 USAGE:
     chat <model_dir> [OPTIONS]
@@ -247,7 +247,7 @@ fn main() {
                 stdout.flush().ok();
                 match sess.step(next, &sampler).await {
                     Ok(t) => next = t,
-                    Err(BonsaiError::ContextOverflow { .. }) => {
+                    Err(PotError::ContextOverflow { .. }) => {
                         hit_overflow = true;
                         break;
                     }

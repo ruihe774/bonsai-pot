@@ -1,21 +1,21 @@
 [package]
-name = "bonsai-wgpu"
+name = "bonsai-pot"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "bonsai_wgpu"
+name = "bonsai_pot"
 path = "src/lib.rs"
 
 [[bin]]
-name = "bonsai-wgpu"
-path = "src/bin/bonsai-wgpu.rs"
+name = "bonsai-pot"
+path = "src/bin/bonsai-pot.rs"
 required-features = ["bench-internals"]
 
 [features]
 default = []
-# Exposes bench/microbench utilities under `bonsai_wgpu::__bench`. Used by the
-# bundled `bonsai-wgpu` binary; not part of the stable public API.
+# Exposes bench/microbench utilities under `bonsai_pot::__bench`. Used by the
+# bundled `bonsai-pot` binary; not part of the stable public API.
 bench-internals = []
 
 [dependencies]

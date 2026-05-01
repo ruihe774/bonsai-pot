@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`bonsai-wgpu` is a from-scratch, dependency-light **Bonsai-4B (Qwen3-architecture) Q1_0 inference engine** built on **wgpu compute shaders**. There is no `llama.cpp`, `ggml`, or PyTorch on the hot path — weights are loaded from a custom flat-file layout (produced by `scripts/extract.py` from a GGUF), all kernels are hand-rolled WGSL, and the host side is plain Rust + wgpu 29 + pollster.
+`bonsai-pot` is a from-scratch, dependency-light **Bonsai-4B (Qwen3-architecture) Q1_0 inference engine** built on **wgpu compute shaders**. There is no `llama.cpp`, `ggml`, or PyTorch on the hot path — weights are loaded from a custom flat-file layout (produced by `scripts/extract.py` from a GGUF), all kernels are hand-rolled WGSL, and the host side is plain Rust + wgpu 29 + pollster.
 
 The crate exposes both:
-- a **library** (`bonsai_wgpu::{Model, Session, Sampler, GenerateOptions, …}`) for embedding the engine in other Rust programs;
-- a **demo CLI** (`src/bin/bonsai-wgpu.rs`) that reads pre-tokenized u32 prompts from stdin and prints decoded output. The CLI bundles bench/microbench utilities behind the `bench-internals` feature.
+- a **library** (`bonsai_pot::{Model, Session, Sampler, GenerateOptions, …}`) for embedding the engine in other Rust programs;
+- a **demo CLI** (`src/bin/bonsai-pot.rs`) that reads pre-tokenized u32 prompts from stdin and prints decoded output. The CLI bundles bench/microbench utilities behind the `bench-internals` feature.
 
 Tokenization is intentionally out of the Rust crate. Use `scripts/bpe.py` to BPE-encode prompts; pipe its u32 output into the bin.
 
@@ -69,9 +69,9 @@ uv run scripts/bpe.py ./model "Once upon a time" | cargo run ...
 - `src/model.rs` — config + manifest loading, GPU device/buffer/pipeline/BGL setup, RoPE table precompute, activation-buffer layout. Owns the public `Model` and `ModelConfig` types.
 - `src/session.rs` — public `Session<'m>` (per-conversation state), `Sampler`, `GenerateOptions`, `StopReason`, and the CPU-side sampler (temperature → top-p → multinomial via SplitMix64-seeded uniform).
 - `src/forward.rs` — entire forward pass and per-step inference helpers. Two end-to-end paths (matvec / matmul) plus encoder + uniform-pool plumbing, plus a `bench_internals` submodule gated on the `bench-internals` feature. Long file (~900 lines) but organized top-down: helpers → step encoders → matmul prefill → bench/microbench.
-- `src/error.rs` — `BonsaiError` + `Result` with hand-rolled `Display`/`Error` impls (no `thiserror` dep).
+- `src/error.rs` — `PotError` + `Result` with hand-rolled `Display`/`Error` impls (no `thiserror` dep).
 - `src/decode.rs` — inverse of GPT-2 byte-level vocab encoding (codepoint → raw byte), used by `Model::decode_token`.
-- `src/bin/bonsai-wgpu.rs` — demo CLI on top of the public lib API. Argv parsing, stdin u32 reader, sampler construction, calls into `Session`. Routes `--mode bench`/`microbench` to `bonsai_wgpu::__bench` (only available when built with `--features bench-internals`).
+- `src/bin/bonsai-pot.rs` — demo CLI on top of the public lib API. Argv parsing, stdin u32 reader, sampler construction, calls into `Session`. Routes `--mode bench`/`microbench` to `bonsai_pot::__bench` (only available when built with `--features bench-internals`).
 - `src/shaders/*.wgsl` — one shader per kernel kind. The matvec/matmul shaders are the two perf-critical ones; `topk_reduce.wgsl` is the new sampler-helper kernel.
 - `examples/chat.rs` — interactive ChatML REPL built on the public library API. Renders the Qwen-style `<|im_start|>...<|im_end|>` chat template per turn, shells out to `scripts/bpe.py` for tokenization, batched-matmul prefills the first turn (`pos==0`) and matvec-loop prefills subsequent turns, then streams generation with `Session::step` until `<|im_end|>`. Persists KV state across turns; `/reset` clears it. Demonstrates that out-of-process tokenization is fast enough for an interactive UX (subprocess startup is ~tens of ms vs. seconds of GPU work).
 - `scripts/extract.py` — GGUF → flat-file converter. Writes weights + vocab + merges + config.
@@ -146,5 +146,5 @@ Since embed runs before topk_reduce in any step, the two roles never alias. `buf
 - **Adding a new kernel**: write `shaders/foo.wgsl`, add a `FooParams` struct (≤ 64 bytes, `Pod + Zeroable + repr(C)`) in `model.rs`, register a BGL in `BindGroupLayouts` (single-rw discipline above), build a pipeline in `Pipelines`. Then add a `dispatch_foo` (in-pass) helper in `forward.rs` and slot it into the layer pipeline.
 - **Modifying weight layout**: changes to Q1_0 packing or to the grouping of tensors into the 5 buffers must be made in **both** `scripts/extract.py` (writer) and `model.rs` / shaders (reader), and the manifest format in `config.json` will need to round-trip. Re-extract the model dir after any layout change.
 - **Modifying the tokenizer / pretok regex**: changes to vocab encoding must be made in **both** `scripts/extract.py` (which writes `vocab.bin` + `merges.txt`) and `scripts/bpe.py` (which encodes prompts) and possibly `src/decode.rs` (which inverts the byte-level mapping). The Rust runtime never tokenizes, only decodes.
-- **Public API changes**: re-exports live in `src/lib.rs`. Anything not re-exported there is internal and may change without notice; keep `Model`, `ModelConfig`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `BonsaiError`, `Result`, `TOPK_MAX` stable.
+- **Public API changes**: re-exports live in `src/lib.rs`. Anything not re-exported there is internal and may change without notice; keep `Model`, `ModelConfig`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `PotError`, `Result`, `TOPK_MAX` stable.
 - **Perf work**: use `--mode microbench` for per-kernel deltas; use `--mode bench` (specifically `tg{N}` and `pp{N}`) for end-to-end. Most tg time is in matvec dispatches (LM head, ffn_down, attn_output, fused QKV, fused gate-up) plus `topk_reduce` (currently ~1.1 ms/step, a notable fraction of total step time); rms_norm/silu/rope/attention are minor. Recent commits document the wins from multi-row matvec, fused QKV/gate-up, single-pass-per-phase, flash-attn online softmax, and (in earlier history) pipelined generation — keep these intact when refactoring.

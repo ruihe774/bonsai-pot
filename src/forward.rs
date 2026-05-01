@@ -15,7 +15,7 @@
 //! the `sample` buffer. The caller reads them back and applies its own
 //! temperature / top-p / multinomial logic on CPU.
 
-use crate::error::{BonsaiError, Result};
+use crate::error::{PotError, Result};
 use crate::model::*;
 use bytemuck::Pod;
 
@@ -253,7 +253,7 @@ async fn read_topk(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
     let _ = model.device.poll(wgpu::PollType::wait_indefinitely());
     match r.receive().await {
         Some(Ok(())) => {}
-        Some(Err(e)) => return Err(BonsaiError::BufferMap(e)),
+        Some(Err(e)) => return Err(PotError::BufferMap(e)),
         None => unreachable!("oneshot channel dropped without sending"),
     }
     let data = slice.get_mapped_range();
@@ -448,7 +448,7 @@ pub(crate) async fn prefill_matvec_loop_topk(
     model: &Model, prompt: &[u32], pos_base: u32, k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     if prompt.is_empty() {
-        return Err(BonsaiError::PrefillTooLarge { n: 0, max: model.m_max });
+        return Err(PotError::PrefillTooLarge { n: 0, max: model.m_max });
     }
     let last = prompt.len() - 1;
     for (t, &tok) in prompt.iter().enumerate() {
@@ -477,13 +477,13 @@ pub(crate) async fn prefill_matmul_topk(
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     if pos_base != 0 {
         // Caller must use prefill_matvec_loop_topk for incremental prefill.
-        return Err(BonsaiError::ContextOverflow {
+        return Err(PotError::ContextOverflow {
             pos: pos_base, n: prompt.len() as u32, max: 0,
         });
     }
     let m = prompt.len() as u32;
     if m == 0 || m > model.m_max {
-        return Err(BonsaiError::PrefillTooLarge { n: m, max: model.m_max });
+        return Err(PotError::PrefillTooLarge { n: m, max: model.m_max });
     }
     let cfg = &model.cfg;
     let k = k.min(TOPK_MAX).max(1);
@@ -861,8 +861,8 @@ pub mod bench_internals {
         println!();
         println!("| backend            |          test |               t/s |");
         println!("| ------------------ | ------------- | ----------------: |");
-        println!("| bonsai-wgpu        |        pp{pp_n:<3} | {pp_t_s_mean:>9.2} ± {pp_t_s_std:>5.2} |");
-        println!("| bonsai-wgpu        |        tg{tg_n:<3} | {tg_t_s_mean:>9.2} ± {tg_t_s_std:>5.2} |");
+        println!("| bonsai-pot        |        pp{pp_n:<3} | {pp_t_s_mean:>9.2} ± {pp_t_s_std:>5.2} |");
+        println!("| bonsai-pot        |        tg{tg_n:<3} | {tg_t_s_mean:>9.2} ± {tg_t_s_std:>5.2} |");
         Ok(())
     }
 

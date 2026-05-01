@@ -1,16 +1,16 @@
-//! Demo CLI for `bonsai-wgpu`.
+//! Demo CLI for `bonsai-pot`.
 //!
 //! Reads pre-tokenized prompts from stdin (little-endian u32 token IDs) and
 //! generates text. Tokenization stays in your script of choice (e.g.
 //! `extract.py`'s `bpe_encode`); pipe its u32 output here.
 //!
 //! Examples:
-//!   cat ./model/prompt.bin | bonsai-wgpu ./model --max-new-tokens 64
-//!   bonsai-wgpu ./model --mode bench --pp 512 --tg 128
-//!   bonsai-wgpu ./model --temperature 0.8 --top-k 50 --top-p 0.95 --seed 42 \
+//!   cat ./model/prompt.bin | bonsai-pot ./model --max-new-tokens 64
+//!   bonsai-pot ./model --mode bench --pp 512 --tg 128
+//!   bonsai-pot ./model --temperature 0.8 --top-k 50 --top-p 0.95 --seed 42 \
 //!       < ./model/prompt.bin
 
-use bonsai_wgpu::{GenerateOptions, Model, Sampler};
+use bonsai_pot::{GenerateOptions, Model, Sampler};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -29,10 +29,10 @@ struct Args {
 }
 
 const HELP: &str = "\
-Demo CLI for the bonsai-wgpu engine.
+Demo CLI for the bonsai-pot engine.
 
 USAGE:
-    bonsai-wgpu <model_dir> [OPTIONS]
+    bonsai-pot <model_dir> [OPTIONS]
 
 ARGS:
     <model_dir>            Path to a directory produced by scripts/extract.py.
@@ -72,8 +72,8 @@ OTHER:
 
 EXAMPLES:
     uv run scripts/bpe.py ./model \"Once upon a time\" \\
-        | bonsai-wgpu ./model --mode prompt --max-new-tokens 64
-    bonsai-wgpu ./model --mode bench --pp 512 --tg 128
+        | bonsai-pot ./model --mode prompt --max-new-tokens 64
+    bonsai-pot ./model --mode bench --pp 512 --tg 128
 ";
 
 fn parse_args() -> Args {
@@ -137,11 +137,11 @@ fn main() {
 
         match args.mode.as_str() {
             "bench" => {
-                bonsai_wgpu::__bench::bench(&model, args.pp_n, args.tg_n, args.repeats).await
+                bonsai_pot::__bench::bench(&model, args.pp_n, args.tg_n, args.repeats).await
                     .unwrap_or_else(|e| { eprintln!("bench error: {e}"); std::process::exit(3) });
             }
             "microbench" => {
-                bonsai_wgpu::__bench::microbench_tg(&model, args.repeats).await;
+                bonsai_pot::__bench::microbench_tg(&model, args.repeats).await;
             }
             "gen" | "prompt" => {
                 let mut buf = Vec::new();

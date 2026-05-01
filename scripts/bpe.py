@@ -164,7 +164,7 @@ def load_merges(model_dir):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="BPE-encode a prompt into u32 token IDs for bonsai-wgpu.",
+        description="BPE-encode a prompt into u32 token IDs for bonsai-pot.",
     )
     ap.add_argument("model_dir", help="path to extracted model dir "
                                       "(must contain vocab.bin and merges.txt)")
