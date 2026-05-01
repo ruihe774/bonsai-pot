@@ -1,0 +1,26 @@
+// y[i] = silu(gate[i]) * up[i] for i in 0..(n*m)
+// Single binding to activations; gate/up/out regions live at different offsets.
+// dispatch: (ceil(n*m / 64), 1, 1)
+
+struct Params {
+  n: u32,
+  m: u32,
+  gate_offset: u32,
+  up_offset: u32,
+  out_offset: u32,
+  dispatch_x_count: u32,    // = dispatch_x_dim * 64 (workgroup_size)
+  _p1: u32, _p2: u32,
+};
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read_write> act: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.y * p.dispatch_x_count + gid.x;
+  let total = p.n * p.m;
+  if (i >= total) { return; }
+  let g = act[p.gate_offset + i];
+  let silu = g / (1.0 + exp(-g));
+  act[p.out_offset + i] = silu * act[p.up_offset + i];
+}
