@@ -97,7 +97,7 @@ impl ModelConfig {
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub(crate) struct EmbedParams {
     pub k: u32, pub d_offset: u32, pub qs_offset: u32, pub output_offset: u32,
-    pub sample_offset: u32, pub m_token: u32, pub _p0: u32, pub _p1: u32,
+    pub sample_offset: u32, pub _p0: u32, pub _p1: u32, pub _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]

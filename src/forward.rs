@@ -71,6 +71,17 @@ impl<'a> StepEncoder<'a> {
         self.uniforms.alloc(params)
     }
 
+    /// Append a `sample → readback` copy to this encoder so the readback
+    /// transfer rides in the same command buffer as the step it follows.
+    /// Avoids a separate submit purely for the copy.
+    pub fn copy_sample_to_readback(&mut self, bytes: u64) {
+        self.encoder.copy_buffer_to_buffer(
+            &self.model.buffers.sample, 0,
+            &self.model.buffers.readback, 0,
+            bytes,
+        );
+    }
+
     pub fn finish(self) -> wgpu::CommandBuffer {
         if !self.uniforms.cpu.is_empty() {
             self.model.queue.write_buffer(&self.model.buffers.uniform, 0, &self.uniforms.cpu);
@@ -220,15 +231,14 @@ fn dispatch_topk_reduce(
 
 // ---------- async readback helper -------------------------------------------
 
-async fn read_topk(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
+/// Await the `sample → readback` copy that was already encoded into the
+/// step's command buffer (via [`StepEncoder::copy_sample_to_readback`]) and
+/// return the K f32 logits + K u32 indices the caller asked for.
+///
+/// This must be called AFTER the step's command buffer has been submitted —
+/// i.e. the readback copy is in flight. There is no separate submit here.
+async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
     let bytes = (k as u64) * 8; // K f32 + K u32
-    {
-        let mut enc = model.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("topk_readback"),
-        });
-        enc.copy_buffer_to_buffer(&model.buffers.sample, 0, &model.buffers.readback, 0, bytes);
-        model.queue.submit(Some(enc.finish()));
-    }
     let slice = model.buffers.readback.slice(0..bytes);
     let (s, r) = futures_intrusive::channel::shared::oneshot_channel::<
         std::result::Result<(), wgpu::BufferAsyncError>,
@@ -271,7 +281,6 @@ pub(crate) fn encode_step_matvec(
             qs_offset: ot.token_embd_qs,
             output_offset: m.act_layout.x,
             sample_offset: sample_in,
-            m_token: 0,
             ..Default::default()
         };
         let off = uniforms.alloc(&p);
@@ -316,9 +325,12 @@ pub(crate) async fn step_matvec_topk(
     model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&token_id));
     let mut se = StepEncoder::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, 0, pos, k);
+    // Fold the readback copy into the same command buffer so the step + the
+    // sample→readback transfer are one submit, not two.
+    se.copy_sample_to_readback((k as u64) * 8);
     let cb = se.finish();
     model.queue.submit(Some(cb));
-    read_topk(model, k).await
+    await_topk_readback(model, k).await
 }
 
 /// Same as [`step_matvec_topk`] but does not perform any sampling readback.
@@ -420,19 +432,32 @@ pub(crate) async fn prefill_matvec_loop_topk(
         return Err(PotError::PrefillTooLarge { n: 0, max: model.m_max });
     }
     let last = prompt.len() - 1;
-    for (t, &tok) in prompt.iter().enumerate() {
-        if t == last {
-            return step_matvec_topk(model, tok, pos_base + t as u32, k).await;
-        }
-        // Run the forward pass for KV-cache fill only, no readback.
-        model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&tok));
+    // For the (n - 1) non-last tokens we just need to fill the KV cache; we
+    // can encode them all back-to-back into a SINGLE command buffer + submit,
+    // then run the final token through `step_matvec_topk` (which does the
+    // CPU readback for sampling).
+    if last > 0 {
+        // One up-front write covers every non-last token's input slot. The
+        // embed shader for step `i` reads `sample[i]`. The topk_reduce output
+        // for steps 0..last-1 is routed to a scratch slot beyond the prompt
+        // region (sample buffer is 1024 u32 slots / 4 KB; M_MAX = 512, so
+        // `TOPK_SCRATCH_BASE = 768` is well clear of any prompt tokens).
+        const TOPK_SCRATCH_BASE: u32 = 768;
+        model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(&prompt[..last]));
         let mut se = StepEncoder::new(model);
-        // Use k=1 as a placeholder; the topk dispatch is small relative to the rest.
-        encode_step_matvec(&mut se, &model.cfg, 0, 0, pos_base + t as u32, 1);
+        for t in 0..last {
+            encode_step_matvec(
+                &mut se, &model.cfg,
+                /*sample_in=*/ t as u32,
+                /*topk_out_u32_base=*/ TOPK_SCRATCH_BASE,
+                /*pos=*/ pos_base + t as u32,
+                /*k=*/ 1,
+            );
+        }
         let cb = se.finish();
         model.queue.submit(Some(cb));
     }
-    unreachable!()
+    step_matvec_topk(model, prompt[last], pos_base + last as u32, k).await
 }
 
 // ---------- matmul (batched prefill) ---------------------------------------
@@ -458,69 +483,66 @@ pub(crate) async fn prefill_matmul_topk(
     let ot = &model.output_tensors;
     let k = k.min(TOPK_MAX).max(1);
 
-    // ---- 1. Embed all M tokens (one shader call per token; cheap) ----------
+    // ---- All phases (embed → per-layer transformer → final norm/LM-head/topk
+    //      → readback copy) into ONE command buffer / ONE submit. ------------
     model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(prompt));
+    let mut se = StepEncoder::new(model);
+
+    // Phase 1: embed all M tokens in a SINGLE dispatch (m, 1, 1). The shader
+    // reads its row from sample[sample_offset + wg.x] and writes to row wg.x
+    // of the output activation buffer.
     {
-        let mut se = StepEncoder::new(model);
+        let p = EmbedParams {
+            k: cfg.n_embd,
+            d_offset: ot.token_embd_d,
+            qs_offset: ot.token_embd_qs,
+            output_offset: model.act_layout.x,
+            sample_offset: 0,
+            ..Default::default()
+        };
+        let off = se.uniforms.alloc(&p);
         let mut pass = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("prefill_embed"), timestamp_writes: None });
-        for (mi, _tid) in prompt.iter().enumerate() {
-            let p = EmbedParams {
-                k: cfg.n_embd,
-                d_offset: ot.token_embd_d,
-                qs_offset: ot.token_embd_qs,
-                output_offset: model.act_layout.x,
-                sample_offset: mi as u32,
-                m_token: mi as u32,
-                ..Default::default()
-            };
-            let off = se.uniforms.alloc(&p);
-            pass.set_pipeline(&model.pipes.embed);
-            pass.set_bind_group(0, &model.cached.embed, &[off]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        drop(pass);
-        let cb = se.finish();
-        model.queue.submit(Some(cb));
+        pass.set_pipeline(&model.pipes.embed);
+        pass.set_bind_group(0, &model.cached.embed, &[off]);
+        pass.dispatch_workgroups(m, 1, 1);
     }
 
-    // ---- 2. Per-layer transformer using matmul (one CB for all layers) ----
+    // Phase 2: per-layer transformer. `layer_step_matmul` opens its own
+    // compute passes for each kernel; that's fine — the KV-cache copies it
+    // emits are transfer commands and are legal between compute passes inside
+    // the same command encoder.
+    for il in 0..cfg.n_layer {
+        layer_step_matmul(model, cfg, &mut se, il, m);
+    }
+
+    // Phase 3: final RMSNorm + LM head + topk_reduce on the LAST token.
+    rms_norm(model, cfg, &mut se, m, cfg.n_embd,
+             model.act_layout.x, model.act_layout.x_norm, ot.output_norm_off);
+
+    let last_input_offset = model.act_layout.x_norm + (m - 1) * cfg.n_embd;
+    matvec_q1_0(model, cfg, &mut se,
+                cfg.n_embd, cfg.n_vocab,
+                WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
+                last_input_offset, model.act_layout.logits, false);
     {
-        let mut se = StepEncoder::new(model);
-        for il in 0..cfg.n_layer {
-            layer_step_matmul(model, cfg, &mut se, il, m);
-        }
-        let cb = se.finish();
-        model.queue.submit(Some(cb));
+        let p = TopKParams {
+            n: cfg.n_vocab, in_offset: model.act_layout.logits,
+            out_offset: 0, k,
+        };
+        let off = se.alloc_uniform(&p);
+        let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("topk_reduce"), timestamp_writes: None });
+        cp.set_pipeline(&model.pipes.topk_reduce);
+        cp.set_bind_group(0, &model.cached.topk_reduce, &[off]);
+        cp.dispatch_workgroups(1, 1, 1);
     }
 
-    // ---- 3. Final RMSNorm + LM head + topk_reduce on the LAST token --------
-    {
-        let mut se = StepEncoder::new(model);
-        rms_norm(model, cfg, &mut se, m, cfg.n_embd,
-                 model.act_layout.x, model.act_layout.x_norm, ot.output_norm_off);
+    // Phase 4: append readback copy so it ships with this same command buffer.
+    se.copy_sample_to_readback((k as u64) * 8);
 
-        let last_input_offset = model.act_layout.x_norm + (m - 1) * cfg.n_embd;
-        matvec_q1_0(model, cfg, &mut se,
-                    cfg.n_embd, cfg.n_vocab,
-                    WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
-                    last_input_offset, model.act_layout.logits, false);
-        // topk_reduce in its own (small) compute pass.
-        {
-            let p = TopKParams {
-                n: cfg.n_vocab, in_offset: model.act_layout.logits,
-                out_offset: 0, k,
-            };
-            let off = se.alloc_uniform(&p);
-            let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("topk_reduce"), timestamp_writes: None });
-            cp.set_pipeline(&model.pipes.topk_reduce);
-            cp.set_bind_group(0, &model.cached.topk_reduce, &[off]);
-            cp.dispatch_workgroups(1, 1, 1);
-        }
-        let cb = se.finish();
-        model.queue.submit(Some(cb));
-    }
+    let cb = se.finish();
+    model.queue.submit(Some(cb));
 
-    read_topk(model, k).await
+    await_topk_readback(model, k).await
 }
 
 fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32, m: u32) {
@@ -902,7 +924,6 @@ pub mod bench_internals {
                 qs_offset: ot.token_embd_qs,
                 output_offset: model.act_layout.x,
                 sample_offset: 0,
-                m_token: 0,
                 ..Default::default()
             };
             let off = se.alloc_uniform(&p);
