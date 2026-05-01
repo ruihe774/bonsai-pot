@@ -309,23 +309,25 @@ async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32
 
 // ---------- single-token forward (matvec) ----------------------------------
 
-/// Number of uniform slots `encode_step_matvec` allocates for one step.
-/// Used by `prefill_matvec_loop_topk` to decide when to flush the encoder so
-/// the uniform pool doesn't overflow on long incremental prefills.
-fn encode_step_matvec_slots(cfg: &Config) -> u64 {
+/// Number of uniform slots `encode_step_matvec` allocates for one step when
+/// the LM-head/topk suffix is omitted (the `topk_out = None` path used by
+/// `prefill_matvec_loop_topk`'s non-last steps).
+fn encode_step_matvec_slots_no_suffix(cfg: &Config) -> u64 {
     // 1 embed + 14 per layer (rms, qkv_fused, q_norm, k_norm, rope_q, rope_k,
     // kv_writeback, attn_split, attn_merge, Wo, ffn_norm, gate_up_fused,
-    // silu_mul, Wd) + 3 suffix (output rms, LM head, topk).
-    1 + 14 * cfg.n_layer as u64 + 3
+    // silu_mul, Wd).
+    1 + 14 * cfg.n_layer as u64
 }
 
 /// Encode one tg step into the given encoder. The input token is read from
-/// `sample[sample_in]`. The final `topk_reduce` writes K f32 logits at
-/// `sample[topk_out_u32_base..+K]` and K u32 indices at
-/// `sample[topk_out_u32_base + k..+2*k]`.
+/// `sample[sample_in]`. If `topk_out = Some((base, k))`, the suffix
+/// (output_norm + LM head + topk_reduce) is appended and the top-K logits +
+/// indices land at `sample[base..base + 2*k]`. If `topk_out = None`, the
+/// suffix is skipped — useful for KV-fill-only steps (e.g. mid-prefill) where
+/// the sampled token isn't read.
 pub(crate) fn encode_step_matvec(
     se: &mut StepEncoder, cfg: &Config,
-    sample_in: u32, topk_out_u32_base: u32, pos: u32, k: u32,
+    sample_in: u32, topk_out: Option<(u32, u32)>, pos: u32,
 ) {
     let StepEncoder { model: m, encoder, uniforms } = se;
     let ot = &m.output_tensors;
@@ -356,16 +358,18 @@ pub(crate) fn encode_step_matvec(
                               il, pos, 1);
         layer_post_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
     }
-    // output suffix (was inside the last layer's pass before)
-    dispatch_rms_norm(m, cfg, uniforms, &mut pass,
-                      1, cfg.n_embd, m.act_layout.x, m.act_layout.x_norm,
-                      ot.output_norm_off);
-    dispatch_matvec_q1_0(m, uniforms, &mut pass,
-                         cfg.n_embd, cfg.n_vocab,
-                         WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
-                         m.act_layout.x_norm, m.act_layout.logits, false);
-    dispatch_topk_reduce(m, uniforms, &mut pass, cfg.n_vocab, k,
-                         m.act_layout.logits, topk_out_u32_base);
+    if let Some((topk_out_u32_base, k)) = topk_out {
+        // output suffix (was inside the last layer's pass before)
+        dispatch_rms_norm(m, cfg, uniforms, &mut pass,
+                          1, cfg.n_embd, m.act_layout.x, m.act_layout.x_norm,
+                          ot.output_norm_off);
+        dispatch_matvec_q1_0(m, uniforms, &mut pass,
+                             cfg.n_embd, cfg.n_vocab,
+                             WeightSet::Embed, ot.token_embd_d, ot.token_embd_qs,
+                             m.act_layout.x_norm, m.act_layout.logits, false);
+        dispatch_topk_reduce(m, uniforms, &mut pass, cfg.n_vocab, k,
+                             m.act_layout.logits, topk_out_u32_base);
+    }
     drop(pass);
 }
 
@@ -377,7 +381,7 @@ pub(crate) async fn step_matvec_topk(
     let k = k.min(TOPK_MAX).max(1);
     model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&token_id));
     let mut se = StepEncoder::new(model);
-    encode_step_matvec(&mut se, &model.cfg, 0, 0, pos, k);
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos);
     // Fold the readback copy into the same command buffer so the step + the
     // sample→readback transfer are one submit, not two.
     se.copy_sample_to_readback((k as u64) * 8);
@@ -395,7 +399,7 @@ pub(crate) fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     let mut se = StepEncoder::new(model);
     // We still encode the topk_reduce dispatch (with k=1, the single argmax case)
     // so the timing reflects real generation cost; we just skip the readback.
-    encode_step_matvec(&mut se, &model.cfg, 0, 0, pos, 1);
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos);
     let cb = se.finish();
     model.queue.submit(Some(cb));
 }
@@ -503,19 +507,18 @@ pub(crate) async fn prefill_matvec_loop_topk(
     // CPU readback for sampling).
     if !rest.is_empty() {
         // One up-front write covers every non-last token's input slot. The
-        // embed shader for step `i` reads `sample[i]`. The topk_reduce output
-        // for steps 0..last-1 is routed to a scratch slot beyond the prompt
-        // region (sample buffer is 1024 u32 slots / 4 KB; M_MAX = 512, so
-        // `TOPK_SCRATCH_BASE = 768` is well clear of any prompt tokens).
-        const TOPK_SCRATCH_BASE: u32 = 768;
+        // embed shader for step `i` reads `sample[i]`. We pass `topk_out=None`
+        // for these steps so the suffix (output_norm + LM head + topk_reduce)
+        // is skipped — those logits are thrown away anyway, and skipping the
+        // topk avoids it stomping on the prompt region of `sample` for prompts
+        // longer than the previous TOPK_SCRATCH_BASE (768) workaround allowed.
         model.queue.write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(rest));
-        // `encode_step_matvec` allocates a fixed number of uniform slots per
-        // step (one for embed + 13 per transformer layer + 3 for the output
-        // suffix). The 1 MiB pool fits ~8 steps for Bonsai-4B, so for any
-        // prefill longer than that we have to split the work into multiple
-        // submits — KV-cache writes from a previous submit are visible to the
-        // next one's attention reads.
-        let slots_per_step = encode_step_matvec_slots(&model.cfg);
+        // Each non-last step allocates a fixed number of uniform slots
+        // (one for embed + 14 per transformer layer; no suffix). The 1 MiB
+        // pool fits ~8 steps for Bonsai-4B, so for any prefill longer than
+        // that we split the work into multiple submits — KV-cache writes from
+        // a previous submit are visible to the next one's attention reads.
+        let slots_per_step = encode_step_matvec_slots_no_suffix(&model.cfg);
         let mut se = StepEncoder::new(model);
         for t in 0..rest.len() {
             if se.uniforms.remaining_slots() < slots_per_step {
@@ -526,9 +529,8 @@ pub(crate) async fn prefill_matvec_loop_topk(
             encode_step_matvec(
                 &mut se, &model.cfg,
                 /*sample_in=*/ t as u32,
-                /*topk_out_u32_base=*/ TOPK_SCRATCH_BASE,
+                /*topk_out=*/ None,
                 /*pos=*/ pos_base + t as u32,
-                /*k=*/ 1,
             );
         }
         let cb = se.finish();
