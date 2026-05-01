@@ -149,6 +149,19 @@ pub(crate) struct AttnParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub(crate) struct AttnSplitParams {
+    pub head_dim: u32, pub n_head: u32, pub n_kv_head: u32, pub pos: u32,
+    pub kv_stride: u32, pub q_offset: u32, pub k_cache_offset: u32, pub v_cache_offset: u32,
+    pub n_chunks_active: u32, pub scale: f32, pub _p0: u32, pub _p1: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub(crate) struct AttnMergeParams {
+    pub head_dim: u32, pub n_head: u32, pub out_offset: u32, pub n_chunks_active: u32,
+    pub _p0: u32, pub _p1: u32, pub _p2: u32, pub _p3: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub(crate) struct SiluMulParams {
     pub n: u32, pub m: u32, pub gate_offset: u32, pub up_offset: u32,
     pub out_offset: u32, pub dispatch_x_count: u32, pub _p1: u32, pub _p2: u32,
@@ -214,6 +227,8 @@ pub(crate) struct Pipelines {
     pub quantize: wgpu::ComputePipeline,
     pub matmul: wgpu::ComputePipeline,
     pub attention: wgpu::ComputePipeline,
+    pub attention_split: wgpu::ComputePipeline,
+    pub attention_merge: wgpu::ComputePipeline,
     pub silu_mul: wgpu::ComputePipeline,
     pub topk_reduce: wgpu::ComputePipeline,
     pub kv_writeback: wgpu::ComputePipeline,
@@ -229,6 +244,7 @@ pub(crate) struct Buffers {
     pub kv_v: wgpu::Buffer,
     pub act: wgpu::Buffer,        // f16 activations
     pub act_q8: wgpu::Buffer,     // Q8_0 activations (raw u32 buffer)
+    pub attn_partials: wgpu::Buffer,  // f32 partials for split-K attention
     pub rope_table: wgpu::Buffer,
     pub uniform: wgpu::Buffer,    // pool of 256-byte slots
     pub sample: wgpu::Buffer,     // u32 storage: input token id @ [0..M], topk output @ [0..2K]
@@ -243,6 +259,8 @@ pub(crate) struct BindGroupLayouts {
     pub quantize: wgpu::BindGroupLayout,
     pub matmul:   wgpu::BindGroupLayout,
     pub attn:     wgpu::BindGroupLayout,
+    pub attn_split: wgpu::BindGroupLayout,
+    pub attn_merge: wgpu::BindGroupLayout,
     pub silu_mul: wgpu::BindGroupLayout,
     pub topk_reduce: wgpu::BindGroupLayout,
     pub kv_writeback: wgpu::BindGroupLayout,
@@ -267,6 +285,8 @@ pub(crate) struct CachedBindGroups {
     pub matmul_w_ffn_d: wgpu::BindGroup,
     pub matmul_w_embed: wgpu::BindGroup,
     pub attn: wgpu::BindGroup,                   // (uniform, act, kv_k, kv_v)
+    pub attn_split: wgpu::BindGroup,             // (uniform, act, kv_k, kv_v, attn_partials)
+    pub attn_merge: wgpu::BindGroup,             // (uniform, act, attn_partials)
     pub silu_mul: wgpu::BindGroup,               // (uniform, act)
     pub topk_reduce: wgpu::BindGroup,            // (uniform, act, sample)
     pub kv_writeback: wgpu::BindGroup,           // (uniform, act, kv_k, kv_v)
@@ -330,6 +350,9 @@ pub struct Model {
 
 const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
+/// Cache positions per workgroup in the split-K attention pass. Must match
+/// `CHUNK_SIZE` in `attention_split.wgsl`.
+pub(crate) const ATTN_CHUNK_SIZE: u32 = 32;
 // 4096 * 256 B = 1 MiB. Each per-token step uses ~450 slots, matmul prefill ~470.
 // 4096 leaves ~8x headroom and is 16x smaller than the historical 65536.
 pub(crate) const UNIFORM_POOL_SLOTS: u64 = 4096;
@@ -392,6 +415,9 @@ impl Model {
         if !adapter.features().contains(wgpu::Features::SHADER_F16) {
             return Err(PotError::FeatureUnsupported("SHADER_F16"));
         }
+        if !adapter.features().contains(wgpu::Features::SUBGROUP) {
+            return Err(PotError::FeatureUnsupported("SUBGROUP"));
+        }
 
         let mut limits = adapter.limits();
         limits.max_storage_buffer_binding_size = limits
@@ -405,7 +431,7 @@ impl Model {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    required_features: wgpu::Features::SHADER_F16,
+                    required_features: wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
                     required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                     experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -471,6 +497,17 @@ impl Model {
             mapped_at_creation: false,
         });
 
+        // Split-K attention partials: per layer, n_head * n_chunks_max chunks of
+        // (head_dim + 2) f32 each. Reused across layers within a step.
+        let n_chunks_max = (opts.max_seq + ATTN_CHUNK_SIZE - 1) / ATTN_CHUNK_SIZE;
+        let attn_partials_size =
+            (cfg.n_head as u64) * (n_chunks_max as u64) * (cfg.head_dim as u64 + 2) * 4;
+        let attn_partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("attn_partials"), size: attn_partials_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniform"),
             size: UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE,
@@ -497,6 +534,7 @@ impl Model {
         let buffers = Buffers {
             w_attn, w_ffn_gu, w_ffn_d, w_norms, w_embed,
             kv_k, kv_v, act: act_buf, act_q8: act_q8_buf,
+            attn_partials: attn_partials_buf,
             rope_table: rope_buf, uniform: uniform_buf, sample, readback,
         };
 
@@ -514,6 +552,8 @@ impl Model {
         let sh_quant = load_shader!("quantize_q8_0.wgsl");
         let sh_matmul = load_shader!("matmul_q1_0_q8_0.wgsl");
         let sh_attn = load_shader!("attention.wgsl");
+        let sh_attn_split = load_shader!("attention_split.wgsl");
+        let sh_attn_merge = load_shader!("attention_merge.wgsl");
         let sh_silu = load_shader!("silu_mul.wgsl");
         let sh_topk = load_shader!("topk_reduce.wgsl");
         let sh_kv_writeback = load_shader!("kv_writeback.wgsl");
@@ -558,6 +598,8 @@ impl Model {
             quantize:    make_bgl("quantize_bgl",    2, 0b10),    // act ro, outbuf rw
             matmul:      make_bgl("matmul_bgl",      3, 0b100),   // weights ro, acts ro, y rw
             attn:        make_bgl("attn_bgl",        3, 0b001),   // act rw, k ro, v ro
+            attn_split:  make_bgl("attn_split_bgl",  4, 0b1000),  // act ro, k ro, v ro, partials rw
+            attn_merge:  make_bgl("attn_merge_bgl",  2, 0b01),    // act rw, partials ro
             silu_mul:    make_bgl("silu_mul_bgl",    1, 0b1),     // act rw
             topk_reduce: make_bgl("topk_reduce_bgl", 2, 0b10),    // logits ro, result rw
             kv_writeback: make_bgl("kv_writeback_bgl", 3, 0b110), // act ro, kv_k rw, kv_v rw
@@ -587,6 +629,8 @@ impl Model {
             quantize:     mk_pipe(&bgls.quantize,    &sh_quant,         "quantize"),
             matmul:       mk_pipe(&bgls.matmul,      &sh_matmul,        "matmul"),
             attention:    mk_pipe(&bgls.attn,        &sh_attn,          "attention"),
+            attention_split: mk_pipe(&bgls.attn_split, &sh_attn_split,  "attention_split"),
+            attention_merge: mk_pipe(&bgls.attn_merge, &sh_attn_merge,  "attention_merge"),
             silu_mul:     mk_pipe(&bgls.silu_mul,    &sh_silu,          "silu_mul"),
             topk_reduce:  mk_pipe(&bgls.topk_reduce, &sh_topk,          "topk_reduce"),
             kv_writeback: mk_pipe(&bgls.kv_writeback, &sh_kv_writeback, "kv_writeback"),
@@ -768,6 +812,8 @@ fn build_cached_bind_groups(
         matmul_w_ffn_d:  mk("cached_matmul_ffnd",  &bgls.matmul,      &[&buffers.w_ffn_d,  &buffers.act_q8, &buffers.act]),
         matmul_w_embed:  mk("cached_matmul_embed", &bgls.matmul,      &[&buffers.w_embed,  &buffers.act_q8, &buffers.act]),
         attn:            mk("cached_attn",         &bgls.attn,        &[&buffers.act,      &buffers.kv_k, &buffers.kv_v]),
+        attn_split:      mk("cached_attn_split",   &bgls.attn_split,  &[&buffers.act, &buffers.kv_k, &buffers.kv_v, &buffers.attn_partials]),
+        attn_merge:      mk("cached_attn_merge",   &bgls.attn_merge,  &[&buffers.act, &buffers.attn_partials]),
         silu_mul:        mk("cached_silu_mul",     &bgls.silu_mul,    &[&buffers.act]),
         topk_reduce:     mk("cached_topk_reduce",  &bgls.topk_reduce, &[&buffers.act, &buffers.sample]),
         kv_writeback:    mk("cached_kv_writeback", &bgls.kv_writeback, &[&buffers.act, &buffers.kv_k, &buffers.kv_v]),

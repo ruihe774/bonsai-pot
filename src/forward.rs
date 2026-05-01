@@ -406,21 +406,37 @@ fn layer_post_kv_in_pass(
     let cache_row_bytes = cfg.kv_dim as u64 * ACT_ELEM_BYTES;
     let layer_offset_bytes = (il as u64) * (model.max_seq as u64) * cache_row_bytes;
 
+    // Split-K + GQA-batched flash-attention for tg (m_tokens=1).
     {
-        let p = AttnParams {
+        let cur_pos = pos + 1;
+        let n_chunks_active = (cur_pos + ATTN_CHUNK_SIZE - 1) / ATTN_CHUNK_SIZE;
+        let kv_off = (layer_offset_bytes / ACT_ELEM_BYTES) as u32;
+
+        let ps = AttnSplitParams {
             head_dim: cfg.head_dim, n_head: cfg.n_head, n_kv_head: cfg.n_kv_head,
-            pos: pos + 1,
+            pos: cur_pos,
             kv_stride: cfg.kv_dim,
             q_offset: model.act_layout.q,
-            k_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
-            v_cache_offset: ((layer_offset_bytes / ACT_ELEM_BYTES) as u32),
-            out_offset: model.act_layout.attn_out,
+            k_cache_offset: kv_off,
+            v_cache_offset: kv_off,
+            n_chunks_active,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-            m_tokens: 1, is_prefill: 0,
+            ..Default::default()
         };
-        let off = uniforms.alloc(&p);
-        pass.set_pipeline(&model.pipes.attention);
-        pass.set_bind_group(0, &model.cached.attn, &[off]);
+        let off = uniforms.alloc(&ps);
+        pass.set_pipeline(&model.pipes.attention_split);
+        pass.set_bind_group(0, &model.cached.attn_split, &[off]);
+        pass.dispatch_workgroups(cfg.n_kv_head, n_chunks_active, 1);
+
+        let pm = AttnMergeParams {
+            head_dim: cfg.head_dim, n_head: cfg.n_head,
+            out_offset: model.act_layout.attn_out,
+            n_chunks_active,
+            ..Default::default()
+        };
+        let off = uniforms.alloc(&pm);
+        pass.set_pipeline(&model.pipes.attention_merge);
+        pass.set_bind_group(0, &model.cached.attn_merge, &[off]);
         pass.dispatch_workgroups(cfg.n_head, 1, 1);
     }
 
