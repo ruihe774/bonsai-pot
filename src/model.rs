@@ -322,7 +322,9 @@ pub struct Model {
 
 const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
-const UNIFORM_POOL_SLOTS: u64 = 65536;
+// 4096 * 256 B = 1 MiB. Each per-token step uses ~450 slots, matmul prefill ~470.
+// 4096 leaves ~8x headroom and is 16x smaller than the historical 65536.
+pub(crate) const UNIFORM_POOL_SLOTS: u64 = 4096;
 
 /// Allocate-time tunables for [`Model::load_with_options`].
 ///

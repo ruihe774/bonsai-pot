@@ -42,6 +42,10 @@ impl UniformPool {
     }
     fn alloc<T: Pod>(&mut self, params: &T) -> u32 {
         let slot = self.next_slot;
+        assert!(
+            slot < UNIFORM_POOL_SLOTS,
+            "UniformPool exhausted: {slot} >= {UNIFORM_POOL_SLOTS}; raise UNIFORM_POOL_SLOTS",
+        );
         self.next_slot += 1;
         let off = (slot * UNIFORM_SLOT_SIZE) as usize;
         if self.cpu.len() < off + UNIFORM_SLOT_SIZE as usize {

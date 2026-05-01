@@ -113,7 +113,7 @@ KV cache is split into `kv_k` and `kv_v`, sized as `n_layer * MAX_SEQ * kv_dim *
 
 ### Uniforms via dynamic offsets
 
-There is **one** `uniform` buffer (`UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE = 65536 * 256` bytes). Every dispatch's params struct is appended into a `UniformPool` (CPU-side `Vec<u8>`), and the dynamic offset is recorded; the pool is flushed in one `write_buffer` at `StepEncoder::finish`. All `Params` structs in `model.rs` are ≤ 64 bytes and packed into 256-byte slots. **Every BGL has its UBO at binding 0 with `has_dynamic_offset: true`** — bind-group helpers in `forward.rs::make_bg` set this up.
+There is **one** `uniform` buffer (`UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE = 4096 * 256 = 1,048,576 bytes = 1 MiB`). Every dispatch's params struct is appended into a `UniformPool` (CPU-side `Vec<u8>`), and the dynamic offset is recorded; the pool is flushed in one `write_buffer` at `StepEncoder::finish`. All `Params` structs in `model.rs` are ≤ 64 bytes and packed into 256-byte slots. **Every BGL has its UBO at binding 0 with `has_dynamic_offset: true`** — bind-group helpers in `forward.rs::make_bg` set this up.
 
 ### Bind-group layout discipline
 
