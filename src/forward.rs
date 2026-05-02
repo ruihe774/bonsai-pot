@@ -1547,27 +1547,28 @@ pub mod bench_internals {
         // (label, k, n, calls/step, weight_set, w_d_offset, w_qs_offset)
         let lt0 = &model.layer_tensors[0];
         let ot = &model.output_tensors;
-        let matvec_shapes: &[(&str, u32, u32, u32, WeightSet, u32, u32)] = &[
+        let n_layer = cfg.n_layer;
+        let matvec_shapes: Vec<(String, u32, u32, u32, WeightSet, u32, u32)> = vec![
             (
-                "matvec Wo         K=4096 N=2560 ",
+                format!("matvec Wo K={} N={}", cfg.q_dim, cfg.n_embd),
                 cfg.q_dim,
                 cfg.n_embd,
-                36,
+                n_layer,
                 WeightSet::Attn,
                 lt0.wo.0,
                 lt0.wo.1,
             ),
             (
-                "matvec Wdown      K=9728 N=2560 ",
+                format!("matvec Wdown K={} N={}", cfg.n_ff, cfg.n_embd),
                 cfg.n_ff,
                 cfg.n_embd,
-                36,
+                n_layer,
                 WeightSet::FfnD,
                 lt0.wd.0,
                 lt0.wd.1,
             ),
             (
-                "matvec LM_head    K=2560 N=152K ",
+                format!("matvec LM_head K={} N={}", cfg.n_embd, cfg.n_vocab),
                 cfg.n_embd,
                 cfg.n_vocab,
                 1,
@@ -1576,9 +1577,11 @@ pub mod bench_internals {
                 ot.lm_head_qs,
             ),
         ];
-        for &(label, k, n, calls, ws, w_d, w_qs) in matvec_shapes {
+        for (label, k, n, calls, ws, w_d, w_qs) in &matvec_shapes {
+            let (label, k, n, calls, ws, w_d, w_qs) =
+                (label.clone(), *k, *n, *calls, *ws, *w_d, *w_qs);
             entries.push((
-                label.to_string(),
+                label,
                 calls,
                 Box::new(move |model, cfg, se| {
                     matvec_q1_0(
@@ -1599,8 +1602,8 @@ pub mod bench_internals {
         }
 
         entries.push((
-            "matvec QKV  fused N=4608        ".to_string(),
-            36,
+            format!("matvec QKV fused N={}", cfg.q_dim + cfg.kv_dim + cfg.kv_dim),
+            n_layer,
             Box::new(move |model, cfg, se| {
                 let lt = &model.layer_tensors[0];
                 matvec_q1_0_fused_pass(
@@ -1618,8 +1621,8 @@ pub mod bench_internals {
             }),
         ));
         entries.push((
-            "matvec gate_up fused N=19456    ".to_string(),
-            36,
+            format!("matvec gate_up fused N={}", 2 * cfg.n_ff),
+            n_layer,
             Box::new(move |model, cfg, se| {
                 let lt = &model.layer_tensors[0];
                 matvec_q1_0_fused_pass(
@@ -1637,32 +1640,33 @@ pub mod bench_internals {
         ));
 
         // (label, n_groups, group_size, calls/step, norm_off)
-        let rms_shapes: &[(&str, u32, u32, u32, u32)] = &[
+        let rms_shapes: Vec<(String, u32, u32, u32, u32)> = vec![
             (
-                "rms_norm  ng=1  gs=2560        ",
+                format!("rms_norm ng=1 gs={}", cfg.n_embd),
                 1,
                 cfg.n_embd,
-                36 + 36 + 1,
+                2 * n_layer + 1,
                 lt0.attn_norm_off,
             ),
             (
-                "rms_norm  ng=32 gs=128         ",
+                format!("rms_norm ng={} gs={}", cfg.n_head, cfg.head_dim),
                 cfg.n_head,
                 cfg.head_dim,
-                36,
+                n_layer,
                 lt0.attn_q_norm_off,
             ),
             (
-                "rms_norm  ng=8  gs=128         ",
+                format!("rms_norm ng={} gs={}", cfg.n_kv_head, cfg.head_dim),
                 cfg.n_kv_head,
                 cfg.head_dim,
-                36,
+                n_layer,
                 lt0.attn_k_norm_off,
             ),
         ];
-        for &(label, ng, gs, calls, norm_off) in rms_shapes {
+        for (label, ng, gs, calls, norm_off) in &rms_shapes {
+            let (label, ng, gs, calls, norm_off) = (label.clone(), *ng, *gs, *calls, *norm_off);
             entries.push((
-                label.to_string(),
+                label,
                 calls,
                 Box::new(move |model, cfg, se| {
                     rms_norm(
@@ -1680,23 +1684,23 @@ pub mod bench_internals {
         }
 
         entries.push((
-            "rope     n_heads=32             ".to_string(),
-            36,
+            format!("rope n_heads={}", cfg.n_head),
+            n_layer,
             Box::new(move |model, cfg, se| {
                 rope(model, cfg, se, model.act_layout.q, 1, cfg.n_head, 0);
             }),
         ));
         entries.push((
-            "rope     n_heads=8              ".to_string(),
-            36,
+            format!("rope n_heads={}", cfg.n_kv_head),
+            n_layer,
             Box::new(move |model, cfg, se| {
                 rope(model, cfg, se, model.act_layout.k_cur, 1, cfg.n_kv_head, 0);
             }),
         ));
 
         entries.push((
-            "silu_mul n=9728                 ".to_string(),
-            36,
+            format!("silu_mul n={}", cfg.n_ff),
+            n_layer,
             Box::new(move |model, cfg, se| {
                 silu_mul(
                     model,
@@ -1711,8 +1715,8 @@ pub mod bench_internals {
         ));
 
         entries.push((
-            format!("attention pos={attn_pos:<3}                "),
-            36,
+            format!("attention pos={attn_pos}"),
+            n_layer,
             Box::new(move |model, cfg, se| {
                 // Layer 0: d-section starts at byte 0; qs-section starts at d_total.
                 let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, 0);
@@ -1861,11 +1865,7 @@ pub mod bench_internals {
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
             let per_pair_us = mean / n_per_cb as f32 * 1e6;
-            breakdown.push((
-                "kv_writeback Q8_0 (K+V)         ".to_string(),
-                36,
-                per_pair_us,
-            ));
+            breakdown.push(("kv_writeback Q8_0 (K+V)".to_string(), n_layer, per_pair_us));
         }
 
         println!();
