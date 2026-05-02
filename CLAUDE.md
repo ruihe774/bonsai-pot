@@ -152,9 +152,11 @@ Activation buffers always go through **one** `read_write` storage binding per bi
 
 When adding a new dispatch in tg, prefer the `_in_pass` form and slot it into an existing pass. When adding to prefill, the per-pass wrapper is fine.
 
-### Tied embeddings
+### Tied vs. untied embeddings
 
-Bonsai 4B and 8B both have tied embeddings: `token_embd.weight` is used as both the embedding lookup (in `embed.wgsl`) and the LM head full matvec. The Q1_0 row layout `[n_embd, n_vocab]` happens to be the right shape for both ops (gather a single row for embed, full matvec for LM head). `cfg.tied_embeddings` is set by `scripts/extract.py`; current code paths assume tied embeddings.
+Bonsai 4B has **tied** embeddings: `token_embd.weight` is used both for the embedding lookup (in `embed.wgsl`) and for the LM head full matvec. Bonsai 8B has **untied** embeddings — it ships a separate `output.weight` tensor. Both layouts share the same `[n_embd, n_vocab]` Q1_0 row shape (gather a single row for embed, full matvec for LM head), so the kernels and the `w_embed` storage buffer are identical; only the byte offsets differ.
+
+`scripts/extract.py` packs `token_embd.weight` (and, when not tied, `output.weight`) consecutively into `weights_embed_lmhead.bin` and sets `cfg.tied_embeddings`. `OutputTensors` in `model.rs` then exposes both `token_embd_*` (used by the embed kernel) and `lm_head_*` (used by the LM head matvec); when tied they coincide.
 
 ### Sample / readback layout
 

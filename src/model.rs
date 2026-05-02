@@ -444,10 +444,18 @@ pub struct LayerTensors {
 }
 
 /// Precomputed offsets for global / output-side tensors (LM head + `output_norm`).
+///
+/// `token_embd_*` is the embedding-lookup tensor; `lm_head_*` is the row-major
+/// projection used by the final matvec. For tied-embedding models (e.g.
+/// Bonsai-4B) the two pairs are identical; for untied models (e.g. Bonsai-8B,
+/// which ships a separate `output.weight`) they point to distinct rows in
+/// `weights_embed_lmhead.bin`.
 #[derive(Clone, Debug)]
 pub struct OutputTensors {
     pub token_embd_d: u32,
     pub token_embd_qs: u32,
+    pub lm_head_d: u32,
+    pub lm_head_qs: u32,
     pub output_norm_off: u32,
 }
 
@@ -1036,10 +1044,17 @@ impl Model {
         let output_tensors = {
             let te = tensor(&cfg, "token_embd.weight");
             let on = tensor(&cfg, "output_norm.weight");
+            let lm = if cfg.tied_embeddings {
+                te
+            } else {
+                tensor(&cfg, "output.weight")
+            };
             let act_elem_bytes = size_of::<half::f16>() as u64;
             OutputTensors {
                 token_embd_d: te.d_offset as u32,
                 token_embd_qs: te.qs_offset as u32,
+                lm_head_d: lm.d_offset as u32,
+                lm_head_qs: lm.qs_offset as u32,
                 output_norm_off: (on.offset / act_elem_bytes) as u32,
             }
         };
