@@ -6,14 +6,13 @@ use crate::model::{Model, TOPK_MAX};
 /// Token sampler.
 ///
 /// There is no separate greedy mode — set `temperature = 0.0` (or
-/// `top_k = Some(1)`) for argmax-like behavior. `top_k` is silently capped at
-/// the shader-side constant [`crate::TOPK_MAX`].
+/// `top_k = Some(1)`) for argmax-like behavior. `top_k` is silently capped at 32.
 #[derive(Debug, Clone)]
 pub struct Sampler {
     /// Logit temperature. `0.0` ⇒ argmax over the K candidates. Must be ≥ 0.
     pub temperature: f32,
     /// Truncate to top-`k` candidates before sampling. `None` ⇒ keep all
-    /// `TOPK_MAX` candidates returned by the GPU.
+    /// 32 candidates returned by the GPU.
     pub top_k: Option<u32>,
     /// Nucleus filter: keep the smallest set of candidates whose cumulative
     /// probability ≥ `p`. `None` ⇒ no nucleus filter.
