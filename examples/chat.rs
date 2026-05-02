@@ -220,6 +220,33 @@ fn read_user_line() -> Option<String> {
     }
 }
 
+/// Remove every `<think>...</think>` span (inclusive) from `tokens`.
+///
+/// If a `<think>` is opened but never closed (e.g. hit `max_new_tokens`
+/// mid-thought), every token from the unclosed `<think>` to the end is
+/// dropped — there is no usable response in that tail.
+fn strip_thinking(tokens: &[u32], open: Option<u32>, close: Option<u32>) -> Vec<u32> {
+    let (Some(open), Some(close)) = (open, close) else {
+        return tokens.to_vec();
+    };
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut depth = 0u32;
+    for &tok in tokens {
+        if tok == open {
+            depth += 1;
+        }
+        if depth == 0 {
+            out.push(tok);
+        }
+        if tok == close && depth > 0 {
+            depth -= 1;
+        }
+    }
+    // If depth > 0 an open tag was never closed — the tail was already
+    // excluded by the depth==0 guard above, so no extra work needed.
+    out
+}
+
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
@@ -248,6 +275,11 @@ fn main() {
             eprintln!("error: vocab missing <|endoftext|>");
             exit(2);
         });
+        // Qwen3 thinking tokens — absent on non-Qwen3 vocabs, in which case
+        // stripping is silently disabled.
+        let think_open = model.token_id("<think>");
+        let think_close = model.token_id("</think>");
+        let thinking_supported = think_open.is_some() && think_close.is_some();
         let sampler = Sampler {
             temperature: args.temperature,
             top_k: args.top_k,
@@ -318,15 +350,39 @@ fn main() {
                 .prefill_one_at_a_time(&tokens, &sampler)
                 .expect("prefill_one_at_a_time");
 
+            // Snapshot here: the first sampled token hasn't been `step`-fed
+            // yet, so this captures KV state just after `<|im_start|>assistant\n`.
+            // We'll rewind to this point after generation to re-prefill with
+            // thinking stripped, as required by the Qwen3 chat template.
+            let pre_assistant_snap = if thinking_supported {
+                Some(sess.snapshot().expect("pre-assistant snapshot"))
+            } else {
+                None
+            };
+
             write!(stdout, "Assistant: ").ok();
             stdout.flush().ok();
             let mut hit_overflow = false;
+            let mut out_tokens: Vec<u32> = Vec::new();
+            let mut in_think = false;
             for _ in 0..args.max_new_tokens {
                 if next == im_end || next == endoftext {
                     break;
                 }
+                // Track thinking-block boundaries for display and stripping.
+                if thinking_supported {
+                    if Some(next) == think_open {
+                        in_think = true;
+                        stdout.write_all(b"\x1b[2m").ok(); // dim
+                    }
+                    out_tokens.push(next);
+                }
                 stdout.write_all(&model.decode_token(next)).ok();
                 stdout.flush().ok();
+                if thinking_supported && Some(next) == think_close {
+                    in_think = false;
+                    stdout.write_all(b"\x1b[0m").ok(); // reset
+                }
                 match sess.step(next, &sampler) {
                     Ok(t) => next = t,
                     Err(PotError::ContextOverflow { .. }) => {
@@ -336,6 +392,10 @@ fn main() {
                     Err(e) => panic!("step: {e}"),
                 }
             }
+            // Reset dim if we hit max_new_tokens or overflow mid-think.
+            if in_think {
+                stdout.write_all(b"\x1b[0m").ok();
+            }
             writeln!(stdout).ok();
             if hit_overflow {
                 writeln!(
@@ -344,6 +404,23 @@ fn main() {
                     sess.pos(),
                 )
                 .ok();
+            }
+
+            // Rewind KV cache to just after the assistant header, then
+            // re-prefill with thinking blocks removed. This matches the Qwen3
+            // chat template, which strips prior-turn thinking from history.
+            if let Some(snap) = pre_assistant_snap {
+                let stripped = strip_thinking(&out_tokens, think_open, think_close);
+                if stripped.len() != out_tokens.len() {
+                    // Something was stripped — rewind and rebuild KV.
+                    sess.restore(&snap).expect("restore pre-assistant snapshot");
+                    if stripped.is_empty() {
+                        writeln!(stdout, "(no response after thinking)").ok();
+                    } else {
+                        sess.prefill_one_at_a_time(&stripped, &sampler)
+                            .expect("re-prefill stripped response");
+                    }
+                }
             }
             turn += 1;
         }
