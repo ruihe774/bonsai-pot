@@ -1,3 +1,7 @@
+#![allow(clippy::panic)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
 //! Demo CLI for `bonsai-pot`.
 //!
 //! Reads pre-tokenized prompts from stdin (little-endian u32 token IDs) and

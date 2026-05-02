@@ -1,3 +1,7 @@
+#![allow(clippy::panic)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
 //! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
 //! Bonsai is an instruction-tuned model family; we render each turn into the
