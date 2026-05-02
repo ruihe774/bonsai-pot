@@ -93,9 +93,9 @@ fn prefill_pos_nonzero_rejected() {
     let model = load_model();
     let mut sess = model.new_session();
     let prompt = short_prompt();
-    let _ = pollster::block_on(sess.prefill(&prompt, &greedy_sampler())).unwrap();
+    let _ = sess.prefill(&prompt, &greedy_sampler()).unwrap();
     // pos is now 8; calling prefill again must fail.
-    let err = pollster::block_on(sess.prefill(&prompt, &greedy_sampler())).unwrap_err();
+    let err = sess.prefill(&prompt, &greedy_sampler()).unwrap_err();
     assert!(matches!(err, PotError::Config(_)));
 }
 
@@ -104,7 +104,7 @@ fn prefill_too_large_rejected() {
     let model = load_model();
     let mut sess = model.new_session();
     let too_many: Vec<u32> = vec![1u32; 513]; // > M_MAX=512
-    let err = pollster::block_on(sess.prefill(&too_many, &greedy_sampler())).unwrap_err();
+    let err = sess.prefill(&too_many, &greedy_sampler()).unwrap_err();
     assert!(
         matches!(
             err,
@@ -123,12 +123,12 @@ fn greedy_is_byte_deterministic() {
     let opts = greedy_opts(16);
 
     let mut sess1 = model.new_session();
-    let first1 = pollster::block_on(sess1.prefill(&prompt, &greedy_sampler())).unwrap();
-    let (toks1, _) = pollster::block_on(sess1.generate(first1, &opts)).unwrap();
+    let first1 = sess1.prefill(&prompt, &greedy_sampler()).unwrap();
+    let (toks1, _) = sess1.generate(first1, &opts).unwrap();
 
     let mut sess2 = model.new_session();
-    let first2 = pollster::block_on(sess2.prefill(&prompt, &greedy_sampler())).unwrap();
-    let (toks2, _) = pollster::block_on(sess2.generate(first2, &opts)).unwrap();
+    let first2 = sess2.prefill(&prompt, &greedy_sampler()).unwrap();
+    let (toks2, _) = sess2.generate(first2, &opts).unwrap();
 
     assert_eq!(first1, first2, "prefill returned different first tokens");
     assert_eq!(toks1, toks2, "greedy generation is not byte-deterministic");
@@ -142,11 +142,10 @@ fn matvec_matmul_parity_first_token() {
     let greedy = greedy_sampler();
 
     let mut sess_matmul = model.new_session();
-    let first_matmul = pollster::block_on(sess_matmul.prefill(&prompt, &greedy)).unwrap();
+    let first_matmul = sess_matmul.prefill(&prompt, &greedy).unwrap();
 
     let mut sess_matvec = model.new_session();
-    let first_matvec =
-        pollster::block_on(sess_matvec.prefill_one_at_a_time(&prompt, &greedy)).unwrap();
+    let first_matvec = sess_matvec.prefill_one_at_a_time(&prompt, &greedy).unwrap();
 
     assert_eq!(
         first_matmul, first_matvec,
@@ -175,8 +174,8 @@ fn seeded_sampler_reproducibility() {
             ..opts.clone()
         };
         let mut sess = model.new_session();
-        let first = pollster::block_on(sess.prefill(&prompt, s)).unwrap();
-        let (toks, _) = pollster::block_on(sess.generate(first, &opts_local)).unwrap();
+        let first = sess.prefill(&prompt, s).unwrap();
+        let (toks, _) = sess.generate(first, &opts_local).unwrap();
         (first, toks)
     };
 
@@ -207,10 +206,11 @@ fn generate_max_tokens_zero_returns_immediately() {
         sampler: greedy_sampler(),
     };
     let mut fired = false;
-    let stop = pollster::block_on(sess.generate_streaming(0, &opts, |_| {
-        fired = true;
-    }))
-    .unwrap();
+    let stop = sess
+        .generate_streaming(0, &opts, |_| {
+            fired = true;
+        })
+        .unwrap();
     assert_eq!(stop, StopReason::MaxTokens);
     assert!(!fired, "on_token callback fired when max_new_tokens=0");
 }
@@ -225,15 +225,15 @@ fn snapshot_restore_round_trip_continues_identically() {
 
     // Original session: prefill, snapshot, continue.
     let mut sess = model.new_session();
-    let first = pollster::block_on(sess.prefill(&prompt, &greedy)).unwrap();
+    let first = sess.prefill(&prompt, &greedy).unwrap();
     let snap = sess.snapshot().unwrap();
-    let (toks_orig, _) = pollster::block_on(sess.generate(first, &greedy_opts(8))).unwrap();
+    let (toks_orig, _) = sess.generate(first, &greedy_opts(8)).unwrap();
 
     // Restored session: restore snapshot, continue from same point.
     let mut sess2 = model.new_session();
     sess2.restore(&snap).unwrap();
     assert_eq!(sess2.pos(), snap.pos());
-    let (toks_restored, _) = pollster::block_on(sess2.generate(first, &greedy_opts(8))).unwrap();
+    let (toks_restored, _) = sess2.generate(first, &greedy_opts(8)).unwrap();
 
     assert_eq!(
         toks_orig, toks_restored,
@@ -248,16 +248,16 @@ fn snapshot_to_bytes_round_trip() {
     let greedy = greedy_sampler();
 
     let mut sess = model.new_session();
-    let first = pollster::block_on(sess.prefill(&prompt, &greedy)).unwrap();
+    let first = sess.prefill(&prompt, &greedy).unwrap();
     let snap = sess.snapshot().unwrap();
-    let (toks_orig, _) = pollster::block_on(sess.generate(first, &greedy_opts(4))).unwrap();
+    let (toks_orig, _) = sess.generate(first, &greedy_opts(4)).unwrap();
 
     // Serialize → deserialize → restore.
     let bytes = snap.to_bytes();
     let snap2 = KvSnapshot::from_bytes(&bytes).unwrap();
     let mut sess2 = model.new_session();
     sess2.restore(&snap2).unwrap();
-    let (toks_via_disk, _) = pollster::block_on(sess2.generate(first, &greedy_opts(4))).unwrap();
+    let (toks_via_disk, _) = sess2.generate(first, &greedy_opts(4)).unwrap();
 
     assert_eq!(
         toks_orig, toks_via_disk,
@@ -279,7 +279,7 @@ fn restore_pos_zero_snapshot_leaves_session_ready_for_prefill() {
 
     // Should be able to prefill as if fresh.
     let prompt = short_prompt();
-    pollster::block_on(sess2.prefill(&prompt, &greedy_sampler())).unwrap();
+    sess2.prefill(&prompt, &greedy_sampler()).unwrap();
     assert_eq!(sess2.pos(), prompt.len() as u32);
 }
 
@@ -291,7 +291,7 @@ fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
 
     // Confirm liveness before we destroy the device.
     let mut sess = model.new_session();
-    let first = pollster::block_on(sess.prefill(&short_prompt(), &greedy_sampler())).unwrap();
+    let first = sess.prefill(&short_prompt(), &greedy_sampler()).unwrap();
 
     // Capture a snapshot while the device is still healthy, so we can verify
     // that restore() is also guarded after loss.
@@ -307,7 +307,8 @@ fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
     );
 
     // step() must return DeviceLost, not panic.
-    let err = pollster::block_on(sess.step(first, &greedy_sampler()))
+    let err = sess
+        .step(first, &greedy_sampler())
         .expect_err("step on a lost device must fail");
     assert!(
         matches!(
@@ -346,8 +347,10 @@ fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
         "freshly loaded model should not be lost"
     );
     let mut sess2 = model2.new_session();
-    let first2 = pollster::block_on(sess2.prefill(&short_prompt(), &greedy_sampler()))
+    let first2 = sess2
+        .prefill(&short_prompt(), &greedy_sampler())
         .expect("prefill on recovered model must succeed");
-    let _ = pollster::block_on(sess2.step(first2, &greedy_sampler()))
+    let _ = sess2
+        .step(first2, &greedy_sampler())
         .expect("step on recovered model must succeed");
 }

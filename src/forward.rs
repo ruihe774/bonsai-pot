@@ -376,13 +376,13 @@ fn dispatch_kv_writeback(
 
 // ---------- async readback helper -------------------------------------------
 
-/// Await the `sample → readback` copy that was already encoded into the
+/// Wait the `sample → readback` copy that was already encoded into the
 /// step's command buffer (via [`StepEncoder::copy_sample_to_readback`]) and
 /// return the K f32 logits + K u32 indices the caller asked for.
 ///
 /// This must be called AFTER the step's command buffer has been submitted —
 /// i.e. the readback copy is in flight. There is no separate submit here.
-fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
+fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
     use core::result::Result as StdResult;
     use std::sync::{Arc, OnceLock};
 
@@ -527,7 +527,7 @@ pub fn encode_step_matvec(
 
 /// Run one matvec step at `pos`, reading the current token from CPU and
 /// returning the top-`k` logits + indices for the next token.
-pub async fn step_matvec_topk(
+pub fn step_matvec_topk(
     model: &Model,
     token_id: u32,
     pos: u32,
@@ -544,7 +544,7 @@ pub async fn step_matvec_topk(
     se.copy_sample_to_readback(u64::from(k) * 8);
     let cb = se.finish();
     model.queue.submit(Some(cb));
-    await_topk_readback(model, k)
+    wait_topk_readback(model, k)
 }
 
 /// Same as [`step_matvec_topk`] but does not perform any sampling readback.
@@ -763,7 +763,7 @@ fn layer_post_kv_in_pass(
 /// `pos` from `pos_base` to `pos_base + prompt.len()`, and return the top-K
 /// candidates from the LAST token's logits. Suitable for incremental prefill
 /// after an existing KV cache (any `pos_base`).
-pub async fn prefill_matvec_loop_topk(
+pub fn prefill_matvec_loop_topk(
     model: &Model,
     prompt: &[u32],
     pos_base: u32,
@@ -813,7 +813,7 @@ pub async fn prefill_matvec_loop_topk(
         let cb = se.finish();
         model.queue.submit(Some(cb));
     }
-    step_matvec_topk(model, last, pos_base + rest.len() as u32, k).await
+    step_matvec_topk(model, last, pos_base + rest.len() as u32, k)
 }
 
 // ---------- matmul (batched prefill) ---------------------------------------
@@ -822,7 +822,7 @@ pub async fn prefill_matvec_loop_topk(
 /// Advances pos from 0 to `prompt.len()`. Returns top-K candidates from the
 /// last token's logits. Requires `pos_base == 0` (the matmul attention shader
 /// assumes a fresh cache).
-pub async fn prefill_matmul_topk(
+pub fn prefill_matmul_topk(
     model: &Model,
     prompt: &[u32],
     pos_base: u32,
@@ -931,7 +931,7 @@ pub async fn prefill_matmul_topk(
     let cb = se.finish();
     model.queue.submit(Some(cb));
 
-    await_topk_readback(model, k)
+    wait_topk_readback(model, k)
 }
 
 fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32, m: u32) {
@@ -1465,14 +1465,14 @@ pub mod bench_internals {
     ///
     /// # Panics
     /// Panics if `device.poll` returns an error.
-    pub async fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
+    pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let cfg = &model.cfg;
         eprintln!("--- bench: pp={pp_n}, tg={tg_n}, repeats={repeats} (after 1 warmup) ---");
 
         let prompt: Vec<u32> = (0..pp_n).map(|i| (i % (cfg.n_vocab - 1)) + 1).collect();
 
         // ----- warm up -----
-        let _ = prefill_matmul_topk(model, &prompt[..pp_n.min(model.m_max) as usize], 0, 1).await?;
+        let _ = prefill_matmul_topk(model, &prompt[..pp_n.min(model.m_max) as usize], 0, 1)?;
         step_matvec_no_sample(model, 1u32, 0);
         if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
             model.check_device()?;
@@ -1483,7 +1483,7 @@ pub mod bench_internals {
         let mut pp_times = Vec::with_capacity(repeats as usize);
         for _ in 0..repeats {
             let t = Instant::now();
-            let _ = prefill_matmul_topk(model, &prompt, 0, 1).await?;
+            let _ = prefill_matmul_topk(model, &prompt, 0, 1)?;
             if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
                 model.check_device()?;
                 return Err(PotError::Poll(e));
@@ -1500,7 +1500,7 @@ pub mod bench_internals {
         for _ in 0..repeats {
             let t = Instant::now();
             for pos in 0..tg_n {
-                let (_, _) = step_matvec_topk(model, 1u32, pos, 1).await?;
+                let (_, _) = step_matvec_topk(model, 1u32, pos, 1)?;
             }
             if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
                 model.check_device()?;
@@ -1535,7 +1535,7 @@ pub mod bench_internals {
     }
 
     #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
-    pub async fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
+    pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
         type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
 
         let cfg = &model.cfg;

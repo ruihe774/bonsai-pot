@@ -139,7 +139,7 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if `self.pos() != 0`, if the prompt would overflow the
     /// KV cache, or if the underlying GPU dispatch fails.
-    pub async fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
+    pub fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         self.model.check_device()?;
         if self.pos != 0 {
             return Err(PotError::Config(
@@ -155,8 +155,7 @@ impl<'m> Session<'m> {
             });
         }
         let k = effective_k(sampler);
-        let (logits, indices) =
-            forward::prefill_matmul_topk(self.model, tokens, self.pos, k).await?;
+        let (logits, indices) = forward::prefill_matmul_topk(self.model, tokens, self.pos, k)?;
         let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
         self.pos += n;
         Ok(chosen)
@@ -170,11 +169,7 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if the prompt would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
-    pub async fn prefill_one_at_a_time(
-        &mut self,
-        tokens: &[u32],
-        sampler: &Sampler,
-    ) -> Result<u32> {
+    pub fn prefill_one_at_a_time(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         self.model.check_device()?;
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
@@ -185,8 +180,7 @@ impl<'m> Session<'m> {
             });
         }
         let k = effective_k(sampler);
-        let (logits, indices) =
-            forward::prefill_matvec_loop_topk(self.model, tokens, self.pos, k).await?;
+        let (logits, indices) = forward::prefill_matvec_loop_topk(self.model, tokens, self.pos, k)?;
         let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
         self.pos += n;
         Ok(chosen)
@@ -199,7 +193,7 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if advancing `pos` would overflow the KV cache, or if
     /// the underlying GPU dispatch fails.
-    pub async fn step(&mut self, token: u32, sampler: &Sampler) -> Result<u32> {
+    pub fn step(&mut self, token: u32, sampler: &Sampler) -> Result<u32> {
         self.model.check_device()?;
         if self.pos + 1 > self.model.max_seq {
             return Err(PotError::ContextOverflow {
@@ -209,7 +203,7 @@ impl<'m> Session<'m> {
             });
         }
         let k = effective_k(sampler);
-        let (logits, indices) = forward::step_matvec_topk(self.model, token, self.pos, k).await?;
+        let (logits, indices) = forward::step_matvec_topk(self.model, token, self.pos, k)?;
         let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
         self.pos += 1;
         Ok(chosen)
@@ -223,15 +217,13 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if generation would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
-    pub async fn generate(
+    pub fn generate(
         &mut self,
         first_token: u32,
         opts: &GenerateOptions,
     ) -> Result<(Vec<u32>, StopReason)> {
         let mut out = Vec::with_capacity(opts.max_new_tokens as usize);
-        let stop = self
-            .generate_streaming(first_token, opts, |id| out.push(id))
-            .await?;
+        let stop = self.generate_streaming(first_token, opts, |id| out.push(id))?;
         Ok((out, stop))
     }
 
@@ -244,7 +236,7 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if generation would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
-    pub async fn generate_streaming<F: FnMut(u32)>(
+    pub fn generate_streaming<F: FnMut(u32)>(
         &mut self,
         first_token: u32,
         opts: &GenerateOptions,
@@ -264,8 +256,7 @@ impl<'m> Session<'m> {
                 });
             }
             let k = effective_k(&opts.sampler);
-            let (logits, indices) =
-                forward::step_matvec_topk(self.model, next, self.pos, k).await?;
+            let (logits, indices) = forward::step_matvec_topk(self.model, next, self.pos, k)?;
             let chosen = sample_from_topk(&logits, &indices, &opts.sampler, self.pos);
             self.pos += 1;
             if chosen == stop_id {

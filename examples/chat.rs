@@ -257,7 +257,6 @@ fn main() {
         let system_tokens = tokenize(&args.bpe, &args.model_dir, &system_segment);
         eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
         sess.prefill(&system_tokens, &sampler)
-            .await
             .expect("system prefill");
         let system_snap: KvSnapshot = sess.snapshot().expect("system snapshot");
 
@@ -310,7 +309,6 @@ fn main() {
             // it is fed back via `step` in the streaming loop below.
             let mut next = sess
                 .prefill_one_at_a_time(&tokens, &sampler)
-                .await
                 .expect("prefill_one_at_a_time");
 
             write!(stdout, "Assistant: ").ok();
@@ -322,7 +320,7 @@ fn main() {
                 }
                 stdout.write_all(&model.decode_token(next)).ok();
                 stdout.flush().ok();
-                match sess.step(next, &sampler).await {
+                match sess.step(next, &sampler) {
                     Ok(t) => next = t,
                     Err(PotError::ContextOverflow { .. }) => {
                         hit_overflow = true;

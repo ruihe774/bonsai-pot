@@ -11,9 +11,9 @@
 //!     let model = Model::load(std::path::Path::new("./model")).await.unwrap();
 //!     let mut sess = model.new_session();
 //!     let prompt: &[u32] = &[/* token ids ... */];
-//!     let first = sess.prefill(prompt, &Sampler::default()).await.unwrap();
+//!     let first = sess.prefill(prompt, &Sampler::default()).unwrap();
 //!     let opts = GenerateOptions { max_new_tokens: 64, ..Default::default() };
-//!     let (toks, _stop) = sess.generate(first, &opts).await.unwrap();
+//!     let (toks, _stop) = sess.generate(first, &opts).unwrap();
 //!     print!("{}", model.decode_tokens(&[&[first][..], &toks].concat()));
 //! });
 //! ```

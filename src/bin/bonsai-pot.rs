@@ -220,20 +220,16 @@ fn main() {
 
         match args.mode.as_str() {
             "bench" => {
-                __bench::bench(&model, args.pp_n, args.tg_n, args.repeats)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("bench error: {e}");
-                        exit(3)
-                    });
+                __bench::bench(&model, args.pp_n, args.tg_n, args.repeats).unwrap_or_else(|e| {
+                    eprintln!("bench error: {e}");
+                    exit(3)
+                });
             }
             "microbench" => {
-                __bench::microbench_tg(&model, args.repeats)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("microbench error: {e}");
-                        exit(3)
-                    });
+                __bench::microbench_tg(&model, args.repeats).unwrap_or_else(|e| {
+                    eprintln!("microbench error: {e}");
+                    exit(3)
+                });
             }
             "gen" | "prompt" => {
                 let mut buf = Vec::new();
@@ -256,10 +252,9 @@ fn main() {
                 };
                 let mut sess = model.new_session();
                 let first = if args.use_matmul_prefill {
-                    sess.prefill(&prompt, &sampler).await.expect("prefill")
+                    sess.prefill(&prompt, &sampler).expect("prefill")
                 } else {
                     sess.prefill_one_at_a_time(&prompt, &sampler)
-                        .await
                         .expect("prefill")
                 };
 
@@ -280,7 +275,6 @@ fn main() {
                     stdout.write_all(&model.decode_token(id)).ok();
                     stdout.flush().ok();
                 })
-                .await
                 .expect("generate");
                 writeln!(stdout).ok();
             }
