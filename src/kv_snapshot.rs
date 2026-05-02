@@ -94,6 +94,10 @@ impl KvSnapshot {
     /// Does not panic in practice: the fixed-size slice conversions used
     /// internally are guaranteed to succeed once the length precondition is
     /// met.
+    #[allow(
+        clippy::unwrap_used,
+        reason = "fixed-size slice → array conversions are infallible after the length check above"
+    )]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_BYTES {
             return Err(PotError::Config(

@@ -41,7 +41,7 @@ pub type Result<T> = StdResult<T, PotError>;
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::error::Error as _;
     use std::io;
     use std::path::PathBuf;
 

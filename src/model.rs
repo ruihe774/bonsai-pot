@@ -10,18 +10,17 @@ use std::fs::{read, read_to_string, write};
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::str::from_utf8;
+use std::str::{from_utf8, FromStr};
 use std::sync::{Arc, OnceLock};
 
 use bytemuck::{cast_slice, Pod, Zeroable};
-use wgpu::util::DeviceExt;
+use wgpu::util::DeviceExt as _;
 
 use crate::decode;
 use crate::error::{PotError, Result};
 
 // ----- config & manifest ----------------------------------------------------
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TensorEntry {
     pub(crate) dtype: String,
@@ -35,7 +34,6 @@ pub struct TensorEntry {
 }
 
 /// Internal config: the full struct deserialized from `config.ini`.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ConfigRaw {
     pub(crate) n_layer: u32,
@@ -529,7 +527,46 @@ impl Default for ModelOptions {
     }
 }
 
-fn parse_config_ini(text: &str) -> Config {
+fn parse_config_ini(text: &str) -> Result<Config> {
+    fn get<'a>(map: &'a HashMap<&str, &str>, key: &'static str) -> Result<&'a str> {
+        map.get(key)
+            .copied()
+            .ok_or(PotError::Config("config.ini missing required field"))
+    }
+    fn parse_field<T: FromStr>(map: &HashMap<&str, &str>, key: &'static str) -> Result<T> {
+        get(map, key)?
+            .parse()
+            .map_err(|_| PotError::Config("config.ini field has invalid value"))
+    }
+    fn parse_opt<T: FromStr + Default>(map: &HashMap<&str, &str>, key: &'static str) -> Result<T> {
+        map.get(key).map_or_else(
+            || Ok(T::default()),
+            |v| {
+                v.parse()
+                    .map_err(|_| PotError::Config("config.ini field has invalid value"))
+            },
+        )
+    }
+    fn build_entry(g: &HashMap<&str, &str>) -> Result<TensorEntry> {
+        let shape = get(g, "shape")?
+            .split(',')
+            .map(|s| {
+                s.parse::<u64>()
+                    .map_err(|_| PotError::Config("config.ini shape has invalid value"))
+            })
+            .collect::<Result<Vec<u64>>>()?;
+        Ok(TensorEntry {
+            dtype: get(g, "dtype")?.to_string(),
+            shape,
+            buffer: get(g, "buffer")?.to_string(),
+            offset: parse_field(g, "offset")?,
+            length: parse_field(g, "length")?,
+            d_offset: parse_opt(g, "d_offset")?,
+            qs_offset: parse_opt(g, "qs_offset")?,
+            nb: parse_opt(g, "nb")?,
+        })
+    }
+
     let mut globals: HashMap<&str, &str> = HashMap::new();
     let mut manifest: HashMap<String, TensorEntry> = HashMap::new();
     let mut cur_section: Option<&str> = None;
@@ -542,24 +579,7 @@ fn parse_config_ini(text: &str) -> Config {
         }
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             if let Some(sec) = cur_section {
-                let g = &cur_fields;
-                let shape = g["shape"]
-                    .split(',')
-                    .map(|s| s.parse::<u64>().unwrap())
-                    .collect();
-                manifest.insert(
-                    sec.to_string(),
-                    TensorEntry {
-                        dtype: g["dtype"].to_string(),
-                        shape,
-                        buffer: g["buffer"].to_string(),
-                        offset: g["offset"].parse().unwrap(),
-                        length: g["length"].parse().unwrap(),
-                        d_offset: g.get("d_offset").map_or(0, |v| v.parse().unwrap()),
-                        qs_offset: g.get("qs_offset").map_or(0, |v| v.parse().unwrap()),
-                        nb: g.get("nb").map_or(0, |v| v.parse().unwrap()),
-                    },
-                );
+                manifest.insert(sec.to_string(), build_entry(&cur_fields)?);
                 cur_fields.clear();
             }
             cur_section = Some(name);
@@ -572,48 +592,31 @@ fn parse_config_ini(text: &str) -> Config {
         }
     }
     if let Some(sec) = cur_section {
-        let g = &cur_fields;
-        let shape = g["shape"]
-            .split(',')
-            .map(|s| s.parse::<u64>().unwrap())
-            .collect();
-        manifest.insert(
-            sec.to_string(),
-            TensorEntry {
-                dtype: g["dtype"].to_string(),
-                shape,
-                buffer: g["buffer"].to_string(),
-                offset: g["offset"].parse().unwrap(),
-                length: g["length"].parse().unwrap(),
-                d_offset: g.get("d_offset").map_or(0, |v| v.parse().unwrap()),
-                qs_offset: g.get("qs_offset").map_or(0, |v| v.parse().unwrap()),
-                nb: g.get("nb").map_or(0, |v| v.parse().unwrap()),
-            },
-        );
+        manifest.insert(sec.to_string(), build_entry(&cur_fields)?);
     }
 
     let g = &globals;
-    ConfigRaw {
-        n_layer: g["n_layer"].parse().unwrap(),
-        n_embd: g["n_embd"].parse().unwrap(),
-        n_ff: g["n_ff"].parse().unwrap(),
-        n_head: g["n_head"].parse().unwrap(),
-        n_kv_head: g["n_kv_head"].parse().unwrap(),
-        head_dim: g["head_dim"].parse().unwrap(),
-        rope_freq_base: g["rope_freq_base"].parse().unwrap(),
-        rms_eps: g["rms_eps"].parse().unwrap(),
-        n_vocab: g["n_vocab"].parse().unwrap(),
-        eos_token_id: g["eos_token_id"].parse().unwrap(),
-        padding_token_id: g["padding_token_id"].parse().unwrap(),
-        add_bos: g["add_bos"] == "true",
-        context_length: g["context_length"].parse().unwrap(),
-        rope_orig_context: g["rope_orig_context"].parse().unwrap(),
-        n_kv_groups: g["n_kv_groups"].parse().unwrap(),
-        q_dim: g["q_dim"].parse().unwrap(),
-        kv_dim: g["kv_dim"].parse().unwrap(),
-        tied_embeddings: g["tied_embeddings"] == "true",
+    Ok(ConfigRaw {
+        n_layer: parse_field(g, "n_layer")?,
+        n_embd: parse_field(g, "n_embd")?,
+        n_ff: parse_field(g, "n_ff")?,
+        n_head: parse_field(g, "n_head")?,
+        n_kv_head: parse_field(g, "n_kv_head")?,
+        head_dim: parse_field(g, "head_dim")?,
+        rope_freq_base: parse_field(g, "rope_freq_base")?,
+        rms_eps: parse_field(g, "rms_eps")?,
+        n_vocab: parse_field(g, "n_vocab")?,
+        eos_token_id: parse_field(g, "eos_token_id")?,
+        padding_token_id: parse_field(g, "padding_token_id")?,
+        add_bos: get(g, "add_bos")? == "true",
+        context_length: parse_field(g, "context_length")?,
+        rope_orig_context: parse_field(g, "rope_orig_context")?,
+        n_kv_groups: parse_field(g, "n_kv_groups")?,
+        q_dim: parse_field(g, "q_dim")?,
+        kv_dim: parse_field(g, "kv_dim")?,
+        tied_embeddings: get(g, "tied_embeddings")? == "true",
         manifest,
-    }
+    })
 }
 
 impl Model {
@@ -674,7 +677,7 @@ impl Model {
             path: cfg_path.clone(),
             source: e,
         })?;
-        let cfg = parse_config_ini(&cfg_text);
+        let cfg = parse_config_ini(&cfg_text)?;
         let public_cfg = ModelConfig::from_raw(&cfg);
 
         // ---- wgpu init ------------------------------------------------------
@@ -1376,7 +1379,12 @@ fn probe_subgroup_size(
         .map_err(|_| PotError::Config("probe map_async errored"))?;
     let sg = {
         let data = slice.get_mapped_range();
-        u32::from_le_bytes(data[..4].try_into().unwrap())
+        #[allow(
+            clippy::unwrap_used,
+            reason = "data[..4] is always 4 bytes, so try_into to [u8; 4] is infallible"
+        )]
+        let bytes: [u8; 4] = data[..4].try_into().unwrap();
+        u32::from_le_bytes(bytes)
     };
     readback.unmap();
     Ok(sg)
@@ -1384,6 +1392,10 @@ fn probe_subgroup_size(
 
 // ----- public(crate) helpers used by forward.rs -----------------------------
 
+#[allow(
+    clippy::panic,
+    reason = "manifest is fully validated at load; missing tensor is a programmer error"
+)]
 pub fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
     cfg.manifest
         .get(name)
@@ -1398,6 +1410,10 @@ fn build_cached_bind_groups(
 ) -> CachedBindGroups {
     // The UBO binding always uses UNIFORM_SLOT_SIZE — every params struct
     // fits in one slot, and the dynamic offset selects which slot.
+    #[allow(
+        clippy::unwrap_used,
+        reason = "UNIFORM_SLOT_SIZE is a non-zero compile-time constant"
+    )]
     let ubo_size = NonZeroU64::new(UNIFORM_SLOT_SIZE).unwrap();
     let ubo = || {
         wgpu::BindingResource::Buffer(wgpu::BufferBinding {

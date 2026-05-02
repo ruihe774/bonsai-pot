@@ -1,6 +1,9 @@
-#![allow(clippy::panic)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::panic,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "demo"
+)]
 
 //! Demo CLI for `bonsai-pot`.
 //!
@@ -16,7 +19,7 @@
 
 use std::env;
 use std::fmt::Display;
-use std::io::{stdin, stdout, Read, Write};
+use std::io::{stdin, stdout, Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;

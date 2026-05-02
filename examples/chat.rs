@@ -1,6 +1,9 @@
-#![allow(clippy::panic)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::panic,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "demo"
+)]
 
 //! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
@@ -26,7 +29,7 @@
 
 use std::env;
 use std::fmt::Display;
-use std::io::{stdin, stdout, Write};
+use std::io::{stdin, stdout, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::str::FromStr;

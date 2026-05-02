@@ -1445,7 +1445,13 @@ fn matmul_q1_0(
 // =========================================================================
 
 #[cfg(feature = "bench-internals")]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    reason = "internal"
+)]
 pub mod bench_internals {
+    use std::cmp::Ordering;
     use std::time::Instant;
 
     use wgpu::PollType;
@@ -1457,14 +1463,6 @@ pub mod bench_internals {
     };
     use crate::error::PotError;
 
-    /// Match `llama-bench` style: pp{n} measures batched-prefill throughput;
-    /// tg{n} measures single-token generation throughput.
-    ///
-    /// # Errors
-    /// Returns an error if any prefill or step call fails (e.g. buffer-mapping).
-    ///
-    /// # Panics
-    /// Panics if `device.poll` returns an error.
     pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let cfg = &model.cfg;
         eprintln!("--- bench: pp={pp_n}, tg={tg_n}, repeats={repeats} (after 1 warmup) ---");
@@ -1534,7 +1532,6 @@ pub mod bench_internals {
         var.sqrt()
     }
 
-    #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
     pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
         type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
 
@@ -1885,7 +1882,7 @@ pub mod bench_internals {
         sorted.sort_by(|a, b| {
             let ma = a.1 as f32 * a.2;
             let mb = b.1 as f32 * b.2;
-            mb.partial_cmp(&ma).unwrap()
+            mb.partial_cmp(&ma).unwrap_or(Ordering::Equal)
         });
         for (label, calls, per_us) in &sorted {
             let ms_step = (*calls as f32) * (*per_us) / 1000.0;

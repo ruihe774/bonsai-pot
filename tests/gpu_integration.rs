@@ -8,6 +8,7 @@ fn model_dir() -> PathBuf {
     env::var_os("BONSAI_POT_MODEL_DIR").map_or_else(|| PathBuf::from("./model"), PathBuf::from)
 }
 
+#[allow(clippy::panic, reason = "test helper")]
 fn load_model() -> Model {
     let dir = model_dir();
     pollster::block_on(Model::load(&dir))
