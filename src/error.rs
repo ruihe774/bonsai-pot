@@ -7,7 +7,6 @@ use std::result::Result as StdResult;
 #[derive(Debug)]
 pub enum PotError {
     Io { path: PathBuf, source: io::Error },
-    ConfigParse(serde_json::Error),
     MissingTensor(String),
     Vocab(&'static str),
     NoAdapter,
@@ -22,12 +21,11 @@ pub enum PotError {
 impl Display for PotError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         use PotError::{
-            BufferMap, Config, ConfigParse, ContextOverflow, DeviceRequest, FeatureUnsupported, Io,
+            BufferMap, Config, ContextOverflow, DeviceRequest, FeatureUnsupported, Io,
             MissingTensor, NoAdapter, PrefillTooLarge, Vocab,
         };
         match self {
             Io { path, source } => write!(f, "io error reading {}: {}", path.display(), source),
-            ConfigParse(e) => write!(f, "failed to parse config.json: {e}"),
             MissingTensor(name) => write!(f, "missing tensor in manifest: {name}"),
             Vocab(msg) => write!(f, "vocab.bin / vocab_offsets.bin: {msg}"),
             NoAdapter => write!(f, "no compatible GPU adapter found"),
@@ -52,16 +50,9 @@ impl Error for PotError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::ConfigParse(e) => Some(e),
             Self::DeviceRequest(e) => Some(e),
             _ => None,
         }
-    }
-}
-
-impl From<serde_json::Error> for PotError {
-    fn from(e: serde_json::Error) -> Self {
-        Self::ConfigParse(e)
     }
 }
 
@@ -91,11 +82,9 @@ mod tests {
     #[test]
     fn display_each_variant() {
         assert!(make_io_error().to_string().contains("/tmp/fake"));
-        assert!(
-            PotError::ConfigParse(serde_json::from_str::<u32>("bad").unwrap_err())
-                .to_string()
-                .contains("config.json")
-        );
+        assert!(PotError::Config("bad ini key")
+            .to_string()
+            .contains("bad ini key"));
         assert!(PotError::MissingTensor("foo.weight".into())
             .to_string()
             .contains("foo.weight"));
@@ -134,8 +123,6 @@ mod tests {
     #[test]
     fn source_present_for_wrapped() {
         assert!(make_io_error().source().is_some());
-        let cfg_err = PotError::ConfigParse(serde_json::from_str::<u32>("bad").unwrap_err());
-        assert!(cfg_err.source().is_some());
 
         assert!(PotError::MissingTensor("x".into()).source().is_none());
         assert!(PotError::Vocab("x").source().is_none());
@@ -155,12 +142,5 @@ mod tests {
             .source()
             .is_none());
         assert!(PotError::Config("x").source().is_none());
-    }
-
-    #[test]
-    fn from_serde_json_error_produces_config_parse() {
-        let e: serde_json::Error = serde_json::from_str::<u32>("not-json").unwrap_err();
-        let pot: PotError = e.into();
-        assert!(matches!(pot, PotError::ConfigParse(_)));
     }
 }

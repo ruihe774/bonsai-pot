@@ -32,7 +32,7 @@ cargo run --release --features bench-internals -- ./model --mode bench --pp 512 
 cargo run --release --features bench-internals -- ./model --mode microbench
 ```
 
-`<model_dir>` is the output of `scripts/extract.py` (default `./model`). It must contain `config.json`, the five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and (for the tokenizer) `merges.txt`. The runtime no longer reads `prompt.bin`; prompts come in over stdin from `scripts/bpe.py`.
+`<model_dir>` is the output of `scripts/extract.py` (default `./model`). It must contain `config.ini`, the five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and (for the tokenizer) `merges.txt`. The runtime no longer reads `prompt.bin`; prompts come in over stdin from `scripts/bpe.py`.
 
 Tests live in `tests/gpu_integration.rs` (end-to-end on a real GPU against `./model`) plus unit tests in `src/session.rs` (CPU sampler) and `src/kv_snapshot.rs` (header round-trips). Run with `cargo test --release`. Beyond that, `--mode gen` / `--mode prompt` plus parity diffs against captured baselines (and `examples/chat.rs`) are the correctness harness.
 
@@ -53,7 +53,7 @@ uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
 
 Both Python scripts use [PEP 723 inline metadata](https://peps.python.org/pep-0723/) — `uv run` reads the dependency block at the top of each script and runs it in an isolated env. No virtualenv setup or `pip install` needed; just have `uv` on `$PATH`.
 
-`scripts/extract.py` writes weights / vocab / `merges.txt` / `config.json`. It does **not** encode prompts. To encode a prompt:
+`scripts/extract.py` writes weights / vocab / `merges.txt` / `config.ini`. It does **not** encode prompts. To encode a prompt:
 
 ```
 uv run scripts/bpe.py ./model "Once upon a time" --out ./model/prompt.bin
@@ -83,7 +83,7 @@ uv run scripts/bpe.py ./model "Once upon a time" | cargo run ...
 
 ### Q1_0 weight format and the multiply-free matvec
 
-Q1_0 stores 128 weights per block as 16 bytes of sign bits (+1/-1 per weight) + a 2-byte FP16 scale `d` — 18 bytes per block. `scripts/extract.py` splits each Q1_0 tensor into a contiguous **d-array** (FP16 scales) followed by a **qs-array** (raw 16-byte sign blocks); the manifest in `config.json` records `d_offset`, `qs_offset`, and `nb` (blocks per row) for every tensor. Both halves are u32-aligned — all WGSL reads are word loads.
+Q1_0 stores 128 weights per block as 16 bytes of sign bits (+1/-1 per weight) + a 2-byte FP16 scale `d` — 18 bytes per block. `scripts/extract.py` splits each Q1_0 tensor into a contiguous **d-array** (FP16 scales) followed by a **qs-array** (raw 16-byte sign blocks); the manifest in `config.ini` records `d_offset`, `qs_offset`, and `nb` (blocks per row) for every tensor. Both halves are u32-aligned — all WGSL reads are word loads.
 
 The hot-path kernel `shaders/matvec_q1_0.wgsl` therefore needs **no multiplications inside the inner loop** — it accumulates `±x` per weight via `select(-xv, xv, bit_set)` and only multiplies by `d` once per block. `matvec_q1_0_fused.wgsl` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup to amortize x-load cost.
 
@@ -171,7 +171,7 @@ Since embed runs before topk_reduce in any step, the two roles never alias. `buf
 ## When making changes
 
 - **Adding a new kernel**: write `shaders/foo.wgsl`, add a `FooParams` struct (≤ 64 bytes, `Pod + Zeroable + repr(C)`) in `model.rs`, register a BGL in `BindGroupLayouts` (single-rw discipline above), build a pipeline in `Pipelines`. Then add a `dispatch_foo` (in-pass) helper in `forward.rs` and slot it into the layer pipeline.
-- **Modifying weight layout**: changes to Q1_0 packing or to the grouping of tensors into the 5 buffers must be made in **both** `scripts/extract.py` (writer) and `model.rs` / shaders (reader), and the manifest format in `config.json` will need to round-trip. Re-extract the model dir after any layout change.
+- **Modifying weight layout**: changes to Q1_0 packing or to the grouping of tensors into the 5 buffers must be made in **both** `scripts/extract.py` (writer) and `model.rs` / shaders (reader), and the manifest format in `config.ini` will need to round-trip. Re-extract the model dir after any layout change.
 - **Modifying the tokenizer / pretok regex**: changes to vocab encoding must be made in **both** `scripts/extract.py` (which writes `vocab.bin` + `merges.txt`) and `scripts/bpe.py` (which encodes prompts) and possibly `src/decode.rs` (which inverts the byte-level mapping). The Rust runtime never tokenizes, only decodes.
 - **Public API changes**: re-exports live in `src/lib.rs`. Anything not re-exported there is internal and may change without notice; keep `Model`, `ModelConfig`, `ModelOptions`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `KvSnapshot`, `PotError`, `Result`, `TOPK_MAX` stable.
 - **Perf work**: use `--mode microbench` for per-kernel deltas; use `--mode bench` (specifically `tg{N}` and `pp{N}`) for end-to-end. Most tg time is in matvec dispatches (LM head, ffn_down, attn_output, fused QKV, fused gate-up) plus rms_norm (which adds up across 73 calls/step); `topk_reduce` and LM head are each ~0.4–0.6 ms/step on 4B. Attention, silu, rope are minor. Recent commits document the wins from multi-row matvec, fused QKV/gate-up, single-pass-per-phase, flash-attn online softmax, and (in earlier history) pipelined generation — keep these intact when refactoring.

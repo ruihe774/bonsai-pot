@@ -14,7 +14,6 @@ use std::str::from_utf8;
 
 use bytemuck::{cast_slice, Pod, Zeroable};
 use futures_intrusive::channel::shared::oneshot_channel;
-use serde::Deserialize;
 use wgpu::util::DeviceExt;
 
 use crate::decode;
@@ -23,24 +22,21 @@ use crate::error::{PotError, Result};
 // ----- config & manifest ----------------------------------------------------
 
 #[allow(dead_code)]
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct TensorEntry {
     pub dtype: String,
     pub shape: Vec<u64>,
     pub buffer: String,
     pub offset: u64,
     pub length: u64,
-    #[serde(default)]
     pub d_offset: u64,
-    #[serde(default)]
     pub qs_offset: u64,
-    #[serde(default)]
     pub nb: u64,
 }
 
-/// Internal config: the full struct deserialized from `config.json`.
+/// Internal config: the full struct deserialized from `config.ini`.
 #[allow(dead_code)]
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct ConfigRaw {
     pub n_layer: u32,
     pub n_embd: u32,
@@ -511,6 +507,93 @@ impl Default for ModelOptions {
     }
 }
 
+fn parse_config_ini(text: &str) -> Config {
+    let mut globals: HashMap<&str, &str> = HashMap::new();
+    let mut manifest: HashMap<String, TensorEntry> = HashMap::new();
+    let mut cur_section: Option<&str> = None;
+    let mut cur_fields: HashMap<&str, &str> = HashMap::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if let Some(sec) = cur_section {
+                let g = &cur_fields;
+                let shape = g["shape"]
+                    .split(',')
+                    .map(|s| s.parse::<u64>().unwrap())
+                    .collect();
+                manifest.insert(
+                    sec.to_string(),
+                    TensorEntry {
+                        dtype: g["dtype"].to_string(),
+                        shape,
+                        buffer: g["buffer"].to_string(),
+                        offset: g["offset"].parse().unwrap(),
+                        length: g["length"].parse().unwrap(),
+                        d_offset: g.get("d_offset").map_or(0, |v| v.parse().unwrap()),
+                        qs_offset: g.get("qs_offset").map_or(0, |v| v.parse().unwrap()),
+                        nb: g.get("nb").map_or(0, |v| v.parse().unwrap()),
+                    },
+                );
+                cur_fields.clear();
+            }
+            cur_section = Some(name);
+        } else if let Some((k, v)) = line.split_once(" = ") {
+            if cur_section.is_some() {
+                cur_fields.insert(k, v);
+            } else {
+                globals.insert(k, v);
+            }
+        }
+    }
+    if let Some(sec) = cur_section {
+        let g = &cur_fields;
+        let shape = g["shape"]
+            .split(',')
+            .map(|s| s.parse::<u64>().unwrap())
+            .collect();
+        manifest.insert(
+            sec.to_string(),
+            TensorEntry {
+                dtype: g["dtype"].to_string(),
+                shape,
+                buffer: g["buffer"].to_string(),
+                offset: g["offset"].parse().unwrap(),
+                length: g["length"].parse().unwrap(),
+                d_offset: g.get("d_offset").map_or(0, |v| v.parse().unwrap()),
+                qs_offset: g.get("qs_offset").map_or(0, |v| v.parse().unwrap()),
+                nb: g.get("nb").map_or(0, |v| v.parse().unwrap()),
+            },
+        );
+    }
+
+    let g = &globals;
+    ConfigRaw {
+        n_layer: g["n_layer"].parse().unwrap(),
+        n_embd: g["n_embd"].parse().unwrap(),
+        n_ff: g["n_ff"].parse().unwrap(),
+        n_head: g["n_head"].parse().unwrap(),
+        n_kv_head: g["n_kv_head"].parse().unwrap(),
+        head_dim: g["head_dim"].parse().unwrap(),
+        rope_freq_base: g["rope_freq_base"].parse().unwrap(),
+        rms_eps: g["rms_eps"].parse().unwrap(),
+        n_vocab: g["n_vocab"].parse().unwrap(),
+        eos_token_id: g["eos_token_id"].parse().unwrap(),
+        padding_token_id: g["padding_token_id"].parse().unwrap(),
+        add_bos: g["add_bos"] == "true",
+        context_length: g["context_length"].parse().unwrap(),
+        rope_orig_context: g["rope_orig_context"].parse().unwrap(),
+        n_kv_groups: g["n_kv_groups"].parse().unwrap(),
+        q_dim: g["q_dim"].parse().unwrap(),
+        kv_dim: g["kv_dim"].parse().unwrap(),
+        tied_embeddings: g["tied_embeddings"] == "true",
+        manifest,
+    }
+}
+
 impl Model {
     /// Load weights with default options. Equivalent to
     /// [`Model::load_with_options`] with `ModelOptions::default()`.
@@ -564,12 +647,12 @@ impl Model {
         if opts.max_seq == 0 {
             return Err(PotError::Config("max_seq must be > 0"));
         }
-        let cfg_path = model_dir.join("config.json");
+        let cfg_path = model_dir.join("config.ini");
         let cfg_text = read_to_string(&cfg_path).map_err(|e| PotError::Io {
             path: cfg_path.clone(),
             source: e,
         })?;
-        let cfg: Config = serde_json::from_str(&cfg_text)?;
+        let cfg = parse_config_ini(&cfg_text);
         let public_cfg = ModelConfig::from_raw(&cfg);
 
         // ---- wgpu init ------------------------------------------------------

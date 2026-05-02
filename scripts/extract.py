@@ -15,7 +15,7 @@
 Extract a Bonsai (Qwen3-family) Q1_0 GGUF into a flat directory the Rust runtime can load.
 
 Output layout (under --out, default ./model):
-  config.json       hyperparams + tensor manifest (offsets & shapes within
+  config.ini        hyperparams + tensor manifest (offsets & shapes within
                     the 5 grouped weight buffers)
   weights_attn.bin
   weights_ffn_gate_up.bin
@@ -41,7 +41,7 @@ Usage:
   uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
   uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
 """
-import argparse, json, os, struct
+import argparse, os, struct
 import gguf
 import numpy as np
 
@@ -86,7 +86,7 @@ def main():
     cfg["q_dim"]  = cfg["n_head"] * cfg["head_dim"]
     cfg["kv_dim"] = cfg["n_kv_head"] * cfg["head_dim"]
 
-    print("config:", json.dumps(cfg, indent=2))
+    print("config:", cfg)
 
     # ---- index tensors by name -----------------------------------------------
     by_name = {t.name: t for t in r.tensors}
@@ -218,9 +218,18 @@ def main():
                 f.write("\n")
 
     # ---- final config -------------------------------------------------------
-    cfg["manifest"] = manifest["tensors"]
-    with open(os.path.join(args.out, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+    def _ini_fmt(v):
+        if isinstance(v, bool): return "true" if v else "false"
+        if isinstance(v, list): return ",".join(str(x) for x in v)
+        return str(v)
+
+    with open(os.path.join(args.out, "config.ini"), "w") as f:
+        for k, v in cfg.items():
+            f.write(f"{k} = {_ini_fmt(v)}\n")
+        for name, entry in manifest["tensors"].items():
+            f.write(f"\n[{name}]\n")
+            for k, v in entry.items():
+                f.write(f"{k} = {_ini_fmt(v)}\n")
 
     sizes = {os.path.basename(p): os.path.getsize(os.path.join(args.out, p))
              for p in os.listdir(args.out) if p.endswith(".bin")}

@@ -236,7 +236,7 @@ fn main() {
         // Prefill the system prompt once with the fast batched-matmul path
         // (requires pos == 0), then snapshot the KV state. /reset restores
         // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
-        let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system,);
+        let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system);
         let system_tokens = tokenize(&args.bpe, &args.model_dir, &system_segment);
         eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
         sess.prefill(&system_tokens, &sampler)
@@ -246,7 +246,7 @@ fn main() {
 
         let mut turn: u32 = 0;
 
-        eprintln!("ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).",);
+        eprintln!("ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).");
 
         loop {
             write!(stdout, "\nYou: ").ok();
