@@ -24,39 +24,39 @@ use crate::error::{PotError, Result};
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TensorEntry {
-    pub dtype: String,
-    pub shape: Vec<u64>,
-    pub buffer: String,
-    pub offset: u64,
-    pub length: u64,
-    pub d_offset: u64,
-    pub qs_offset: u64,
-    pub nb: u64,
+    pub(crate) dtype: String,
+    pub(crate) shape: Vec<u64>,
+    pub(crate) buffer: String,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) d_offset: u64,
+    pub(crate) qs_offset: u64,
+    pub(crate) nb: u64,
 }
 
 /// Internal config: the full struct deserialized from `config.ini`.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ConfigRaw {
-    pub n_layer: u32,
-    pub n_embd: u32,
-    pub n_ff: u32,
-    pub n_head: u32,
-    pub n_kv_head: u32,
-    pub head_dim: u32,
-    pub rope_freq_base: f32,
-    pub rms_eps: f32,
-    pub n_vocab: u32,
-    pub eos_token_id: u32,
-    pub padding_token_id: u32,
-    pub add_bos: bool,
-    pub context_length: u32,
-    pub rope_orig_context: u32,
-    pub n_kv_groups: u32,
-    pub q_dim: u32,
-    pub kv_dim: u32,
-    pub tied_embeddings: bool,
-    pub manifest: HashMap<String, TensorEntry>,
+    pub(crate) n_layer: u32,
+    pub(crate) n_embd: u32,
+    pub(crate) n_ff: u32,
+    pub(crate) n_head: u32,
+    pub(crate) n_kv_head: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) rope_freq_base: f32,
+    pub(crate) rms_eps: f32,
+    pub(crate) n_vocab: u32,
+    pub(crate) eos_token_id: u32,
+    pub(crate) padding_token_id: u32,
+    pub(crate) add_bos: bool,
+    pub(crate) context_length: u32,
+    pub(crate) rope_orig_context: u32,
+    pub(crate) n_kv_groups: u32,
+    pub(crate) q_dim: u32,
+    pub(crate) kv_dim: u32,
+    pub(crate) tied_embeddings: bool,
+    pub(crate) manifest: HashMap<String, TensorEntry>,
 }
 
 // Internal alias for the full config — most code uses this name and reaches the
@@ -103,175 +103,175 @@ impl ModelConfig {
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct EmbedParams {
-    pub k: u32,
-    pub d_offset: u32,
-    pub qs_offset: u32,
-    pub output_offset: u32,
-    pub sample_offset: u32,
-    pub _p0: u32,
-    pub _p1: u32,
-    pub _p2: u32,
+    pub(crate) k: u32,
+    pub(crate) d_offset: u32,
+    pub(crate) qs_offset: u32,
+    pub(crate) output_offset: u32,
+    pub(crate) sample_offset: u32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
+    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct RmsNormParams {
-    pub group_size: u32,
-    pub n_groups: u32,
-    pub input_offset: u32,
-    pub output_offset: u32,
-    pub weight_offset: u32,
-    pub eps: f32,
-    pub _p0: u32,
-    pub _p1: u32,
+    pub(crate) group_size: u32,
+    pub(crate) n_groups: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) output_offset: u32,
+    pub(crate) weight_offset: u32,
+    pub(crate) eps: f32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct RopeParams {
-    pub head_dim: u32,
-    pub n_heads: u32,
-    pub n_tokens: u32,
-    pub pos_base: u32,
-    pub data_offset: u32,
-    pub _p0: u32,
-    pub _p1: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) n_heads: u32,
+    pub(crate) n_tokens: u32,
+    pub(crate) pos_base: u32,
+    pub(crate) data_offset: u32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct MatvecParams {
-    pub k: u32,
-    pub n: u32,
-    pub d_offset: u32,
-    pub qs_offset: u32,
-    pub input_offset: u32,
-    pub output_offset: u32,
-    pub accumulate: u32,
-    pub dispatch_x_dim: u32,
+    pub(crate) k: u32,
+    pub(crate) n: u32,
+    pub(crate) d_offset: u32,
+    pub(crate) qs_offset: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) output_offset: u32,
+    pub(crate) accumulate: u32,
+    pub(crate) dispatch_x_dim: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct MatvecFusedParams {
-    pub k: u32,
-    pub n_total: u32,
-    pub input_offset: u32,
-    pub dispatch_x_dim: u32,
-    pub d_offset_0: u32,
-    pub qs_offset_0: u32,
-    pub n_0: u32,
-    pub output_offset_0: u32,
-    pub d_offset_1: u32,
-    pub qs_offset_1: u32,
-    pub n_1: u32,
-    pub output_offset_1: u32,
-    pub d_offset_2: u32,
-    pub qs_offset_2: u32,
-    pub n_2: u32,
-    pub output_offset_2: u32,
+    pub(crate) k: u32,
+    pub(crate) n_total: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) dispatch_x_dim: u32,
+    pub(crate) d_offset_0: u32,
+    pub(crate) qs_offset_0: u32,
+    pub(crate) n_0: u32,
+    pub(crate) output_offset_0: u32,
+    pub(crate) d_offset_1: u32,
+    pub(crate) qs_offset_1: u32,
+    pub(crate) n_1: u32,
+    pub(crate) output_offset_1: u32,
+    pub(crate) d_offset_2: u32,
+    pub(crate) qs_offset_2: u32,
+    pub(crate) n_2: u32,
+    pub(crate) output_offset_2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct QuantParams {
-    pub k: u32,
-    pub m: u32,
-    pub input_offset: u32,
-    pub d_offset: u32,
-    pub qs_offset: u32,
-    pub dispatch_x_dim: u32,
-    pub _p1: u32,
-    pub _p2: u32,
+    pub(crate) k: u32,
+    pub(crate) m: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) d_offset: u32,
+    pub(crate) qs_offset: u32,
+    pub(crate) dispatch_x_dim: u32,
+    pub(crate) _p1: u32,
+    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct MatmulParams {
-    pub k: u32,
-    pub n: u32,
-    pub m: u32,
-    pub w_d_offset: u32,
-    pub w_qs_offset: u32,
-    pub a_d_offset: u32,
-    pub a_qs_offset: u32,
-    pub out_offset: u32,
-    pub accumulate: u32,
-    pub _p0: u32,
-    pub _p1: u32,
-    pub _p2: u32,
+    pub(crate) k: u32,
+    pub(crate) n: u32,
+    pub(crate) m: u32,
+    pub(crate) w_d_offset: u32,
+    pub(crate) w_qs_offset: u32,
+    pub(crate) a_d_offset: u32,
+    pub(crate) a_qs_offset: u32,
+    pub(crate) out_offset: u32,
+    pub(crate) accumulate: u32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
+    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct AttnParams {
-    pub head_dim: u32,
-    pub n_head: u32,
-    pub n_kv_head: u32,
-    pub pos: u32,
-    pub kv_stride: u32,
-    pub q_offset: u32,
-    pub k_d_word_offset: u32,
-    pub k_qs_byte_offset: u32,
-    pub v_d_word_offset: u32,
-    pub v_qs_byte_offset: u32,
-    pub out_offset: u32,
-    pub scale: f32,
-    pub m_tokens: u32,
-    pub is_prefill: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) n_head: u32,
+    pub(crate) n_kv_head: u32,
+    pub(crate) pos: u32,
+    pub(crate) kv_stride: u32,
+    pub(crate) q_offset: u32,
+    pub(crate) k_d_word_offset: u32,
+    pub(crate) k_qs_byte_offset: u32,
+    pub(crate) v_d_word_offset: u32,
+    pub(crate) v_qs_byte_offset: u32,
+    pub(crate) out_offset: u32,
+    pub(crate) scale: f32,
+    pub(crate) m_tokens: u32,
+    pub(crate) is_prefill: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct AttnSplitParams {
-    pub head_dim: u32,
-    pub n_head: u32,
-    pub n_kv_head: u32,
-    pub pos: u32,
-    pub kv_stride: u32,
-    pub q_offset: u32,
-    pub k_d_word_offset: u32,
-    pub k_qs_byte_offset: u32,
-    pub v_d_word_offset: u32,
-    pub v_qs_byte_offset: u32,
-    pub n_chunks_active: u32,
-    pub scale: f32,
+    pub(crate) head_dim: u32,
+    pub(crate) n_head: u32,
+    pub(crate) n_kv_head: u32,
+    pub(crate) pos: u32,
+    pub(crate) kv_stride: u32,
+    pub(crate) q_offset: u32,
+    pub(crate) k_d_word_offset: u32,
+    pub(crate) k_qs_byte_offset: u32,
+    pub(crate) v_d_word_offset: u32,
+    pub(crate) v_qs_byte_offset: u32,
+    pub(crate) n_chunks_active: u32,
+    pub(crate) scale: f32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct AttnMergeParams {
-    pub head_dim: u32,
-    pub n_head: u32,
-    pub out_offset: u32,
-    pub n_chunks_active: u32,
-    pub _p0: u32,
-    pub _p1: u32,
-    pub _p2: u32,
-    pub _p3: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) n_head: u32,
+    pub(crate) out_offset: u32,
+    pub(crate) n_chunks_active: u32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
+    pub(crate) _p2: u32,
+    pub(crate) _p3: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct SiluMulParams {
-    pub n: u32,
-    pub m: u32,
-    pub gate_offset: u32,
-    pub up_offset: u32,
-    pub out_offset: u32,
-    pub dispatch_x_count: u32,
-    pub _p1: u32,
-    pub _p2: u32,
+    pub(crate) n: u32,
+    pub(crate) m: u32,
+    pub(crate) gate_offset: u32,
+    pub(crate) up_offset: u32,
+    pub(crate) out_offset: u32,
+    pub(crate) dispatch_x_count: u32,
+    pub(crate) _p1: u32,
+    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct TopKParams {
-    pub n: u32,
-    pub in_offset: u32,
-    pub out_offset: u32,
-    pub k: u32,
+    pub(crate) n: u32,
+    pub(crate) in_offset: u32,
+    pub(crate) out_offset: u32,
+    pub(crate) k: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct KvWritebackParams {
-    pub k_cur_off: u32,          // f16 element offset in act
-    pub v_cur_off: u32,          // f16 element offset in act
-    pub dst_d_word_offset: u32,  // u32-word offset into kv_{k,v} (FP32 d-section, layer base)
-    pub dst_qs_byte_offset: u32, // byte offset into kv_{k,v} (qs-section, layer base)
-    pub pos_base: u32,           // first absolute cache position to write into
-    pub nb_per_row: u32,         // kv_dim / 32
-    pub kv_dim: u32,
-    pub dispatch_x_dim: u32,
+    pub(crate) k_cur_off: u32,          // f16 element offset in act
+    pub(crate) v_cur_off: u32,          // f16 element offset in act
+    pub(crate) dst_d_word_offset: u32, // u32-word offset into kv_{k,v} (FP32 d-section, layer base)
+    pub(crate) dst_qs_byte_offset: u32, // byte offset into kv_{k,v} (qs-section, layer base)
+    pub(crate) pos_base: u32,          // first absolute cache position to write into
+    pub(crate) nb_per_row: u32,        // kv_dim / 32
+    pub(crate) kv_dim: u32,
+    pub(crate) dispatch_x_dim: u32,
 }
 
 // All of these <= 64 bytes; we pack each into a 256-byte uniform slot.
@@ -287,17 +287,17 @@ pub const TOPK_MAX: u32 = 32;
 /// match the shader-side `array<f16>` indexing — never bytes.
 #[derive(Copy, Clone, Debug)]
 pub struct ActLayout {
-    pub x: u32,
-    pub x_norm: u32,
-    pub q: u32,
-    pub k_cur: u32,
-    pub v_cur: u32,
-    pub attn_out: u32,
-    pub gate: u32,
-    pub up: u32,
-    pub ffn_in: u32,
-    pub logits: u32,
-    pub total_elems: u32,
+    pub(crate) x: u32,
+    pub(crate) x_norm: u32,
+    pub(crate) q: u32,
+    pub(crate) k_cur: u32,
+    pub(crate) v_cur: u32,
+    pub(crate) attn_out: u32,
+    pub(crate) gate: u32,
+    pub(crate) up: u32,
+    pub(crate) ffn_in: u32,
+    pub(crate) logits: u32,
+    pub(crate) total_elems: u32,
 }
 
 impl ActLayout {
@@ -337,51 +337,51 @@ impl ActLayout {
 // ----- the model ------------------------------------------------------------
 
 pub struct Pipelines {
-    pub embed: wgpu::ComputePipeline,
-    pub rms_norm: wgpu::ComputePipeline,
-    pub rope_neox: wgpu::ComputePipeline,
-    pub matvec: wgpu::ComputePipeline,
-    pub matvec_fused: wgpu::ComputePipeline,
-    pub quantize: wgpu::ComputePipeline,
-    pub matmul: wgpu::ComputePipeline,
-    pub attention: wgpu::ComputePipeline,
-    pub attention_split: wgpu::ComputePipeline,
-    pub attention_merge: wgpu::ComputePipeline,
-    pub silu_mul: wgpu::ComputePipeline,
-    pub topk_reduce: wgpu::ComputePipeline,
-    pub kv_writeback: wgpu::ComputePipeline,
+    pub(crate) embed: wgpu::ComputePipeline,
+    pub(crate) rms_norm: wgpu::ComputePipeline,
+    pub(crate) rope_neox: wgpu::ComputePipeline,
+    pub(crate) matvec: wgpu::ComputePipeline,
+    pub(crate) matvec_fused: wgpu::ComputePipeline,
+    pub(crate) quantize: wgpu::ComputePipeline,
+    pub(crate) matmul: wgpu::ComputePipeline,
+    pub(crate) attention: wgpu::ComputePipeline,
+    pub(crate) attention_split: wgpu::ComputePipeline,
+    pub(crate) attention_merge: wgpu::ComputePipeline,
+    pub(crate) silu_mul: wgpu::ComputePipeline,
+    pub(crate) topk_reduce: wgpu::ComputePipeline,
+    pub(crate) kv_writeback: wgpu::ComputePipeline,
 }
 
 pub struct Buffers {
-    pub w_attn: wgpu::Buffer,
-    pub w_ffn_gu: wgpu::Buffer,
-    pub w_ffn_d: wgpu::Buffer,
-    pub w_norms: wgpu::Buffer,
-    pub w_embed: wgpu::Buffer,
-    pub kv_k: wgpu::Buffer,
-    pub kv_v: wgpu::Buffer,
-    pub act: wgpu::Buffer,           // f16 activations
-    pub act_q8: wgpu::Buffer,        // Q8_0 activations (raw u32 buffer)
-    pub attn_partials: wgpu::Buffer, // f32 partials for split-K attention
-    pub rope_table: wgpu::Buffer,
-    pub uniform: wgpu::Buffer,  // pool of 256-byte slots
-    pub sample: wgpu::Buffer,   // u32 storage: input token id @ [0..M], topk output @ [0..2K]
-    pub readback: wgpu::Buffer, // u32 readback (mappable)
+    pub(crate) w_attn: wgpu::Buffer,
+    pub(crate) w_ffn_gu: wgpu::Buffer,
+    pub(crate) w_ffn_d: wgpu::Buffer,
+    pub(crate) w_norms: wgpu::Buffer,
+    pub(crate) w_embed: wgpu::Buffer,
+    pub(crate) kv_k: wgpu::Buffer,
+    pub(crate) kv_v: wgpu::Buffer,
+    pub(crate) act: wgpu::Buffer,           // f16 activations
+    pub(crate) act_q8: wgpu::Buffer,        // Q8_0 activations (raw u32 buffer)
+    pub(crate) attn_partials: wgpu::Buffer, // f32 partials for split-K attention
+    pub(crate) rope_table: wgpu::Buffer,
+    pub(crate) uniform: wgpu::Buffer,  // pool of 256-byte slots
+    pub(crate) sample: wgpu::Buffer, // u32 storage: input token id @ [0..M], topk output @ [0..2K]
+    pub(crate) readback: wgpu::Buffer, // u32 readback (mappable)
 }
 
 pub struct BindGroupLayouts {
-    pub embed: wgpu::BindGroupLayout,
-    pub rms_norm: wgpu::BindGroupLayout,
-    pub rope: wgpu::BindGroupLayout,
-    pub matvec: wgpu::BindGroupLayout,
-    pub quantize: wgpu::BindGroupLayout,
-    pub matmul: wgpu::BindGroupLayout,
-    pub attn: wgpu::BindGroupLayout,
-    pub attn_split: wgpu::BindGroupLayout,
-    pub attn_merge: wgpu::BindGroupLayout,
-    pub silu_mul: wgpu::BindGroupLayout,
-    pub topk_reduce: wgpu::BindGroupLayout,
-    pub kv_writeback: wgpu::BindGroupLayout,
+    pub(crate) embed: wgpu::BindGroupLayout,
+    pub(crate) rms_norm: wgpu::BindGroupLayout,
+    pub(crate) rope: wgpu::BindGroupLayout,
+    pub(crate) matvec: wgpu::BindGroupLayout,
+    pub(crate) quantize: wgpu::BindGroupLayout,
+    pub(crate) matmul: wgpu::BindGroupLayout,
+    pub(crate) attn: wgpu::BindGroupLayout,
+    pub(crate) attn_split: wgpu::BindGroupLayout,
+    pub(crate) attn_merge: wgpu::BindGroupLayout,
+    pub(crate) silu_mul: wgpu::BindGroupLayout,
+    pub(crate) topk_reduce: wgpu::BindGroupLayout,
+    pub(crate) kv_writeback: wgpu::BindGroupLayout,
 }
 
 /// Pre-built bind groups indexed by (BGL kind, weight buffer). The UBO binding
@@ -390,24 +390,24 @@ pub struct BindGroupLayouts {
 /// the per-dispatch params structs. One BG per (kind, weight buffer) is reused
 /// across every dispatch of that kind in a step.
 pub struct CachedBindGroups {
-    pub embed: wgpu::BindGroup,           // (uniform, w_embed, act, sample)
-    pub rms_norm: wgpu::BindGroup,        // (uniform, act, w_norms)
-    pub rope: wgpu::BindGroup,            // (uniform, rope_table, act)
-    pub matvec_w_attn: wgpu::BindGroup,   // (uniform, w_attn,   act)
-    pub matvec_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act)
-    pub matvec_w_ffn_d: wgpu::BindGroup,  // (uniform, w_ffn_d,  act)
-    pub matvec_w_embed: wgpu::BindGroup,  // (uniform, w_embed,  act) — LM head
-    pub quantize: wgpu::BindGroup,        // (uniform, act, act_q8)
-    pub matmul_w_attn: wgpu::BindGroup,   // (uniform, w_attn,   act_q8, act)
-    pub matmul_w_ffn_gu: wgpu::BindGroup,
-    pub matmul_w_ffn_d: wgpu::BindGroup,
-    pub matmul_w_embed: wgpu::BindGroup,
-    pub attn: wgpu::BindGroup,         // (uniform, act, kv_k, kv_v)
-    pub attn_split: wgpu::BindGroup,   // (uniform, act, kv_k, kv_v, attn_partials)
-    pub attn_merge: wgpu::BindGroup,   // (uniform, act, attn_partials)
-    pub silu_mul: wgpu::BindGroup,     // (uniform, act)
-    pub topk_reduce: wgpu::BindGroup,  // (uniform, act, sample)
-    pub kv_writeback: wgpu::BindGroup, // (uniform, act, kv_k, kv_v)
+    pub(crate) embed: wgpu::BindGroup, // (uniform, w_embed, act, sample)
+    pub(crate) rms_norm: wgpu::BindGroup, // (uniform, act, w_norms)
+    pub(crate) rope: wgpu::BindGroup,  // (uniform, rope_table, act)
+    pub(crate) matvec_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act)
+    pub(crate) matvec_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act)
+    pub(crate) matvec_w_ffn_d: wgpu::BindGroup, // (uniform, w_ffn_d,  act)
+    pub(crate) matvec_w_embed: wgpu::BindGroup, // (uniform, w_embed,  act) — LM head
+    pub(crate) quantize: wgpu::BindGroup, // (uniform, act, act_q8)
+    pub(crate) matmul_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act_q8, act)
+    pub(crate) matmul_w_ffn_gu: wgpu::BindGroup,
+    pub(crate) matmul_w_ffn_d: wgpu::BindGroup,
+    pub(crate) matmul_w_embed: wgpu::BindGroup,
+    pub(crate) attn: wgpu::BindGroup, // (uniform, act, kv_k, kv_v)
+    pub(crate) attn_split: wgpu::BindGroup, // (uniform, act, kv_k, kv_v, attn_partials)
+    pub(crate) attn_merge: wgpu::BindGroup, // (uniform, act, attn_partials)
+    pub(crate) silu_mul: wgpu::BindGroup, // (uniform, act)
+    pub(crate) topk_reduce: wgpu::BindGroup, // (uniform, act, sample)
+    pub(crate) kv_writeback: wgpu::BindGroup, // (uniform, act, kv_k, kv_v)
 }
 
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
@@ -429,18 +429,18 @@ pub enum WeightSet {
 pub struct LayerTensors {
     // per-layer Q1_0 weights (d_offset, qs_offset) — values are byte offsets
     // into the corresponding weight buffer (w_attn / w_ffn_gu / w_ffn_d).
-    pub wq: (u32, u32),
-    pub wk: (u32, u32),
-    pub wv: (u32, u32),
-    pub wo: (u32, u32),
-    pub wg: (u32, u32), // ffn_gate
-    pub wu: (u32, u32), // ffn_up
-    pub wd: (u32, u32), // ffn_down
+    pub(crate) wq: (u32, u32),
+    pub(crate) wk: (u32, u32),
+    pub(crate) wv: (u32, u32),
+    pub(crate) wo: (u32, u32),
+    pub(crate) wg: (u32, u32), // ffn_gate
+    pub(crate) wu: (u32, u32), // ffn_up
+    pub(crate) wd: (u32, u32), // ffn_down
     // per-layer F16 norm element offsets (already divided by ACT_ELEM_BYTES)
-    pub attn_norm_off: u32,
-    pub attn_q_norm_off: u32,
-    pub attn_k_norm_off: u32,
-    pub ffn_norm_off: u32,
+    pub(crate) attn_norm_off: u32,
+    pub(crate) attn_q_norm_off: u32,
+    pub(crate) attn_k_norm_off: u32,
+    pub(crate) ffn_norm_off: u32,
 }
 
 /// Precomputed offsets for global / output-side tensors (LM head + `output_norm`).
@@ -452,11 +452,11 @@ pub struct LayerTensors {
 /// `weights_embed_lmhead.bin`.
 #[derive(Clone, Debug)]
 pub struct OutputTensors {
-    pub token_embd_d: u32,
-    pub token_embd_qs: u32,
-    pub lm_head_d: u32,
-    pub lm_head_qs: u32,
-    pub output_norm_off: u32,
+    pub(crate) token_embd_d: u32,
+    pub(crate) token_embd_qs: u32,
+    pub(crate) lm_head_d: u32,
+    pub(crate) lm_head_qs: u32,
+    pub(crate) output_norm_off: u32,
 }
 
 /// GPU-bearing handle to a loaded Bonsai model.
@@ -466,19 +466,19 @@ pub struct OutputTensors {
 /// but only one inference can run at a time because they share the
 /// activation/KV/sample buffers.
 pub struct Model {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub cfg: Config,
-    pub public_cfg: ModelConfig,
-    pub act_layout: ActLayout,
-    pub m_max: u32,
-    pub max_seq: u32,
-    pub buffers: Buffers,
-    pub pipes: Pipelines,
-    pub cached: CachedBindGroups,
-    pub layer_tensors: Vec<LayerTensors>,
-    pub output_tensors: OutputTensors,
-    pub vocab: Vec<String>,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) cfg: Config,
+    pub(crate) public_cfg: ModelConfig,
+    pub(crate) act_layout: ActLayout,
+    pub(crate) m_max: u32,
+    pub(crate) max_seq: u32,
+    pub(crate) buffers: Buffers,
+    pub(crate) pipes: Pipelines,
+    pub(crate) cached: CachedBindGroups,
+    pub(crate) layer_tensors: Vec<LayerTensors>,
+    pub(crate) output_tensors: OutputTensors,
+    pub(crate) vocab: Vec<String>,
 }
 
 const M_MAX: u32 = 512;

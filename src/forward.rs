@@ -93,8 +93,8 @@ impl UniformPool {
 
 pub struct StepEncoder<'a> {
     model: &'a Model,
-    pub encoder: wgpu::CommandEncoder,
-    pub uniforms: UniformPool,
+    pub(crate) encoder: wgpu::CommandEncoder,
+    pub(crate) uniforms: UniformPool,
 }
 
 impl<'a> StepEncoder<'a> {
