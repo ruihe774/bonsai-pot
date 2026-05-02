@@ -1,6 +1,6 @@
 # bonsai-pot
 
-A from-scratch, dependency-light **Bonsai-4B (Qwen3-architecture) Q1_0 inference engine** running on **wgpu compute shaders**.
+A from-scratch, dependency-light **Bonsai (Qwen3-architecture) Q1_0 inference engine** running on **wgpu compute shaders**. Supports the Bonsai 4B and 8B model sizes.
 
 The defining property of this engine: **weights are never dequantized**. Q1_0 storage is consumed directly by the matvec/matmul kernels — there is no intermediate FP16 weight tensor, no on-the-fly unpack into shared memory, nothing. Each weight contributes to the dot product as a single sign bit selecting `+x` or `-x`, with one FP16 multiply per 128-weight block to apply the block scale. The hot inner loop has **zero multiplications** — every accumulation is an add or a sign-flipped add.
 
@@ -20,11 +20,14 @@ Tokenization is intentionally outside the Rust crate.
 ## Building the model directory
 
 ```sh
-uv run scripts/extract.py path/to/Bonsai-4B.gguf --out ./model
+# 4B:
+uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
+# 8B:
+uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
 ```
 
-You can download Bonsai-4B.gguf from huggingface.
-This writes `config.json`, five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and `merges.txt`.
+Both model sizes are available on Hugging Face.
+This writes `config.ini`, five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and `merges.txt`.
 
 ## Build and run
 
@@ -65,7 +68,7 @@ Sampling is hybrid: a single-workgroup `topk_reduce.wgsl` kernel reduces the ful
 
 ### Q1_0: dequant-free, multiply-free
 
-Q1_0 stores 128 weights per block as 16 bytes of sign bits (±1 per weight) plus a 2-byte FP16 scale `d` — 18 bytes per block. `extract.py` splits each tensor into a contiguous **d-array** of FP16 scales followed by a **qs-array** of raw 16-byte sign blocks, both `u32`-aligned. The manifest in `config.json` records `d_offset`, `qs_offset`, and `nb` (blocks per row) per tensor.
+Q1_0 stores 128 weights per block as 16 bytes of sign bits (±1 per weight) plus a 2-byte FP16 scale `d` — 18 bytes per block. `extract.py` splits each tensor into a contiguous **d-array** of FP16 scales followed by a **qs-array** of raw 16-byte sign blocks, both `u32`-aligned. The manifest in `config.ini` records `d_offset`, `qs_offset`, and `nb` (blocks per row) per tensor.
 
 The shaders consume these two arrays **directly**:
 
@@ -74,14 +77,14 @@ The shaders consume these two arrays **directly**:
 
 ### Two execution paths
 
-1. **Single-token (matvec) path** — used for all of `--mode gen` and the generation phase of `--mode prompt`. The whole step (embed → 36 transformer layers → output_norm → LM head → topk) is encoded into a single compute pass.
+1. **Single-token (matvec) path** — used for all of `--mode gen` and the generation phase of `--mode prompt`. The whole step (embed → transformer layers → output_norm → LM head → topk) is encoded into a single compute pass.
 2. **Batched-prefill (matmul) path** — used by `Session::prefill` and `--mode prompt`. Activations are quantized to Q8_0 once per layer; weights stay in Q1_0.
 
-Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches every dispatch — embed, all 36 layers, output norm, LM head, and `topk_reduce` — into a single compute pass. Per-layer K/V is quantized to Q8_0 directly into the KV cache by a `kv_writeback` kernel, replacing the `copy_buffer_to_buffer` that used to break the pass.
+Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches every dispatch — embed, all layers, output norm, LM head, and `topk_reduce` — into a single compute pass. Per-layer K/V is quantized to Q8_0 directly into the KV cache by a `kv_writeback` kernel, replacing the `copy_buffer_to_buffer` that used to break the pass.
 
 ### GPU memory layout
 
-Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v` and stored in **Q8_0** (~2.25 bytes/element); per-step K/V is quantized straight into the cache, with no f16 staging copy. Capacity is set at load via `ModelOptions::max_seq` (default 1024; `--max-seq` on both the bin and the chat example). Bonsai-4B uses tied embeddings, so `token_embd.weight` serves as both the embedding table and the LM head.
+Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v` and stored in **Q8_0** (~2.25 bytes/element); per-step K/V is quantized straight into the cache, with no f16 staging copy. Capacity is set at load via `ModelOptions::max_seq` (default 1024; `--max-seq` on both the bin and the chat example). Bonsai 4B uses **tied** embeddings (`token_embd.weight` serves as both embed table and LM head); Bonsai 8B ships a separate `output.weight` tensor for the LM head.
 
 There is exactly one `uniform` buffer; every dispatch's params struct is appended to a CPU-side pool with a dynamic offset, and the whole pool is uploaded in one `write_buffer` per step.
 
