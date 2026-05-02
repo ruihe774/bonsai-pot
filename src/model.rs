@@ -1,4 +1,4 @@
-//! Bonsai-4B (Qwen3 architecture) `Q1_0` inference: model loading & GPU resource setup.
+//! Bonsai (Qwen3 architecture) `Q1_0` inference: model loading & GPU resource setup.
 //!
 //! All large weights live in 5 storage buffers organized by role; the activation
 //! workspace is a single f16 buffer with named regions plus a separate buffer for
@@ -599,10 +599,14 @@ impl Model {
         );
 
         let mut limits = adapter.limits();
+        // Floor at 300 MB so the largest grouped weight buffer (~510 MB at 8B) fits
+        // even on adapters whose wgpu defaults are below that. No upper cap — the
+        // KV cache for 8B at practical 32k ctx needs ~1.27 GB per buffer, so we
+        // rely on the adapter's natural max_buffer_size (typically 2–4 GB on desktop).
         limits.max_storage_buffer_binding_size = limits
             .max_storage_buffer_binding_size
-            .clamp(300 * 1024 * 1024, 1u64 << 30);
-        limits.max_buffer_size = limits.max_buffer_size.clamp(300 * 1024 * 1024, 1u64 << 30);
+            .max(300 * 1024 * 1024);
+        limits.max_buffer_size = limits.max_buffer_size.max(300 * 1024 * 1024);
         limits.max_storage_buffers_per_shader_stage =
             limits.max_storage_buffers_per_shader_stage.max(8);
 
@@ -683,6 +687,17 @@ impl Model {
         let kv_qs_total: u64 =
             u64::from(cfg.n_layer) * u64::from(opts.max_seq) * u64::from(cfg.kv_dim);
         let kv_total: u64 = kv_d_total + kv_qs_total;
+        {
+            let dl = device.limits();
+            let max_buf = dl.max_buffer_size;
+            let max_bind = dl.max_storage_buffer_binding_size;
+            if kv_total > max_buf || kv_total > max_bind {
+                return Err(PotError::Config(
+                    "KV cache exceeds adapter buffer/binding limit; \
+                     reduce --max-seq or use a GPU with larger storage buffers",
+                ));
+            }
+        }
         let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv_k"),
             size: kv_total,
@@ -779,13 +794,27 @@ impl Model {
         };
 
         // ---- shaders & pipelines -------------------------------------------
-        // `{{SG_SIZE}}` is substituted with the runtime subgroup size at load
-        // time; shaders that don't reference it get pass-through `replace`.
+        // `{{SG_SIZE}}` and `{{MAX_CHUNKS}}` are substituted with runtime values
+        // at load time; shaders that don't reference them get pass-through `replace`.
         let sg_size_str = sg_size.to_string();
+        let max_chunks = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
+        let max_chunks_str = max_chunks.to_string();
+
+        // Pre-flight: check the attention_merge LDS budget before shader compile.
+        // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs N_SG f32 slots.
+        let merge_lds_bytes = 4 * u64::from(max_chunks) + 4 * (64 / u64::from(sg_size));
+        if merge_lds_bytes > u64::from(device.limits().max_compute_workgroup_storage_size) {
+            return Err(PotError::Config(
+                "max_seq exceeds attention_merge LDS budget; reduce --max-seq",
+            ));
+        }
+
         macro_rules! load_shader {
             ($file:expr) => {{
                 let src: &str = include_str!(concat!("shaders/", $file));
-                let templated = src.replace("{{SG_SIZE}}", &sg_size_str);
+                let templated = src
+                    .replace("{{SG_SIZE}}", &sg_size_str)
+                    .replace("{{MAX_CHUNKS}}", &max_chunks_str);
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some($file),
                     source: wgpu::ShaderSource::Wgsl(templated.into()),

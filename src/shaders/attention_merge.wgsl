@@ -31,9 +31,9 @@ const WG: u32 = 64u;
 const N_SG: u32 = WG / SG_SIZE;
 const ELEMS_PER_THREAD: u32 = 2u;
 const PARTIAL_STRIDE: u32 = 130u;  // head_dim + 2
-// Cap on chunk count we keep weights for in shmem. n_chunks = ceil(pos/32);
-// 256 covers max_seq up to 8192, which exceeds the runtime's default 1024.
-const MAX_CHUNKS: u32 = 256u;
+// Cap on chunk count we keep weights for in shmem. n_chunks = ceil(pos/32).
+// Runtime-baked from opts.max_seq at shader-load time (like {{SG_SIZE}}).
+const MAX_CHUNKS: u32 = {{MAX_CHUNKS}}u;
 
 var<workgroup> sg_partial: array<f32, N_SG>;
 var<workgroup> weights_sh: array<f32, MAX_CHUNKS>;
@@ -103,8 +103,9 @@ fn main(
   let l_global = wg_sum(l_local, tid, sg_inv_id);
 
   // Phase C: per-thread o accumulation using precomputed weights. The per-d
-  // loops below assume head_dim == ELEMS_PER_THREAD * WG (true for Bonsai-4B);
-  // models with a different head_dim would need ELEMS_PER_THREAD retemplated.
+  // loops below assume head_dim == ELEMS_PER_THREAD * WG (true for the Bonsai
+  // family: head_dim=128, WG=64); models with a different head_dim would need
+  // ELEMS_PER_THREAD retemplated.
   var o: array<f32, ELEMS_PER_THREAD>;
   for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) { o[i] = 0.0; }
   for (var c: u32 = 0u; c < n; c++) {

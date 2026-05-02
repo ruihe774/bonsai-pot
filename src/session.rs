@@ -95,7 +95,7 @@ impl<'m> Session<'m> {
     /// freely cloned, persisted to disk via [`KvSnapshot::to_bytes`], and
     /// restored into any `Session` created from the same [`crate::Model`].
     ///
-    /// Cost: one `PCIe` round-trip plus a memcpy. For `Bonsai-4B` at `pos=512`,
+    /// Cost: one `PCIe` round-trip plus a memcpy. At `pos=512` with `kv_dim=1024`,
     /// roughly 1–2 ms on `PCIe 4`.
     ///
     /// # Errors

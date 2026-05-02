@@ -6,7 +6,7 @@
 # ]
 # ///
 """
-BPE-encode a prompt for the Bonsai-4B Rust runtime.
+BPE-encode a prompt for the Bonsai Rust runtime.
 
 Reads `vocab.bin`, `vocab_offsets.bin`, and `merges.txt` from a model directory
 (produced by `scripts/extract.py`) and tokenizes a prompt into u32 token IDs.

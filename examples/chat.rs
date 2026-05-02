@@ -1,6 +1,6 @@
 //! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
-//! Bonsai-4B is an instruction-tuned model, so we render each turn into the
+//! Bonsai is an instruction-tuned model family; we render each turn into the
 //! Qwen-style `ChatML` template (`<|im_start|>...<|im_end|>`), shell out to
 //! `scripts/bpe.py` for tokenization, prefill, and stream the assistant's
 //! reply token-by-token. Multi-turn conversation is preserved across the

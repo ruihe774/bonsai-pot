@@ -18,7 +18,7 @@ enable f16;
 //
 // Per-thread output accumulator is `array<f32, ELEMS_PER_THREAD>` where each
 // thread owns elements (tid, tid+WG, ...) of the head-dim-sized output vector.
-// For Bonsai-4B (head_dim=128, WG=64), ELEMS_PER_THREAD = 2.
+// For the Bonsai family (head_dim=128, WG=64), ELEMS_PER_THREAD = 2.
 //
 // Invariant: head_dim == ELEMS_PER_THREAD * WG. The per-element loops below
 // don't bounds-check `d < hd` because every (tid, i) pair indexes a real

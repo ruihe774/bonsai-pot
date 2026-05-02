@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`bonsai-pot` is a from-scratch, dependency-light **Bonsai-4B (Qwen3-architecture) Q1_0 inference engine** built on **wgpu compute shaders**. There is no `llama.cpp`, `ggml`, or PyTorch on the hot path — weights are loaded from a custom flat-file layout (produced by `scripts/extract.py` from a GGUF), all kernels are hand-rolled WGSL, and the host side is plain Rust + wgpu 29 + pollster.
+`bonsai-pot` is a from-scratch, dependency-light **Bonsai (Qwen3-architecture) Q1_0 inference engine** built on **wgpu compute shaders**. It supports the Bonsai 4B and 8B model sizes. There is no `llama.cpp`, `ggml`, or PyTorch on the hot path — weights are loaded from a custom flat-file layout (produced by `scripts/extract.py` from a GGUF), all kernels are hand-rolled WGSL, and the host side is plain Rust + wgpu 29 + pollster.
 
 The crate exposes both:
 - a **library** (`bonsai_pot::{Model, Session, Sampler, GenerateOptions, …}`) for embedding the engine in other Rust programs;
@@ -46,7 +46,9 @@ CLI sampling flags: `--temperature`, `--top-k`, `--top-p`, `--seed`. Default is 
 ## Rebuilding the model directory
 
 ```
-uv run scripts/extract.py path/to/Bonsai-4B.gguf --out ./model
+uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
+# or for 8B:
+uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
 ```
 
 Both Python scripts use [PEP 723 inline metadata](https://peps.python.org/pep-0723/) — `uv run` reads the dependency block at the top of each script and runs it in an isolated env. No virtualenv setup or `pip install` needed; just have `uv` on `$PATH`.
@@ -125,7 +127,7 @@ All weights live in **5 storage buffers** grouped by role: `w_attn` (per-layer W
 
 KV cache is split into `kv_k` and `kv_v`, both stored as **Q8_0** (32-element blocks: FP32 scale + 32 i8 quants ⇒ ~2.25 bytes/element, ~12.5% smaller than f16 and producing a `dot4I8Packed`-friendly load shape for the attention kernels). Each buffer has a contiguous d-section followed by a qs-section (see `kv_layer_offsets` / `kv_qs_byte_base` in `forward.rs`); helpers there compute per-layer offsets. Per-step K/V is quantized straight into the cache by `kv_writeback.wgsl` — there is no f16 staging copy. Total per-buffer size is `n_layer * max_seq * kv_dim * 2.25` bytes (≈170 MB combined K+V at `max_seq = 1024`).
 
-`max_seq` is **not** a compile-time constant — it's an allocate-time tunable (`ModelOptions::max_seq`, default 1024, exposed by both the bin and `examples/chat.rs` as `--max-seq`). The shaders themselves don't bake in any sequence-length limit, so any value up to the model's `context_length` is supported subject to VRAM and the 1 GB buffer cap. The `attn_partials` buffer (split-K attention scratch, sized as `n_head * ceil(max_seq / ATTN_CHUNK_SIZE) * (head_dim + 2) * 4` bytes) and the RoPE table (`max_seq * head_dim * 2` bytes) also scale with `max_seq`. `attention_merge.wgsl` caps `MAX_CHUNKS=256`, which limits `max_seq` to `256 * 32 = 8192` until that constant is bumped.
+`max_seq` is **not** a compile-time constant — it's an allocate-time tunable (`ModelOptions::max_seq`, default 1024, exposed by both the bin and `examples/chat.rs` as `--max-seq`). The `attn_partials` buffer (split-K attention scratch, sized as `n_head * ceil(max_seq / ATTN_CHUNK_SIZE) * (head_dim + 2) * 4` bytes) and the RoPE table (`max_seq * head_dim * 2` bytes) scale with `max_seq`. The `attention_merge.wgsl` constant `MAX_CHUNKS` is **runtime-baked** from `ceil(max_seq / ATTN_CHUNK_SIZE)` at `Model::load` time (like `SG_SIZE`), so there is no hard sequence-length cap in the shader. VRAM is the practical limit; `Model::load` checks the KV buffer against the adapter's `max_buffer_size` and returns a clean error if `max_seq` is too large. Note: the engine has no YaRN/NTK RoPE scaling, so output quality degrades for `max_seq` significantly beyond `~2 × rope_orig_context` (≈16k for 4B, ≈32k for 8B).
 
 `act_q8` is the Q8_0 activation scratch used only on the matmul path (FP32 d-section followed by i8 qs-section).
 
@@ -145,7 +147,7 @@ When adding a new dispatch in tg, prefer the `_in_pass` form and slot it into an
 
 ### Tied embeddings
 
-Bonsai-4B has tied embeddings: `token_embd.weight` is used as both the embedding lookup (in `embed.wgsl`) and the LM head full matvec. The Q1_0 row layout `[n_embd, n_vocab]` happens to be the right shape for both ops (gather a single row for embed, full matvec for LM head). `cfg.tied_embeddings` is set by `scripts/extract.py`; current code paths assume tied embeddings.
+Bonsai 4B and 8B both have tied embeddings: `token_embd.weight` is used as both the embedding lookup (in `embed.wgsl`) and the LM head full matvec. The Q1_0 row layout `[n_embd, n_vocab]` happens to be the right shape for both ops (gather a single row for embed, full matvec for LM head). `cfg.tied_embeddings` is set by `scripts/extract.py`; current code paths assume tied embeddings.
 
 ### Sample / readback layout
 
@@ -157,7 +159,7 @@ Since embed runs before topk_reduce in any step, the two roles never alias. `buf
 
 ### Adapter / limits
 
-`Model::load` clamps `max_storage_buffer_binding_size` and `max_buffer_size` to `min(adapter_limit, 1 GB)` but raises the floor to 300 MB so the largest grouped weight buffer (~252 MB) fits. `max_storage_buffers_per_shader_stage` is bumped to ≥ 8.
+`Model::load` raises `max_storage_buffer_binding_size` and `max_buffer_size` to a minimum of 300 MB so the largest grouped weight buffer fits (~252 MB at 4B, ~510 MB at 8B). No upper cap is imposed — the adapter's natural limit is used, which on desktop GPUs is typically 2–4 GB (needed for 8B KV at 32k ctx ≈ 1.27 GB per buffer). `max_storage_buffers_per_shader_stage` is bumped to ≥ 8.
 
 ## When making changes
 

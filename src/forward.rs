@@ -786,7 +786,7 @@ pub async fn prefill_matvec_loop_topk(
             .write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(rest));
         // Each non-last step allocates a fixed number of uniform slots
         // (one for embed + 14 per transformer layer; no suffix). The 1 MiB
-        // pool fits ~8 steps for Bonsai-4B, so for any prefill longer than
+        // pool fits ~8 steps at n_layer=36, so for any prefill longer than
         // that we split the work into multiple submits — KV-cache writes from
         // a previous submit are visible to the next one's attention reads.
         let slots_per_step = encode_step_matvec_slots_no_suffix(&model.cfg);

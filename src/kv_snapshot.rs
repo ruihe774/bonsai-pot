@@ -225,7 +225,7 @@ pub async fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
         mapped_at_creation: false,
     });
 
-    // Build one CommandEncoder with 144 small copies (for Bonsai-4B):
+    // Build one CommandEncoder with 4 × n_layer small copies:
     // for kind in {K,V} × for il in 0..n_layer × for sect in {d, qs}.
     let mut enc = model
         .device
@@ -401,6 +401,21 @@ mod tests {
     fn payload_size_bonsai4b() {
         // For Bonsai-4B at pos=512: 2 × 36 × 512 × (1024 + 128) = 42_467_328 bytes.
         assert_eq!(payload_bytes(36, 1024, 512), 42_467_328);
+    }
+
+    #[test]
+    fn payload_size_bonsai8b() {
+        // Bonsai-8B: n_layer=36, kv_dim=1024 (n_kv_head=8 × head_dim=128).
+        // Identical KV layout to 4B — payload depends only on (n_layer, kv_dim, pos).
+        assert_eq!(payload_bytes(36, 1024, 512), 42_467_328);
+    }
+
+    #[test]
+    fn payload_size_bonsai8b_full_useful_ctx() {
+        // 8B at the practical ~32k cap (2× rope_orig_context=16384):
+        // 2 × 36 × 32768 × (1024 + 128) = 2_717_908_992 bytes.
+        // Verifies the arithmetic stays u64-clean above 2 GB.
+        assert_eq!(payload_bytes(36, 1024, 32768), 2_717_908_992);
     }
 
     #[test]

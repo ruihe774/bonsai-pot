@@ -1,13 +1,16 @@
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 
 use bonsai_pot::{GenerateOptions, KvSnapshot, Model, PotError, Sampler, StopReason};
 
-fn model_dir() -> &'static Path {
-    Path::new("./model")
+fn model_dir() -> PathBuf {
+    env::var_os("BONSAI_POT_MODEL_DIR").map_or_else(|| PathBuf::from("./model"), PathBuf::from)
 }
 
 fn load_model() -> Model {
-    pollster::block_on(Model::load(model_dir())).expect("failed to load ./model")
+    let dir = model_dir();
+    pollster::block_on(Model::load(&dir))
+        .unwrap_or_else(|e| panic!("failed to load {}: {e}", dir.display()))
 }
 
 fn greedy_sampler() -> Sampler {
@@ -36,12 +39,17 @@ fn greedy_opts(max_new_tokens: u32) -> GenerateOptions {
 // ---- model loading -----------------------------------------------------------
 
 #[test]
-fn model_load_succeeds_and_config_is_bonsai4b() {
+fn model_load_succeeds_and_config_is_bonsai_family() {
     let model = load_model();
     let cfg = model.config();
-    assert_eq!(cfg.n_layer, 36);
+    // Invariants that hold across the Bonsai/Qwen3 dense family.
+    assert_eq!(cfg.head_dim, 128);
+    assert_eq!(cfg.n_kv_head, 8);
+    assert_eq!(cfg.n_head, 32);
+    assert!(matches!(cfg.n_layer, 28 | 36 | 40));
     assert_ne!(cfg.eos_token_id, 0);
     assert!(cfg.n_vocab > 100_000);
+    // max_seq_len / max_prefill_tokens are ModelOptions-driven, not model-specific.
     assert_eq!(model.max_seq_len(), 1024);
     assert_eq!(model.max_prefill_tokens(), 512);
 }

@@ -1,4 +1,4 @@
-//! Bonsai-4B (`Qwen3` architecture) `Q1_0` inference on wgpu compute shaders.
+//! Bonsai (`Qwen3` architecture) `Q1_0` inference on wgpu compute shaders.
 //!
 //! See the README for a one-page tour of the engine. This crate exposes the
 //! engine as a library; the `bonsai-pot` binary is a thin CLI on top of this

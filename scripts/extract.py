@@ -12,7 +12,7 @@
 # gguf = { git = "https://github.com/ggml-org/llama.cpp", rev = "a95a11e", subdirectory = "gguf-py" }
 # ///
 """
-Extract a Bonsai-4B Q1_0 GGUF into a flat directory the Rust runtime can load.
+Extract a Bonsai (Qwen3-family) Q1_0 GGUF into a flat directory the Rust runtime can load.
 
 Output layout (under --out, default ./model):
   config.json       hyperparams + tensor manifest (offsets & shapes within
@@ -38,7 +38,8 @@ runtime can bind them as `array<f16>` without a load-time conversion.
 Prompts are NOT encoded here. Run `scripts/bpe.py` for that.
 
 Usage:
-  uv run scripts/extract.py path/to/Bonsai-4B.gguf --out ./model
+  uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
+  uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
 """
 import argparse, json, os, struct
 import gguf
@@ -52,9 +53,9 @@ def field_str(f):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Extract Bonsai-4B GGUF weights/vocab into a flat model dir.",
+        description="Extract a Bonsai/Qwen3 Q1_0 GGUF into a flat model dir.",
     )
-    ap.add_argument("gguf", help="path to Bonsai-4B.gguf")
+    ap.add_argument("gguf", help="path to a Bonsai-*.gguf (Qwen3 Q1_0 family)")
     ap.add_argument("--out", default="./model",
                     help="output directory (default: ./model)")
     args = ap.parse_args()
@@ -181,7 +182,7 @@ def main():
         write_tensor(f, by_name["output_norm.weight"], "output_norm.weight", "F16")
 
     # ---- group E: weights_embed_lmhead -------------------------------------
-    # Bonsai-4B has tied embeddings (no separate output.weight). The LM head
+    # Bonsai/Qwen3 models have tied embeddings (no separate output.weight). The LM head
     # uses the same tensor as the embedding (row-gather for embed; full matvec
     # for the head, since the Q1_0 row-major layout [n_embd, n_vocab] gives
     # n_vocab rows of n_embd elements — the right shape for both ops).
