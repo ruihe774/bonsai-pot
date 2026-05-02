@@ -619,6 +619,187 @@ fn parse_config_ini(text: &str) -> Result<Config> {
     })
 }
 
+fn validate_cfg(cfg: &Config) -> Result<()> {
+    const fn pad4(n: u64) -> u64 {
+        (n + 3) & !3
+    }
+
+    // --- global hyperparameter invariants ---
+    if cfg.add_bos {
+        return Err(PotError::Config(
+            "config: add_bos=true but the runtime never prepends BOS; re-extract with a supported model",
+        ));
+    }
+    if cfg.rope_orig_context == 0 {
+        return Err(PotError::Config("config: rope_orig_context must be > 0"));
+    }
+    if cfg.n_kv_head == 0 || !cfg.n_head.is_multiple_of(cfg.n_kv_head) {
+        return Err(PotError::Config(
+            "config: n_head must be divisible by n_kv_head",
+        ));
+    }
+    if cfg.n_kv_groups != cfg.n_head / cfg.n_kv_head {
+        return Err(PotError::Config(
+            "config: n_kv_groups != n_head / n_kv_head",
+        ));
+    }
+    if cfg.q_dim != cfg.n_head * cfg.head_dim {
+        return Err(PotError::Config("config: q_dim != n_head * head_dim"));
+    }
+    if cfg.kv_dim != cfg.n_kv_head * cfg.head_dim {
+        return Err(PotError::Config("config: kv_dim != n_kv_head * head_dim"));
+    }
+
+    // --- per-tensor checks ---
+    // Each spec: (name, dtype, shape as [u64;2-or-1], buffer filename)
+    // For 1-D F16 tensors encode shape as &[dim] (single element).
+
+    let n_embd = u64::from(cfg.n_embd);
+    let n_ff = u64::from(cfg.n_ff);
+    let q_dim = u64::from(cfg.q_dim);
+    let kv_dim = u64::from(cfg.kv_dim);
+    let n_vocab = u64::from(cfg.n_vocab);
+    let head_dim = u64::from(cfg.head_dim);
+
+    // Per-layer tensors (iterated over all layers).
+    let layer_specs: &[(&str, &str, &[u64], &str)] = &[
+        (
+            "attn_q.weight",
+            "Q1_0",
+            &[n_embd, q_dim],
+            "weights_attn.bin",
+        ),
+        (
+            "attn_k.weight",
+            "Q1_0",
+            &[n_embd, kv_dim],
+            "weights_attn.bin",
+        ),
+        (
+            "attn_v.weight",
+            "Q1_0",
+            &[n_embd, kv_dim],
+            "weights_attn.bin",
+        ),
+        (
+            "attn_output.weight",
+            "Q1_0",
+            &[q_dim, n_embd],
+            "weights_attn.bin",
+        ),
+        (
+            "ffn_gate.weight",
+            "Q1_0",
+            &[n_embd, n_ff],
+            "weights_ffn_gate_up.bin",
+        ),
+        (
+            "ffn_up.weight",
+            "Q1_0",
+            &[n_embd, n_ff],
+            "weights_ffn_gate_up.bin",
+        ),
+        (
+            "ffn_down.weight",
+            "Q1_0",
+            &[n_ff, n_embd],
+            "weights_ffn_down.bin",
+        ),
+        ("attn_norm.weight", "F16", &[n_embd], "weights_norms.bin"),
+        (
+            "attn_q_norm.weight",
+            "F16",
+            &[head_dim],
+            "weights_norms.bin",
+        ),
+        (
+            "attn_k_norm.weight",
+            "F16",
+            &[head_dim],
+            "weights_norms.bin",
+        ),
+        ("ffn_norm.weight", "F16", &[n_embd], "weights_norms.bin"),
+    ];
+    // Non-layer tensors.
+    let global_specs: &[(&str, &str, &[u64], &str)] = &[
+        ("output_norm.weight", "F16", &[n_embd], "weights_norms.bin"),
+        (
+            "token_embd.weight",
+            "Q1_0",
+            &[n_embd, n_vocab],
+            "weights_embed_lmhead.bin",
+        ),
+    ];
+
+    let check = |name: &str, dtype: &str, shape: &[u64], buffer: &str| -> Result<()> {
+        let e = cfg.manifest.get(name).ok_or(PotError::Config(
+            "manifest: expected tensor missing (re-extract the model dir)",
+        ))?;
+        if e.dtype != dtype {
+            return Err(PotError::Config("manifest: tensor has wrong dtype"));
+        }
+        if e.shape.as_slice() != shape {
+            return Err(PotError::Config("manifest: tensor has wrong shape"));
+        }
+        if e.buffer != buffer {
+            return Err(PotError::Config("manifest: tensor is in wrong buffer file"));
+        }
+        match dtype {
+            "Q1_0" => {
+                let n_in = shape[0];
+                let n_out = if shape.len() > 1 { shape[1] } else { 1 };
+                if !n_in.is_multiple_of(128) {
+                    return Err(PotError::Config(
+                        "manifest: Q1_0 tensor n_in not divisible by 128",
+                    ));
+                }
+                let nb = n_in / 128;
+                if e.nb != nb {
+                    return Err(PotError::Config("manifest: Q1_0 tensor nb != n_in/128"));
+                }
+                let expected_qs_offset = pad4(e.d_offset + n_out * nb * 2);
+                if e.qs_offset != expected_qs_offset {
+                    return Err(PotError::Config(
+                        "manifest: Q1_0 tensor qs_offset != pad4(d_offset + n_out*nb*2)",
+                    ));
+                }
+                let expected_length = (e.qs_offset - e.d_offset) + pad4(n_out * nb * 16);
+                if e.length != expected_length {
+                    return Err(PotError::Config("manifest: Q1_0 tensor length mismatch"));
+                }
+            }
+            "F16" => {
+                let expected_length = pad4(shape.iter().product::<u64>() * 2);
+                if e.length != expected_length {
+                    return Err(PotError::Config("manifest: F16 tensor length mismatch"));
+                }
+            }
+            _ => return Err(PotError::Config("manifest: unknown dtype")),
+        }
+        Ok(())
+    };
+
+    for il in 0..cfg.n_layer {
+        for &(tag, dtype, shape, buf) in layer_specs {
+            let name = format!("blk.{il}.{tag}");
+            check(&name, dtype, shape, buf)?;
+        }
+    }
+    for &(name, dtype, shape, buf) in global_specs {
+        check(name, dtype, shape, buf)?;
+    }
+    if !cfg.tied_embeddings {
+        check(
+            "output.weight",
+            "Q1_0",
+            &[n_embd, n_vocab],
+            "weights_embed_lmhead.bin",
+        )?;
+    }
+
+    Ok(())
+}
+
 impl Model {
     /// Load weights with default options. Equivalent to
     /// [`Model::load_with_options`] with `ModelOptions::default()`.
@@ -678,6 +859,7 @@ impl Model {
             source: e,
         })?;
         let cfg = parse_config_ini(&cfg_text)?;
+        validate_cfg(&cfg)?;
         let public_cfg = ModelConfig::from_raw(&cfg);
 
         // ---- wgpu init ------------------------------------------------------
