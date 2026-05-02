@@ -27,6 +27,7 @@ bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 log = "0.4"
 futures-intrusive = "0.5"
+thiserror = "2"
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
 pollster = { version = "0.3", optional = true }

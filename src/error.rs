@@ -1,65 +1,33 @@
-use std::error::Error;
-use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::path::PathBuf;
 use std::result::Result as StdResult;
 
-#[derive(Debug)]
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum PotError {
-    Io { path: PathBuf, source: io::Error },
-    MissingTensor(String),
+    #[error("io error reading {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("vocab.bin / vocab_offsets.bin: {0}")]
     Vocab(&'static str),
+    #[error("no compatible GPU adapter found")]
     NoAdapter,
+    #[error("adapter does not support required feature: {0}")]
     FeatureUnsupported(&'static str),
-    DeviceRequest(wgpu::RequestDeviceError),
+    #[error("wgpu device request failed: {0}")]
+    DeviceRequest(#[from] wgpu::RequestDeviceError),
+    #[error("buffer mapping failed: {0:?}")]
     BufferMap(wgpu::BufferAsyncError),
+    #[error("context overflow: pos {pos} + tokens {n} > max_seq {max}")]
     ContextOverflow { pos: u32, n: u32, max: u32 },
+    #[error("prefill batch {n} exceeds max_prefill_tokens {max}")]
     PrefillTooLarge { n: u32, max: u32 },
+    #[error("invalid config: {0}")]
     Config(&'static str),
-}
-
-impl Display for PotError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        use PotError::{
-            BufferMap, Config, ContextOverflow, DeviceRequest, FeatureUnsupported, Io,
-            MissingTensor, NoAdapter, PrefillTooLarge, Vocab,
-        };
-        match self {
-            Io { path, source } => write!(f, "io error reading {}: {}", path.display(), source),
-            MissingTensor(name) => write!(f, "missing tensor in manifest: {name}"),
-            Vocab(msg) => write!(f, "vocab.bin / vocab_offsets.bin: {msg}"),
-            NoAdapter => write!(f, "no compatible GPU adapter found"),
-            FeatureUnsupported(feat) => {
-                write!(f, "adapter does not support required feature: {feat}")
-            }
-            DeviceRequest(e) => write!(f, "wgpu device request failed: {e}"),
-            BufferMap(e) => write!(f, "buffer mapping failed: {e:?}"),
-            ContextOverflow { pos, n, max } => write!(
-                f,
-                "context overflow: pos {pos} + tokens {n} > max_seq {max}"
-            ),
-            PrefillTooLarge { n, max } => {
-                write!(f, "prefill batch {n} exceeds max_prefill_tokens {max}")
-            }
-            Config(msg) => write!(f, "invalid config: {msg}"),
-        }
-    }
-}
-
-impl Error for PotError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::DeviceRequest(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<wgpu::RequestDeviceError> for PotError {
-    fn from(e: wgpu::RequestDeviceError) -> Self {
-        Self::DeviceRequest(e)
-    }
 }
 
 pub type Result<T> = StdResult<T, PotError>;
@@ -85,9 +53,6 @@ mod tests {
         assert!(PotError::Config("bad ini key")
             .to_string()
             .contains("bad ini key"));
-        assert!(PotError::MissingTensor("foo.weight".into())
-            .to_string()
-            .contains("foo.weight"));
         assert!(PotError::Vocab("bad magic")
             .to_string()
             .contains("bad magic"));
@@ -124,7 +89,6 @@ mod tests {
     fn source_present_for_wrapped() {
         assert!(make_io_error().source().is_some());
 
-        assert!(PotError::MissingTensor("x".into()).source().is_none());
         assert!(PotError::Vocab("x").source().is_none());
         assert!(PotError::NoAdapter.source().is_none());
         assert!(PotError::FeatureUnsupported("x").source().is_none());

@@ -137,6 +137,7 @@ dependencies = [
  "half",
  "log",
  "pollster",
+ "thiserror",
  "wgpu",
 ]
 
