@@ -193,12 +193,12 @@ pub const fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
 
 // ---- GPU paths --------------------------------------------------------------
 
-use std::result::Result as StdResult;
-
-use futures_intrusive::channel::shared::oneshot_channel;
+use std::sync::{Arc, OnceLock};
 
 /// Read back the live `[0..pos)` slice of the GPU KV cache to a [`KvSnapshot`].
-pub async fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
+pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
+    use core::result::Result as StdResult;
+    type MapResult = StdResult<(), wgpu::BufferAsyncError>;
     let cfg = &model.cfg;
     let n_layer = cfg.n_layer;
     let kv_dim = cfg.kv_dim;
@@ -264,23 +264,23 @@ pub async fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
 
     model.queue.submit([enc.finish()]);
 
-    // Await the readback — same idiom as `await_topk_readback` in forward.rs.
     let slice = staging.slice(0..snap_payload_bytes as u64);
-    let (tx, rx) = oneshot_channel::<StdResult<(), wgpu::BufferAsyncError>>();
+    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
+    let slot2 = slot.clone();
     slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
+        let _ = slot2.set(res);
     });
     if let Err(e) = model.device.poll(wgpu::PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
     }
-    match rx.receive().await {
+    match slot.get() {
         Some(Ok(())) => {}
         Some(Err(e)) => {
             model.check_device()?;
-            return Err(PotError::BufferMap(e));
+            return Err(PotError::BufferMap(e.clone()));
         }
-        None => unreachable!("oneshot channel dropped without sending"),
+        None => unreachable!("map_async callback did not fire before poll returned"),
     }
 
     let mut payload = vec![0u8; snap_payload_bytes];

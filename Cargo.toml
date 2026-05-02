@@ -26,7 +26,6 @@ wgpu = { version = "29", default-features = false, features = ["std", "vulkan", 
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 log = "0.4"
-futures-intrusive = "0.5"
 thiserror = "2"
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).

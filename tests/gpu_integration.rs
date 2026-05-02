@@ -226,7 +226,7 @@ fn snapshot_restore_round_trip_continues_identically() {
     // Original session: prefill, snapshot, continue.
     let mut sess = model.new_session();
     let first = pollster::block_on(sess.prefill(&prompt, &greedy)).unwrap();
-    let snap = pollster::block_on(sess.snapshot()).unwrap();
+    let snap = sess.snapshot().unwrap();
     let (toks_orig, _) = pollster::block_on(sess.generate(first, &greedy_opts(8))).unwrap();
 
     // Restored session: restore snapshot, continue from same point.
@@ -249,7 +249,7 @@ fn snapshot_to_bytes_round_trip() {
 
     let mut sess = model.new_session();
     let first = pollster::block_on(sess.prefill(&prompt, &greedy)).unwrap();
-    let snap = pollster::block_on(sess.snapshot()).unwrap();
+    let snap = sess.snapshot().unwrap();
     let (toks_orig, _) = pollster::block_on(sess.generate(first, &greedy_opts(4))).unwrap();
 
     // Serialize → deserialize → restore.
@@ -270,7 +270,7 @@ fn restore_pos_zero_snapshot_leaves_session_ready_for_prefill() {
     let model = load_model();
     // Empty snapshot (pos=0) should restore to a clean state, allowing prefill.
     let mut sess = model.new_session();
-    let snap = pollster::block_on(sess.snapshot()).unwrap();
+    let snap = sess.snapshot().unwrap();
     assert_eq!(snap.pos(), 0);
 
     let mut sess2 = model.new_session();
@@ -295,7 +295,7 @@ fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
 
     // Capture a snapshot while the device is still healthy, so we can verify
     // that restore() is also guarded after loss.
-    let snap = pollster::block_on(sess.snapshot()).unwrap();
+    let snap = sess.snapshot().unwrap();
 
     // Destroy the device; this triggers the device-lost callback synchronously.
     model.__destroy_device_for_test();
@@ -321,7 +321,9 @@ fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
     );
 
     // snapshot() must return DeviceLost.
-    let err = pollster::block_on(sess.snapshot()).expect_err("snapshot on a lost device must fail");
+    let err = sess
+        .snapshot()
+        .expect_err("snapshot on a lost device must fail");
     assert!(
         matches!(err, PotError::DeviceLost { .. }),
         "expected DeviceLost, got: {err}"

@@ -14,7 +14,6 @@ use std::str::from_utf8;
 use std::sync::{Arc, OnceLock};
 
 use bytemuck::{cast_slice, Pod, Zeroable};
-use futures_intrusive::channel::shared::oneshot_channel;
 use wgpu::util::DeviceExt;
 
 use crate::decode;
@@ -797,7 +796,7 @@ impl Model {
         // wave64 (default), and either choice is opaque to the API. We dispatch
         // a tiny `subgroup_size`-builtin readback to learn the real value, then
         // bake that into every other shader at compile time.
-        let sg_size = probe_subgroup_size(&device, &queue, &lost).await?;
+        let sg_size = probe_subgroup_size(&device, &queue, &lost)?;
         if !(8..=64).contains(&sg_size) || (sg_size & (sg_size - 1)) != 0 {
             return Err(PotError::Config(
                 "unsupported runtime subgroup size (need power-of-2 in [8, 64])",
@@ -1284,11 +1283,13 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
 
 // Dispatch a one-thread-writes-the-builtin probe shader to find out what
 // subgroup size the driver actually picks for our compute pipelines.
-async fn probe_subgroup_size(
+fn probe_subgroup_size(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     lost: &OnceLock<DeviceLostInfo>,
 ) -> Result<u32> {
+    use core::result::Result as StdResult;
+    type MapResult = StdResult<(), wgpu::BufferAsyncError>;
     let result = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("probe_result"),
         size: 4,
@@ -1355,9 +1356,10 @@ async fn probe_subgroup_size(
     queue.submit(Some(enc.finish()));
 
     let slice = readback.slice(..);
-    let (tx, rx) = oneshot_channel();
+    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
+    let slot2 = slot.clone();
     slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
+        let _ = slot2.set(r);
     });
     if let Err(e) = device.poll(wgpu::PollType::wait_indefinitely()) {
         if let Some(d) = lost.get() {
@@ -1368,9 +1370,9 @@ async fn probe_subgroup_size(
         }
         return Err(PotError::Poll(e));
     }
-    rx.receive()
-        .await
+    slot.get()
         .ok_or(PotError::Config("probe map_async failed"))?
+        .as_ref()
         .map_err(|_| PotError::Config("probe map_async errored"))?;
     let sg = {
         let data = slice.get_mapped_range();

@@ -259,7 +259,7 @@ fn main() {
         sess.prefill(&system_tokens, &sampler)
             .await
             .expect("system prefill");
-        let system_snap: KvSnapshot = sess.snapshot().await.expect("system snapshot");
+        let system_snap: KvSnapshot = sess.snapshot().expect("system snapshot");
 
         let mut turn: u32 = 0;
 

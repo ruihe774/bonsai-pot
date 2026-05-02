@@ -382,28 +382,30 @@ fn dispatch_kv_writeback(
 ///
 /// This must be called AFTER the step's command buffer has been submitted —
 /// i.e. the readback copy is in flight. There is no separate submit here.
-async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
+fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
     use core::result::Result as StdResult;
+    use std::sync::{Arc, OnceLock};
 
-    use futures_intrusive::channel::shared::oneshot_channel;
     use wgpu::{BufferAsyncError, PollType};
+    type MapResult = StdResult<(), BufferAsyncError>;
     let bytes = u64::from(k) * 8; // K f32 + K u32
     let slice = model.buffers.readback.slice(0..bytes);
-    let (s, r) = oneshot_channel::<StdResult<(), BufferAsyncError>>();
+    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
+    let slot2 = slot.clone();
     slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = s.send(res);
+        let _ = slot2.set(res);
     });
     if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
     }
-    match r.receive().await {
+    match slot.get() {
         Some(Ok(())) => {}
         Some(Err(e)) => {
             model.check_device()?;
-            return Err(PotError::BufferMap(e));
+            return Err(PotError::BufferMap(e.clone()));
         }
-        None => unreachable!("oneshot channel dropped without sending"),
+        None => unreachable!("map_async callback did not fire before poll returned"),
     }
     let data = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&data[..bytes as usize]);
@@ -542,7 +544,7 @@ pub async fn step_matvec_topk(
     se.copy_sample_to_readback(u64::from(k) * 8);
     let cb = se.finish();
     model.queue.submit(Some(cb));
-    await_topk_readback(model, k).await
+    await_topk_readback(model, k)
 }
 
 /// Same as [`step_matvec_topk`] but does not perform any sampling readback.
@@ -929,7 +931,7 @@ pub async fn prefill_matmul_topk(
     let cb = se.finish();
     model.queue.submit(Some(cb));
 
-    await_topk_readback(model, k).await
+    await_topk_readback(model, k)
 }
 
 fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32, m: u32) {

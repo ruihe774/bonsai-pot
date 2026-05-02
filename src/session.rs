@@ -100,9 +100,9 @@ impl<'m> Session<'m> {
     /// # Errors
     ///
     /// Returns an error if the GPU readback fails.
-    pub async fn snapshot(&mut self) -> Result<KvSnapshot> {
+    pub fn snapshot(&mut self) -> Result<KvSnapshot> {
         self.model.check_device()?;
-        kv_snapshot::capture(self.model, self.pos).await
+        kv_snapshot::capture(self.model, self.pos)
     }
 
     /// Replace the GPU KV cache with `snap`'s contents and set
