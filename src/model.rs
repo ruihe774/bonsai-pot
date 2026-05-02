@@ -11,6 +11,7 @@ use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::str::from_utf8;
+use std::sync::{Arc, OnceLock};
 
 use bytemuck::{cast_slice, Pod, Zeroable};
 use futures_intrusive::channel::shared::oneshot_channel;
@@ -459,6 +460,14 @@ pub struct OutputTensors {
     pub(crate) output_norm_off: u32,
 }
 
+/// Latched state set by the wgpu device-lost or uncaptured-error callbacks.
+/// Stored in an `OnceLock` so reads are lock-free and the first writer wins.
+#[derive(Debug, Clone)]
+pub struct DeviceLostInfo {
+    pub reason: wgpu::DeviceLostReason,
+    pub message: String,
+}
+
 /// GPU-bearing handle to a loaded Bonsai model.
 ///
 /// Holds weights, pipelines, activations, and the KV cache. Cheap to share
@@ -479,6 +488,7 @@ pub struct Model {
     pub(crate) layer_tensors: Vec<LayerTensors>,
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
+    pub(crate) lost: Arc<OnceLock<DeviceLostInfo>>,
 }
 
 const M_MAX: u32 = 512;
@@ -712,6 +722,26 @@ impl Model {
             })
             .await?;
 
+        // ---- wire up device-lost and uncaptured-error callbacks ------------
+        // Both callbacks write into `lost` via OnceLock; the first writer wins
+        // (the device-lost reason is more specific, so that path fires first).
+        let lost: Arc<OnceLock<DeviceLostInfo>> = Arc::new(OnceLock::new());
+        {
+            let lost = Arc::clone(&lost);
+            device.set_device_lost_callback(move |reason, message| {
+                let _ = lost.set(DeviceLostInfo { reason, message });
+            });
+        }
+        {
+            let lost = Arc::clone(&lost);
+            device.on_uncaptured_error(Arc::new(move |err: wgpu::Error| {
+                let _ = lost.set(DeviceLostInfo {
+                    reason: wgpu::DeviceLostReason::Unknown,
+                    message: err.to_string(),
+                });
+            }));
+        }
+
         // ---- probe actual runtime subgroup size ----------------------------
         // The adapter exposes the device's subgroup_min..max range, not the
         // size the driver picks for any given pipeline. RADV in particular
@@ -719,7 +749,7 @@ impl Model {
         // wave64 (default), and either choice is opaque to the API. We dispatch
         // a tiny `subgroup_size`-builtin readback to learn the real value, then
         // bake that into every other shader at compile time.
-        let sg_size = probe_subgroup_size(&device, &queue).await?;
+        let sg_size = probe_subgroup_size(&device, &queue, &lost).await?;
         if !(8..=64).contains(&sg_size) || (sg_size & (sg_size - 1)) != 0 {
             return Err(PotError::Config(
                 "unsupported runtime subgroup size (need power-of-2 in [8, 64])",
@@ -1079,6 +1109,7 @@ impl Model {
             layer_tensors,
             output_tensors,
             vocab,
+            lost,
         })
     }
 
@@ -1139,6 +1170,40 @@ impl Model {
     pub fn token_id(&self, token: &str) -> Option<u32> {
         self.vocab.iter().position(|s| s == token).map(|i| i as u32)
     }
+
+    /// Returns `true` if the underlying wgpu device has been lost.
+    ///
+    /// Once `true`, this `Model` (and any [`crate::Session`] borrowed from it)
+    /// is permanently unusable. Drop both, then call [`Model::load`] again to
+    /// recover. A [`crate::KvSnapshot`] captured before loss can be used to
+    /// warm-restart the new session via [`crate::Session::restore`].
+    #[must_use]
+    pub fn is_device_lost(&self) -> bool {
+        self.lost.get().is_some()
+    }
+
+    /// Returns `Err(PotError::DeviceLost)` if the device has been lost, `Ok`
+    /// otherwise. Used as a fail-fast guard at the start of every GPU-touching
+    /// Session method.
+    pub(crate) fn check_device(&self) -> Result<()> {
+        if let Some(d) = self.lost.get() {
+            return Err(PotError::DeviceLost {
+                reason: d.reason,
+                message: d.message.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Calls `Device::destroy()` to simulate device loss. Intended only for
+    /// tests; not part of the stable public API.
+    #[doc(hidden)]
+    pub fn __destroy_device_for_test(&self) {
+        self.device.destroy();
+        // Poll to flush the device-lost callback into the OnceLock. The callback
+        // is queued by destroy() but only fires during poll().
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
 }
 
 /// Precompute cos/sin table for NEOX rope: per position p (`0..max_seq`),
@@ -1160,7 +1225,11 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
 
 // Dispatch a one-thread-writes-the-builtin probe shader to find out what
 // subgroup size the driver actually picks for our compute pipelines.
-async fn probe_subgroup_size(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<u32> {
+async fn probe_subgroup_size(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    lost: &OnceLock<DeviceLostInfo>,
+) -> Result<u32> {
     let result = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("probe_result"),
         size: 4,
@@ -1231,9 +1300,15 @@ async fn probe_subgroup_size(device: &wgpu::Device, queue: &wgpu::Queue) -> Resu
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("device.poll failed");
+    if let Err(e) = device.poll(wgpu::PollType::wait_indefinitely()) {
+        if let Some(d) = lost.get() {
+            return Err(PotError::DeviceLost {
+                reason: d.reason,
+                message: d.message.clone(),
+            });
+        }
+        return Err(PotError::Poll(e));
+    }
     rx.receive()
         .await
         .ok_or(PotError::Config("probe map_async failed"))?

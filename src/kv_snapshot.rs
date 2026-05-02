@@ -270,13 +270,16 @@ pub async fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
-    model
-        .device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .expect("device.poll failed");
+    if let Err(e) = model.device.poll(wgpu::PollType::wait_indefinitely()) {
+        model.check_device()?;
+        return Err(PotError::Poll(e));
+    }
     match rx.receive().await {
         Some(Ok(())) => {}
-        Some(Err(e)) => return Err(PotError::BufferMap(e)),
+        Some(Err(e)) => {
+            model.check_device()?;
+            return Err(PotError::BufferMap(e));
+        }
         None => unreachable!("oneshot channel dropped without sending"),
     }
 

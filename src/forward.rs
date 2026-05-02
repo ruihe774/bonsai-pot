@@ -393,13 +393,16 @@ async fn await_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = s.send(res);
     });
-    model
-        .device
-        .poll(PollType::wait_indefinitely())
-        .expect("device.poll failed");
+    if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+        model.check_device()?;
+        return Err(PotError::Poll(e));
+    }
     match r.receive().await {
         Some(Ok(())) => {}
-        Some(Err(e)) => return Err(PotError::BufferMap(e)),
+        Some(Err(e)) => {
+            model.check_device()?;
+            return Err(PotError::BufferMap(e));
+        }
         None => unreachable!("oneshot channel dropped without sending"),
     }
     let data = slice.get_mapped_range();
@@ -1450,6 +1453,7 @@ pub mod bench_internals {
         rms_norm, rope, silu_mul, step_matvec_no_sample, step_matvec_topk, AttnParams, Config,
         EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
     };
+    use crate::error::PotError;
 
     /// Match `llama-bench` style: pp{n} measures batched-prefill throughput;
     /// tg{n} measures single-token generation throughput.
@@ -1468,20 +1472,20 @@ pub mod bench_internals {
         // ----- warm up -----
         let _ = prefill_matmul_topk(model, &prompt[..pp_n.min(model.m_max) as usize], 0, 1).await?;
         step_matvec_no_sample(model, 1u32, 0);
-        model
-            .device
-            .poll(PollType::wait_indefinitely())
-            .expect("device.poll failed");
+        if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+            model.check_device()?;
+            return Err(PotError::Poll(e));
+        }
 
         // ----- pp{pp_n} -----
         let mut pp_times = Vec::with_capacity(repeats as usize);
         for _ in 0..repeats {
             let t = Instant::now();
             let _ = prefill_matmul_topk(model, &prompt, 0, 1).await?;
-            model
-                .device
-                .poll(PollType::wait_indefinitely())
-                .expect("device.poll failed");
+            if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                model.check_device()?;
+                return Err(PotError::Poll(e));
+            }
             pp_times.push(t.elapsed().as_secs_f32());
         }
         let pp_mean = pp_times.iter().sum::<f32>() / pp_times.len() as f32;
@@ -1496,10 +1500,10 @@ pub mod bench_internals {
             for pos in 0..tg_n {
                 let (_, _) = step_matvec_topk(model, 1u32, pos, 1).await?;
             }
-            model
-                .device
-                .poll(PollType::wait_indefinitely())
-                .expect("device.poll failed");
+            if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                model.check_device()?;
+                return Err(PotError::Poll(e));
+            }
             tg_times.push(t.elapsed().as_secs_f32());
         }
         let tg_mean = tg_times.iter().sum::<f32>() / tg_times.len() as f32;
@@ -1528,9 +1532,8 @@ pub mod bench_internals {
         var.sqrt()
     }
 
-    /// # Panics
-    /// Panics if `device.poll` returns an error or sorting comparator fails.
-    pub async fn microbench_tg(model: &Model, repeats: u32) {
+    #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
+    pub async fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
         type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
 
         let cfg = &model.cfg;
@@ -1803,10 +1806,10 @@ pub mod bench_internals {
             );
             let cb = se.finish();
             model.queue.submit(Some(cb));
-            model
-                .device
-                .poll(PollType::wait_indefinitely())
-                .expect("device.poll failed");
+            if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                model.check_device()?;
+                return Err(PotError::Poll(e));
+            }
         }
 
         let mut breakdown: Vec<(String, u32, f32)> = Vec::new();
@@ -1820,10 +1823,10 @@ pub mod bench_internals {
                 }
                 let cb = se.finish();
                 model.queue.submit(Some(cb));
-                model
-                    .device
-                    .poll(PollType::wait_indefinitely())
-                    .expect("device.poll failed");
+                if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                    model.check_device()?;
+                    return Err(PotError::Poll(e));
+                }
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -1850,10 +1853,10 @@ pub mod bench_internals {
                 }
                 let cb = se.finish();
                 model.queue.submit(Some(cb));
-                model
-                    .device
-                    .poll(PollType::wait_indefinitely())
-                    .expect("device.poll failed");
+                if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                    model.check_device()?;
+                    return Err(PotError::Poll(e));
+                }
                 samples.push(t.elapsed().as_secs_f32());
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -1895,5 +1898,6 @@ pub mod bench_internals {
             "expected tg t/s if isolated sum was reality: {:.1}",
             1000.0 / total_ms
         );
+        Ok(())
     }
 }

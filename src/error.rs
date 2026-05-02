@@ -28,6 +28,13 @@ pub enum PotError {
     PrefillTooLarge { n: u32, max: u32 },
     #[error("invalid config: {0}")]
     Config(&'static str),
+    #[error("wgpu device lost ({reason:?}): {message}")]
+    DeviceLost {
+        reason: wgpu::DeviceLostReason,
+        message: String,
+    },
+    #[error("device.poll failed: {0:?}")]
+    Poll(wgpu::PollError),
 }
 
 pub type Result<T> = StdResult<T, PotError>;
@@ -83,6 +90,18 @@ mod tests {
         assert!(PotError::Config("bad value")
             .to_string()
             .contains("bad value"));
+        assert!(PotError::DeviceLost {
+            reason: wgpu::DeviceLostReason::Destroyed,
+            message: "test".to_string()
+        }
+        .to_string()
+        .contains("Destroyed"));
+        assert!(PotError::DeviceLost {
+            reason: wgpu::DeviceLostReason::Destroyed,
+            message: "test".to_string()
+        }
+        .to_string()
+        .contains("test"));
     }
 
     #[test]
@@ -106,5 +125,11 @@ mod tests {
             .source()
             .is_none());
         assert!(PotError::Config("x").source().is_none());
+        assert!(PotError::DeviceLost {
+            reason: wgpu::DeviceLostReason::Unknown,
+            message: String::new()
+        }
+        .source()
+        .is_none());
     }
 }

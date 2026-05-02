@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use bonsai_pot::{GenerateOptions, KvSnapshot, Model, PotError, Sampler, StopReason};
+use wgpu::DeviceLostReason;
 
 fn model_dir() -> PathBuf {
     env::var_os("BONSAI_POT_MODEL_DIR").map_or_else(|| PathBuf::from("./model"), PathBuf::from)
@@ -280,4 +281,71 @@ fn restore_pos_zero_snapshot_leaves_session_ready_for_prefill() {
     let prompt = short_prompt();
     pollster::block_on(sess2.prefill(&prompt, &greedy_sampler())).unwrap();
     assert_eq!(sess2.pos(), prompt.len() as u32);
+}
+
+// ---- device-lost handling ---------------------------------------------------
+
+#[test]
+fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
+    let model = load_model();
+
+    // Confirm liveness before we destroy the device.
+    let mut sess = model.new_session();
+    let first = pollster::block_on(sess.prefill(&short_prompt(), &greedy_sampler())).unwrap();
+
+    // Capture a snapshot while the device is still healthy, so we can verify
+    // that restore() is also guarded after loss.
+    let snap = pollster::block_on(sess.snapshot()).unwrap();
+
+    // Destroy the device; this triggers the device-lost callback synchronously.
+    model.__destroy_device_for_test();
+
+    // The flag must be latched immediately after destroy.
+    assert!(
+        model.is_device_lost(),
+        "is_device_lost() must be true after destroy"
+    );
+
+    // step() must return DeviceLost, not panic.
+    let err = pollster::block_on(sess.step(first, &greedy_sampler()))
+        .expect_err("step on a lost device must fail");
+    assert!(
+        matches!(
+            err,
+            PotError::DeviceLost {
+                reason: DeviceLostReason::Destroyed,
+                ..
+            }
+        ),
+        "expected DeviceLost(Destroyed), got: {err}"
+    );
+
+    // snapshot() must return DeviceLost.
+    let err = pollster::block_on(sess.snapshot()).expect_err("snapshot on a lost device must fail");
+    assert!(
+        matches!(err, PotError::DeviceLost { .. }),
+        "expected DeviceLost, got: {err}"
+    );
+
+    // restore() (sync) must return DeviceLost.
+    let err = sess
+        .restore(&snap)
+        .expect_err("restore on a lost device must fail");
+    assert!(
+        matches!(err, PotError::DeviceLost { .. }),
+        "expected DeviceLost, got: {err}"
+    );
+
+    // A fresh load must succeed and the new model must be healthy.
+    // (sess and model are dropped here by NLL when they fall out of use.)
+    let model2 = load_model();
+    assert!(
+        !model2.is_device_lost(),
+        "freshly loaded model should not be lost"
+    );
+    let mut sess2 = model2.new_session();
+    let first2 = pollster::block_on(sess2.prefill(&short_prompt(), &greedy_sampler()))
+        .expect("prefill on recovered model must succeed");
+    let _ = pollster::block_on(sess2.step(first2, &greedy_sampler()))
+        .expect("step on recovered model must succeed");
 }

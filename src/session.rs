@@ -101,6 +101,7 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if the GPU readback fails.
     pub async fn snapshot(&mut self) -> Result<KvSnapshot> {
+        self.model.check_device()?;
         kv_snapshot::capture(self.model, self.pos).await
     }
 
@@ -121,6 +122,7 @@ impl<'m> Session<'m> {
     /// Returns an error if `snap` does not match the model's `n_layer` /
     /// `kv_dim`, or if `snap.pos()` exceeds `model.max_seq_len()`.
     pub fn restore(&mut self, snap: &KvSnapshot) -> Result<()> {
+        self.model.check_device()?;
         kv_snapshot::apply(self.model, snap)?;
         self.pos = snap.pos();
         Ok(())
@@ -138,6 +140,7 @@ impl<'m> Session<'m> {
     /// Returns an error if `self.pos() != 0`, if the prompt would overflow the
     /// KV cache, or if the underlying GPU dispatch fails.
     pub async fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
+        self.model.check_device()?;
         if self.pos != 0 {
             return Err(PotError::Config(
                 "Session::prefill requires pos == 0; use prefill_one_at_a_time for incremental prefill",
@@ -172,6 +175,7 @@ impl<'m> Session<'m> {
         tokens: &[u32],
         sampler: &Sampler,
     ) -> Result<u32> {
+        self.model.check_device()?;
         let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
             return Err(PotError::ContextOverflow {
@@ -196,6 +200,7 @@ impl<'m> Session<'m> {
     /// Returns an error if advancing `pos` would overflow the KV cache, or if
     /// the underlying GPU dispatch fails.
     pub async fn step(&mut self, token: u32, sampler: &Sampler) -> Result<u32> {
+        self.model.check_device()?;
         if self.pos + 1 > self.model.max_seq {
             return Err(PotError::ContextOverflow {
                 pos: self.pos,
@@ -245,6 +250,7 @@ impl<'m> Session<'m> {
         opts: &GenerateOptions,
         mut on_token: F,
     ) -> Result<StopReason> {
+        self.model.check_device()?;
         let stop_id = opts
             .stop_token
             .unwrap_or_else(|| self.model.config().eos_token_id);

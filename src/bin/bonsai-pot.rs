@@ -211,7 +211,12 @@ fn main() {
                     });
             }
             "microbench" => {
-                __bench::microbench_tg(&model, args.repeats).await;
+                __bench::microbench_tg(&model, args.repeats)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("microbench error: {e}");
+                        exit(3)
+                    });
             }
             "gen" | "prompt" => {
                 let mut buf = Vec::new();
