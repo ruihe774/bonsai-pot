@@ -706,7 +706,7 @@ impl Model {
                 label: None,
                 required_features: wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
                 required_limits: limits,
-                memory_hints: wgpu::MemoryHints::Performance,
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 trace: wgpu::Trace::Off,
             })
