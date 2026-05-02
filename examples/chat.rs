@@ -40,6 +40,7 @@ struct Args {
     seed: u64,
     max_new_tokens: u32,
     max_seq: u32,
+    pipeline_cache_path: Option<PathBuf>,
 }
 
 const HELP: &str = "\
@@ -73,6 +74,10 @@ OPTIONS:
                            bound on prompt + generated tokens across the
                            whole conversation; raising it linearly grows
                            VRAM use. [default: 1024]
+    --pipeline-cache <p>   Path to persist the compiled pipeline cache across
+                           runs. Ignored on backends without PIPELINE_CACHE
+                           support. [default: <model_dir>/pipeline_cache.bin]
+    --no-pipeline-cache    Disable pipeline caching entirely.
     -h, --help             Show this help and exit.
 
 REPL COMMANDS:
@@ -108,6 +113,7 @@ fn parse_args() -> Args {
         exit(1);
     };
     let model_dir = PathBuf::from(model_dir_arg);
+    let default_cache = model_dir.join("pipeline_cache.bin");
     let mut a = Args {
         model_dir,
         bpe: "scripts/bpe.py".into(),
@@ -120,6 +126,7 @@ fn parse_args() -> Args {
             .map_or(0, |d| d.as_nanos() as u64),
         max_new_tokens: 512,
         max_seq: 1024,
+        pipeline_cache_path: Some(default_cache),
     };
     let mut i = 2;
     while i < argv.len() {
@@ -162,6 +169,14 @@ fn parse_args() -> Args {
                 a.max_seq = parse_or_die("--max-seq", &val());
                 i += 2;
             }
+            "--pipeline-cache" => {
+                a.pipeline_cache_path = Some(PathBuf::from(val()));
+                i += 2;
+            }
+            "--no-pipeline-cache" => {
+                a.pipeline_cache_path = None;
+                i += 1;
+            }
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 exit(1);
@@ -201,6 +216,7 @@ fn read_user_line() -> Option<String> {
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
+        .parse_default_env()
         .init();
     let args = parse_args();
 
@@ -212,6 +228,7 @@ fn main() {
             &args.model_dir,
             ModelOptions {
                 max_seq: args.max_seq,
+                pipeline_cache_path: args.pipeline_cache_path,
             },
         )
         .await
