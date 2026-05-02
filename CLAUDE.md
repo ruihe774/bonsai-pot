@@ -109,7 +109,14 @@ The original single-pass `attention.wgsl` is retained for the matmul prefill pat
 
 The resulting `const N_SG = WG / SG_SIZE` makes the merge branch a constant, so on devices where `SG_SIZE == WG` (e.g. AMD wave64) the fast path const-folds and no cross-subgroup barriers run. `matvec_q1_0` and `matvec_q1_0_fused` use a `subgroupShuffleXor` butterfly for the per-row 8-lane reduction; this assumes `subgroup_invocation_id` increases linearly with `local_invocation_index` (true on AMD/NVIDIA/Intel/Apple) and `SG_SIZE >= 8` so XOR mask 4 stays within a subgroup. Hardware with runtime subgroup size < 8 or non-power-of-2 is rejected at load.
 
-To exercise the wave32 / multi-subgroup merge path on AMD RDNA, run with `RADV_PERFTEST=cswave32`. RX 9070 (RDNA4) at default wave64 hits ~87 t/s tg1024; under wave32 it's ~87 t/s tg1024, ~1340 t/s pp512 (vs. ~1484 t/s wave64) — wave32 has a ~10% prefill cost on this hardware but generation is unaffected.
+To exercise the wave32 / multi-subgroup merge path on AMD RDNA, run with `RADV_PERFTEST=cswave32`. RX 9070 (RDNA4) at default wave64 (pp512/tg1024, after 1 warmup):
+
+| model    | pp512 t/s | tg1024 t/s |
+|----------|----------:|-----------:|
+| Bonsai-4B | ~1377    | ~104       |
+| Bonsai-8B | ~808     | ~75        |
+
+Under `RADV_PERFTEST=cswave32` (4B), generation is unaffected but prefill carries a ~10% cost on this hardware.
 
 ### Sampling: hybrid GPU top-K → CPU finish
 
@@ -167,4 +174,4 @@ Since embed runs before topk_reduce in any step, the two roles never alias. `buf
 - **Modifying weight layout**: changes to Q1_0 packing or to the grouping of tensors into the 5 buffers must be made in **both** `scripts/extract.py` (writer) and `model.rs` / shaders (reader), and the manifest format in `config.json` will need to round-trip. Re-extract the model dir after any layout change.
 - **Modifying the tokenizer / pretok regex**: changes to vocab encoding must be made in **both** `scripts/extract.py` (which writes `vocab.bin` + `merges.txt`) and `scripts/bpe.py` (which encodes prompts) and possibly `src/decode.rs` (which inverts the byte-level mapping). The Rust runtime never tokenizes, only decodes.
 - **Public API changes**: re-exports live in `src/lib.rs`. Anything not re-exported there is internal and may change without notice; keep `Model`, `ModelConfig`, `ModelOptions`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `KvSnapshot`, `PotError`, `Result`, `TOPK_MAX` stable.
-- **Perf work**: use `--mode microbench` for per-kernel deltas; use `--mode bench` (specifically `tg{N}` and `pp{N}`) for end-to-end. Most tg time is in matvec dispatches (LM head, ffn_down, attn_output, fused QKV, fused gate-up) plus `topk_reduce` (currently ~1.1 ms/step, a notable fraction of total step time); rms_norm/silu/rope/attention are minor. Recent commits document the wins from multi-row matvec, fused QKV/gate-up, single-pass-per-phase, flash-attn online softmax, and (in earlier history) pipelined generation — keep these intact when refactoring.
+- **Perf work**: use `--mode microbench` for per-kernel deltas; use `--mode bench` (specifically `tg{N}` and `pp{N}`) for end-to-end. Most tg time is in matvec dispatches (LM head, ffn_down, attn_output, fused QKV, fused gate-up) plus rms_norm (which adds up across 73 calls/step); `topk_reduce` and LM head are each ~0.4–0.6 ms/step on 4B. Attention, silu, rope are minor. Recent commits document the wins from multi-row matvec, fused QKV/gate-up, single-pass-per-phase, flash-attn online softmax, and (in earlier history) pipelined generation — keep these intact when refactoring.
