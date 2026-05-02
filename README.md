@@ -59,7 +59,7 @@ cargo run --release --example chat -- ./model
 
 `--temperature`, `--top-k`, `--top-p`, `--seed`. Default is greedy (`--temperature 0.0`). Greedy runs are byte-deterministic; stochastic runs are reproducible per seed.
 
-Sampling is hybrid: a single-workgroup `topk_reduce.wgsl` kernel reduces the full logits tensor to top-K candidates (default K=64) on the GPU; the CPU then does temperature → softmax → top-p → multinomial.
+Sampling is hybrid: a single-workgroup `topk_reduce.wgsl` kernel reduces the full logits tensor to top-K candidates (`K = TOPK_MAX = 32`) on the GPU; the CPU then does temperature → softmax → top-p → multinomial.
 
 ## How it works
 
@@ -74,14 +74,14 @@ The shaders consume these two arrays **directly**:
 
 ### Two execution paths
 
-1. **Single-token (matvec) path** — used for all of `--mode gen` and the generation phase of `--mode prompt`. The whole step (embed → 36 transformer layers → output_norm → LM head → topk) is encoded into a small number of compute passes.
+1. **Single-token (matvec) path** — used for all of `--mode gen` and the generation phase of `--mode prompt`. The whole step (embed → 36 transformer layers → output_norm → LM head → topk) is encoded into a single compute pass.
 2. **Batched-prefill (matmul) path** — used by `Session::prefill` and `--mode prompt`. Activations are quantized to Q8_0 once per layer; weights stay in Q1_0.
 
-Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches all dispatches into two big passes — one before the per-layer KV copy, one after.
+Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches every dispatch — embed, all 36 layers, output norm, LM head, and `topk_reduce` — into a single compute pass. Per-layer K/V is quantized to Q8_0 directly into the KV cache by a `kv_writeback` kernel, replacing the `copy_buffer_to_buffer` that used to break the pass.
 
 ### GPU memory layout
 
-Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v`, configurable up to `MAX_SEQ`. Bonsai-4B uses tied embeddings, so `token_embd.weight` serves as both the embedding table and the LM head.
+Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v` and stored in **Q8_0** (~2.25 bytes/element); per-step K/V is quantized straight into the cache, with no f16 staging copy. Capacity is set at load via `ModelOptions::max_seq` (default 1024; `--max-seq` on both the bin and the chat example). Bonsai-4B uses tied embeddings, so `token_embd.weight` serves as both the embedding table and the LM head.
 
 There is exactly one `uniform` buffer; every dispatch's params struct is appended to a CPU-side pool with a dynamic offset, and the whole pool is uploaded in one `write_buffer` per step.
 
@@ -90,17 +90,19 @@ There is exactly one `uniform` buffer; every dispatch's params struct is appende
 | Path | What's in it |
 | --- | --- |
 | `src/lib.rs` | Public API surface, re-exports |
-| `src/model.rs` | Config / manifest loading, GPU device & buffer & pipeline & BGL setup, RoPE precompute |
+| `src/model.rs` | Config / manifest loading, GPU device & buffer & pipeline & BGL setup, RoPE precompute, `ModelOptions` |
 | `src/session.rs` | `Session<'m>`, `Sampler`, `GenerateOptions`, `StopReason`, CPU sampler |
+| `src/kv_snapshot.rs` | Host-resident `KvSnapshot` of the GPU KV cache (used by `Session::snapshot` / `Session::restore`) |
 | `src/forward.rs` | Forward pass (both paths) and per-step encoder helpers |
 | `src/error.rs` | `PotError` / `Result` |
 | `src/decode.rs` | GPT-2 byte-level decode |
 | `src/bin/bonsai-pot.rs` | Demo CLI |
 | `src/shaders/*.wgsl` | One file per kernel |
 | `examples/chat.rs` | Interactive ChatML REPL on the public API |
+| `tests/gpu_integration.rs` | End-to-end GPU tests (load `./model`, prefill/generate, snapshot round-trip) |
 | `scripts/extract.py` | GGUF → flat-file converter |
 | `scripts/bpe.py` | Standalone BPE encoder |
 
 ## Public API
 
-`Model`, `ModelConfig`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `PotError`, `Result`, `TOPK_MAX`. Anything not re-exported from `src/lib.rs` is internal.
+`Model`, `ModelConfig`, `ModelOptions`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `KvSnapshot`, `PotError`, `Result`, `TOPK_MAX`. Anything not re-exported from `src/lib.rs` is internal.
