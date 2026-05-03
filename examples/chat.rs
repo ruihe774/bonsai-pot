@@ -79,11 +79,11 @@ OPTIONS:
     --seed <n>             PRNG seed for reproducible sampling.
                            [default: wallclock-derived]
     --max-new-tokens <n>   Hard cap on tokens emitted per assistant turn.
-                           [default: 512]
+                           [default: 4096]
     --max-seq <n>          KV-cache capacity (positions). Sets the upper
                            bound on prompt + generated tokens across the
                            whole conversation; raising it linearly grows
-                           VRAM use. [default: 1024]
+                           VRAM use. [default: 16384]
     --pipeline-cache <p>   Path to persist the compiled pipeline cache across
                            runs. Ignored on backends without PIPELINE_CACHE
                            support. [default: <model_dir>/pipeline_cache.bin]
@@ -118,10 +118,7 @@ fn parse_args() -> Args {
         print!("{HELP}");
         exit(0);
     }
-    let Some(model_dir_arg) = argv.get(1) else {
-        eprintln!("error: missing <model_dir>\n\n{HELP}");
-        exit(1);
-    };
+    let model_dir_arg = argv.get(1).map_or("model", AsRef::as_ref).to_owned();
     let model_dir = PathBuf::from(model_dir_arg);
     let default_cache = model_dir.join("pipeline_cache.bin");
     let mut a = Args {
@@ -133,8 +130,8 @@ fn parse_args() -> Args {
         seed: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64),
-        max_new_tokens: 512,
-        max_seq: 1024,
+        max_new_tokens: 4096,
+        max_seq: 16384,
         pipeline_cache_path: Some(default_cache),
     };
     let mut i = 2;
