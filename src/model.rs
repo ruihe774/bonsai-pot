@@ -10,10 +10,13 @@ use std::fs::{read, read_to_string, write};
 use std::mem::size_of;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::str::{from_utf8, FromStr};
+use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, OnceLock};
 
-use bytemuck::{cast_slice, Pod, Zeroable};
+use ash::vk;
+use bytemuck::{Pod, Zeroable, cast_slice};
+use wgpu::hal::DeviceError;
+use wgpu::hal::api::Vulkan as VulkanApi;
 use wgpu::util::DeviceExt as _;
 
 use crate::decode;
@@ -914,16 +917,101 @@ impl Model {
         if pipeline_cache_supported && opts.pipeline_cache_path.is_some() {
             required_features |= wgpu::Features::PIPELINE_CACHE;
         }
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features,
-                required_limits: limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-                trace: wgpu::Trace::Off,
+        let desc = wgpu::DeviceDescriptor {
+            label: None,
+            required_features,
+            required_limits: limits,
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        };
+        // Open the Vulkan device via the HAL so we can select the async compute
+        // queue family (compute-only, no graphics bit) and request low priority.
+        // Falls back to request_device if the adapter isn't a Vulkan adapter.
+        //
+        // We can't use `open_with_callback` here: it hardcodes
+        // `family_index = 0` (see wgpu-hal-29.0.1/src/vulkan/adapter.rs:2821)
+        // and passes that to `device_from_raw`, so even if the callback swaps
+        // the family in the create-info the post-create `vkGetDeviceQueue`
+        // still asks for queue (0,0) which we never requested — segfault.
+        // Instead we replicate `open_with_callback` ourselves and pass the
+        // chosen family index through to `device_from_raw`.
+        let hal_open = unsafe {
+            adapter.as_hal::<VulkanApi>().map(|hal_adapter| {
+                let pd = hal_adapter.raw_physical_device();
+                let instance = hal_adapter.shared_instance().raw_instance();
+                let families = instance.get_physical_device_queue_family_properties(pd);
+                // Prefer a compute-only family (no GRAPHICS bit) — the async
+                // compute queue on AMD.  Fall back to family 0 if none found.
+                let family_idx: u32 = families
+                    .iter()
+                    .position(|p| {
+                        p.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                            && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    })
+                    .map_or(0, |i| i as u32);
+                log::info!(
+                    "vk queue family {} (async_compute={})",
+                    family_idx,
+                    family_idx != 0,
+                );
+
+                let enabled_extensions =
+                    hal_adapter.required_device_extensions(desc.required_features);
+                let mut enabled_phd_features = hal_adapter
+                    .physical_device_features(&enabled_extensions, desc.required_features);
+
+                let queue_infos = [vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family_idx)
+                    .queue_priorities(&[0.5_f32])];
+
+                let str_pointers: Vec<_> = enabled_extensions.iter().map(|s| s.as_ptr()).collect();
+
+                let pre_info = vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queue_infos)
+                    .enabled_extension_names(&str_pointers);
+                let info = enabled_phd_features.add_to_device_create(pre_info);
+
+                let raw_device = match instance.create_device(pd, &info, None) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // Mirror wgpu-hal's own `vkCreateDevice` error mapping
+                        // (private helpers `hal_usage_error` /
+                        // `map_host_device_oom_and_lost_err` aren't reachable
+                        // from outside the crate, so we inline the cases).
+                        log::warn!("vkCreateDevice on family {family_idx} failed: {e:?}");
+                        let mapped = match e {
+                            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                            | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                            | vk::Result::ERROR_TOO_MANY_OBJECTS => DeviceError::OutOfMemory,
+                            vk::Result::ERROR_INITIALIZATION_FAILED
+                            | vk::Result::ERROR_DEVICE_LOST => DeviceError::Lost,
+                            _ => DeviceError::Unexpected,
+                        };
+                        return Err(mapped);
+                    }
+                };
+
+                hal_adapter.device_from_raw(
+                    raw_device,
+                    None,
+                    &enabled_extensions,
+                    desc.required_features,
+                    &desc.required_limits,
+                    &desc.memory_hints,
+                    family_idx,
+                    0,
+                )
             })
-            .await?;
+        };
+        let (device, queue) = match hal_open {
+            Some(Ok(open)) => unsafe { adapter.create_device_from_hal(open, &desc)? },
+            Some(Err(e)) => {
+                log::warn!("Vulkan HAL open failed ({e:?}), falling back to request_device");
+                adapter.request_device(&desc).await?
+            }
+            None => adapter.request_device(&desc).await?,
+        };
 
         // ---- pipeline cache (best-effort) -----------------------------------
         // Only created when the caller supplied a path AND the adapter supports
@@ -1250,14 +1338,12 @@ impl Model {
         };
 
         // ---- persist pipeline cache -----------------------------------------
-        if let Some((cache, path, prior)) = &pipeline_cache {
-            if let Some(data) = cache.get_data() {
-                if prior.as_deref() != Some(data.as_slice()) {
-                    if let Err(e) = write(path, &data) {
-                        log::warn!("failed to write pipeline cache to {}: {e}", path.display());
-                    }
-                }
-            }
+        if let Some((cache, path, prior)) = &pipeline_cache
+            && let Some(data) = cache.get_data()
+            && prior.as_deref() != Some(data.as_slice())
+            && let Err(e) = write(path, &data)
+        {
+            log::warn!("failed to write pipeline cache to {}: {e}", path.display());
         }
 
         // ---- vocab ----------------------------------------------------------
@@ -1833,7 +1919,7 @@ mod tests {
         // pos=0: all cos=1.0, sin=0.0
         assert!((table[0] - 1.0f32).abs() < 1e-6); // cos(0)
         assert!((table[1] - 0.0f32).abs() < 1e-6); // sin(0)
-                                                   // pos=1, j=0: theta=10000^0=1.0, angle=1.0
+        // pos=1, j=0: theta=10000^0=1.0, angle=1.0
         let cos1 = (1.0f64).cos() as f32;
         let sin1 = (1.0f64).sin() as f32;
         assert!(

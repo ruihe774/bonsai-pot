@@ -23,6 +23,7 @@ bench-internals = ["dep:pollster", "dep:env_logger"]
 [dependencies]
 # Library deps.
 wgpu = { version = "29", default-features = false, features = ["std", "vulkan", "wgsl"] }
+ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 log = "0.4"
