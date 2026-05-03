@@ -1344,12 +1344,19 @@ impl Model {
                 bind_group_layouts: &[Some(layout)],
                 immediate_size: 0,
             });
+            // Every shader's workgroup memory is fully written before being
+            // read (cooperative tile loads + barrier, or per-thread slot
+            // writes), so we don't rely on the implicit zero-init that wgpu
+            // would otherwise inject as a per-dispatch prelude.
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pl),
                 module: sh,
                 entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
                 cache: None,
             })
         };
