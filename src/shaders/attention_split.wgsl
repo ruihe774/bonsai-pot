@@ -67,7 +67,7 @@ fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
   if (sg_inv_id == 0u) { sg_partial4[sg_id] = sg_sum; }
   workgroupBarrier();
   if (sg_id == 0u) {
-    var combined = vec4<f32>(0.0);
+    var combined: vec4<f32>;
     if (sg_inv_id < N_SG) { combined = sg_partial4[sg_inv_id]; }
     let final_sum = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial4[0] = final_sum; }
@@ -132,11 +132,8 @@ fn main(
   var o1: array<f32, ELEMS_PER_THREAD>;
   var o2: array<f32, ELEMS_PER_THREAD>;
   var o3: array<f32, ELEMS_PER_THREAD>;
-  for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) {
-    o0[i] = 0.0; o1[i] = 0.0; o2[i] = 0.0; o3[i] = 0.0;
-  }
   var m: vec4<f32> = vec4<f32>(-1e30);
-  var l: vec4<f32> = vec4<f32>(0.0);
+  var l: vec4<f32>;
 
   for (var t: u32 = chunk_start; t < chunk_end; t++) {
     // Load K[t] once, broadcast against all four Qs.

@@ -66,7 +66,7 @@ fn main(
   let row_d_byte  = p.d_offset  + row * nb * 2u;
   let row_qs_byte = p.qs_offset + row * nb * 16u;
 
-  var acc: f32 = 0.0;
+  var acc: f32;
 
   for (var tile_start: u32 = 0u; tile_start < p.k; tile_start += TILE_K) {
     let tile_size = min(TILE_K, p.k - tile_start);

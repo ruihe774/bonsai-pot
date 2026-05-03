@@ -38,7 +38,7 @@ fn wg_max(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
   if (sg_inv_id == 0u) { sg_amax[sg_id] = sg_m; }
   workgroupBarrier();
   if (sg_id == 0u) {
-    var combined: f32 = 0.0;
+    var combined: f32;
     if (sg_inv_id < N_SG) { combined = sg_amax[sg_inv_id]; }
     let final_m = subgroupMax(combined);
     if (sg_inv_id == 0u) { sg_amax[0] = final_m; }

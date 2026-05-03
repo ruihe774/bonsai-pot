@@ -75,10 +75,10 @@ fn main(
   // the function — the array gets lowered to spill/scratch memory and
   // produces garbage outputs. Linux RADV is unaffected. Replacing with
   // scalars keeps every value in registers across all backends.
-  var acc00: f32 = 0.0; var acc01: f32 = 0.0; var acc02: f32 = 0.0; var acc03: f32 = 0.0;
-  var acc10: f32 = 0.0; var acc11: f32 = 0.0; var acc12: f32 = 0.0; var acc13: f32 = 0.0;
-  var acc20: f32 = 0.0; var acc21: f32 = 0.0; var acc22: f32 = 0.0; var acc23: f32 = 0.0;
-  var acc30: f32 = 0.0; var acc31: f32 = 0.0; var acc32: f32 = 0.0; var acc33: f32 = 0.0;
+  var acc00: f32; var acc01: f32; var acc02: f32; var acc03: f32;
+  var acc10: f32; var acc11: f32; var acc12: f32; var acc13: f32;
+  var acc20: f32; var acc21: f32; var acc22: f32; var acc23: f32;
+  var acc30: f32; var acc31: f32; var acc32: f32; var acc33: f32;
 
   for (var b: u32 = 0u; b < nb_q1; b = b + 1u) {
     // ---- Cooperative loads ----

@@ -84,7 +84,7 @@ fn wg_sum_f32(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
   if (sg_inv_id == 0u) { sg_partial1[sg_id] = sg_sum; }
   workgroupBarrier();
   if (sg_id == 0u) {
-    var combined: f32 = 0.0;
+    var combined: f32;
     if (sg_inv_id < N_SG) { combined = sg_partial1[sg_inv_id]; }
     let final_sum = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial1[0] = final_sum; }
@@ -137,10 +137,9 @@ fn main(
 
   // Per-thread output slice: element indices tid, tid+WG, ...
   var o: array<f32, ELEMS_PER_THREAD>;
-  for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) { o[i] = 0.0; }
 
   var m_run: f32 = -1e30;
-  var l_run: f32 = 0.0;
+  var l_run: f32;
 
   let main_end = (cur_pos / UNROLL) * UNROLL;
   var t: u32 = 0u;

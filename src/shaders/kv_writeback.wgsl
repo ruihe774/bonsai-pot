@@ -55,8 +55,8 @@ fn wg_max2(a: f32, b: f32, tid: u32, sg_inv_id: u32) -> vec2<f32> {
   }
   workgroupBarrier();
   if (sg_id == 0u) {
-    var ca: f32 = 0.0;
-    var cb: f32 = 0.0;
+    var ca: f32;
+    var cb: f32;
     if (sg_inv_id < N_SG) {
       ca = sg_amax_k[sg_inv_id];
       cb = sg_amax_v[sg_inv_id];

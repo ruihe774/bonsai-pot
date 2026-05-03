@@ -43,7 +43,7 @@ fn main(
   let in_base = p.input_offset + gi * n;
   let out_base = p.output_offset + gi * n;
 
-  var s: f32 = 0.0;
+  var s: f32;
   for (var i: u32 = tid; i < n; i += WG) {
     let v = f32(act[in_base + i]);
     s += v * v;
@@ -60,7 +60,7 @@ fn main(
     if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_sum; }
     workgroupBarrier();
     if (sg_id == 0u) {
-      var combined: f32 = 0.0;
+      var combined: f32;
       if (sg_inv_id < N_SG) { combined = sg_partial[sg_inv_id]; }
       let final_sum = subgroupAdd(combined);
       if (sg_inv_id == 0u) { sg_partial[0] = final_sum; }

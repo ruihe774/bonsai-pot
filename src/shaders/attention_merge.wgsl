@@ -61,7 +61,7 @@ fn wg_sum(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
   if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_s; }
   workgroupBarrier();
   if (sg_id == 0u) {
-    var combined: f32 = 0.0;
+    var combined: f32;
     if (sg_inv_id < N_SG) { combined = sg_partial[sg_inv_id]; }
     let final_s = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial[0] = final_s; }
@@ -91,7 +91,7 @@ fn main(
   let m_global = wg_max(m_local, tid, sg_inv_id);
 
   // Phase B: parallel weight precompute + parallel l_global reduction.
-  var l_local: f32 = 0.0;
+  var l_local: f32;
   for (var c: u32 = tid; c < n; c += WG) {
     let pb = head_base + c * PARTIAL_STRIDE;
     let m_c = partials[pb + hd];
@@ -107,7 +107,6 @@ fn main(
   // family: head_dim=128, WG=64); models with a different head_dim would need
   // ELEMS_PER_THREAD retemplated.
   var o: array<f32, ELEMS_PER_THREAD>;
-  for (var i: u32 = 0u; i < ELEMS_PER_THREAD; i++) { o[i] = 0.0; }
   for (var c: u32 = 0u; c < n; c++) {
     let pb = head_base + c * PARTIAL_STRIDE;
     let weight = weights_sh[c];

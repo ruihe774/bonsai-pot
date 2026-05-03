@@ -62,10 +62,10 @@ fn main(
   // Resolve which range this row belongs to. Range sizes are guaranteed to be
   // multiples of ROWS_PER_WG, so the entire WG falls in a single range and the
   // branches below are uniform across the workgroup.
-  var d_off: u32 = 0u;
-  var qs_off: u32 = 0u;
-  var out_off: u32 = 0u;
-  var local_row: u32 = 0u;
+  var d_off: u32;
+  var qs_off: u32;
+  var out_off: u32;
+  var local_row: u32;
   if (valid) {
     if (global_row < p.n_0) {
       d_off = p.d_offset_0; qs_off = p.qs_offset_0;
@@ -82,7 +82,7 @@ fn main(
   let row_d_byte  = d_off  + local_row * nb * 2u;
   let row_qs_byte = qs_off + local_row * nb * 16u;
 
-  var acc: f32 = 0.0;
+  var acc: f32;
 
   for (var tile_start: u32 = 0u; tile_start < p.k; tile_start += TILE_K) {
     let tile_size = min(TILE_K, p.k - tile_start);
