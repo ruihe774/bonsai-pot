@@ -519,6 +519,12 @@ pub struct ModelOptions {
     /// caching. Best-effort: backends without `Features::PIPELINE_CACHE`
     /// silently skip, and read/write errors are logged but never fatal.
     pub pipeline_cache_path: Option<PathBuf>,
+    /// Priority of the command queue, a normalized floating-point value between 0.0 and 1.0,
+    /// which is then translated to a discrete priority level by the implementation.
+    /// Higher values indicate a higher priority,
+    /// with 0.0 being the lowest priority and 1.0 being the highest.
+    /// The implementation makes no guarantees with regards to queues across different devices.
+    pub queue_priority: f32,
 }
 
 impl Default for ModelOptions {
@@ -526,6 +532,7 @@ impl Default for ModelOptions {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
             pipeline_cache_path: None,
+            queue_priority: 0.0,
         }
     }
 }
@@ -961,9 +968,10 @@ impl Model {
                 let mut enabled_phd_features = hal_adapter
                     .physical_device_features(&enabled_extensions, desc.required_features);
 
+                let priorities = [opts.queue_priority];
                 let queue_infos = [vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(family_idx)
-                    .queue_priorities(&[0.5_f32])];
+                    .queue_priorities(&priorities)];
 
                 let str_pointers: Vec<_> = enabled_extensions.iter().map(|s| s.as_ptr()).collect();
 

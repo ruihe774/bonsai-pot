@@ -217,6 +217,7 @@ fn main() {
             ModelOptions {
                 max_seq: args.max_seq,
                 pipeline_cache_path: args.pipeline_cache_path,
+                ..Default::default()
             },
         )
         .await
