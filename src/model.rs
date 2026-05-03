@@ -13,6 +13,7 @@ use std::path::Path;
 use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, OnceLock};
 
+use ash::ext::global_priority;
 use ash::vk;
 use bytemuck::{Pod, Zeroable, cast_slice};
 use wgpu::hal::DeviceError;
@@ -500,6 +501,48 @@ pub const ATTN_CHUNK_SIZE: u32 = 32;
 // 4096 leaves ~8x headroom and is 16x smaller than the historical 65536.
 pub const UNIFORM_POOL_SLOTS: u64 = 4096;
 
+/// System-wide GPU queue scheduling priority, passed via `VK_EXT_global_priority`.
+///
+/// Controls how the OS/driver kernel schedules this process's GPU work relative
+/// to *all* other GPU clients (compositors, games, other ML processes). Requires
+/// driver support for `VK_EXT_global_priority`; if unsupported the requested
+/// value is ignored and a warning is logged.
+///
+/// Maps to `VkQueueGlobalPriorityKHR`: `Low` = 128, `Medium` = 256,
+/// `High` = 512, `Realtime` = 1024. `Realtime` typically requires elevated OS
+/// privileges and may cause `vkCreateDevice` to fail on unprivileged processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GlobalPriority {
+    /// Yields to other GPU clients. Good for background inference. (Default)
+    #[default]
+    Low,
+    /// Vulkan's implicit default when no global priority is specified.
+    Medium,
+    /// Inference takes precedence over normal GPU clients.
+    High,
+    /// Highest priority; requires system privileges.
+    Realtime,
+}
+
+impl GlobalPriority {
+    const fn to_vk(self) -> vk::QueueGlobalPriorityKHR {
+        match self {
+            Self::Low => vk::QueueGlobalPriorityKHR::LOW,
+            Self::Medium => vk::QueueGlobalPriorityKHR::MEDIUM,
+            Self::High => vk::QueueGlobalPriorityKHR::HIGH,
+            Self::Realtime => vk::QueueGlobalPriorityKHR::REALTIME,
+        }
+    }
+
+    const fn to_queue_prio(self) -> f32 {
+        match self {
+            Self::Low => 0.0,
+            Self::Medium => 0.5,
+            Self::High | Self::Realtime => 1.0,
+        }
+    }
+}
+
 /// Allocate-time tunables for [`Model::load_with_options`].
 ///
 /// These affect GPU buffer sizing (KV cache, `RoPE` table) and so cannot be
@@ -515,19 +558,20 @@ pub struct ModelOptions {
     /// a sequence-length limit, so any value up to the model's
     /// `context_length` is supported (subject to VRAM).
     pub max_seq: u32,
-    /// Priority of the command queue, a normalized floating-point value between 0.0 and 1.0,
-    /// which is then translated to a discrete priority level by the implementation.
-    /// Higher values indicate a higher priority,
-    /// with 0.0 being the lowest priority and 1.0 being the highest.
-    /// The implementation makes no guarantees with regards to queues across different devices.
-    pub queue_priority: f32,
+    /// System-wide GPU scheduling priority via `VK_EXT_global_priority`.
+    ///
+    /// See [`GlobalPriority`] for the available levels. Default is
+    /// [`GlobalPriority::Low`] — yields to compositors and other GPU clients,
+    /// which is appropriate for background inference. If the driver does not
+    /// expose `VK_EXT_global_priority` this field is silently ignored.
+    pub priority: GlobalPriority,
 }
 
 impl Default for ModelOptions {
     fn default() -> Self {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
-            queue_priority: 0.0,
+            priority: GlobalPriority::Low,
         }
     }
 }
@@ -953,12 +997,33 @@ impl Model {
                 let mut enabled_phd_features = hal_adapter
                     .physical_device_features(&enabled_extensions, desc.required_features);
 
-                let priorities = [opts.queue_priority];
-                let queue_infos = [vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family_idx)
-                    .queue_priorities(&priorities)];
+                let gp_supported = instance
+                    .enumerate_device_extension_properties(pd)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(global_priority::NAME));
 
-                let str_pointers: Vec<_> = enabled_extensions.iter().map(|s| s.as_ptr()).collect();
+                let priorities = [opts.priority.to_queue_prio()];
+                let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
+                    .global_priority(opts.priority.to_vk());
+                let mut qci = vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family_idx)
+                    .queue_priorities(&priorities);
+                if gp_supported {
+                    qci = qci.push_next(&mut gp_info);
+                } else {
+                    log::warn!(
+                        "VK_EXT_global_priority not supported; ignoring global_priority {:?}",
+                        opts.priority
+                    );
+                }
+                let queue_infos = [qci];
+
+                let mut str_pointers: Vec<_> =
+                    enabled_extensions.iter().map(|s| s.as_ptr()).collect();
+                if gp_supported {
+                    str_pointers.push(global_priority::NAME.as_ptr());
+                }
 
                 let pre_info = vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queue_infos)
@@ -979,6 +1044,13 @@ impl Model {
                             | vk::Result::ERROR_TOO_MANY_OBJECTS => DeviceError::OutOfMemory,
                             vk::Result::ERROR_INITIALIZATION_FAILED
                             | vk::Result::ERROR_DEVICE_LOST => DeviceError::Lost,
+                            vk::Result::ERROR_NOT_PERMITTED_KHR => {
+                                log::warn!(
+                                    "vkCreateDevice denied global_priority {:?} (not permitted)",
+                                    opts.priority
+                                );
+                                DeviceError::Unexpected
+                            }
                             _ => DeviceError::Unexpected,
                         };
                         return Err(mapped);
