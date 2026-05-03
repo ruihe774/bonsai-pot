@@ -90,7 +90,10 @@ fn main(
         let d = load_f16_at(row_d_byte + b * 2u);
         let qs_word_base = (row_qs_byte + b * 16u) >> 2u;
         let x_v4_base = b_local * 32u;  // 128 elements / 4 = 32 vec4s per block
-        var block_acc: vec4<f32> = vec4<f32>(0.0);
+        // Accumulate in f16 across the block (max 128 ±xv values, well under
+        // the f16 representable range for typical post-norm activations) so the
+        // 32 inner adds stay packed and avoid the f16→f32 widening per step.
+        var block_acc: vec4<f16> = vec4<f16>(0.0);
         for (var w: u32 = 0u; w < 4u; w++) {
           let qword = weights[qs_word_base + w];
           // Process 32 sign bits in 8 groups of 4, one vec4<f16> per group.
@@ -103,11 +106,11 @@ fn main(
               (bits & 8u) != 0u,
             );
             let xv4 = x_sh[x_v4_base + w * 8u + i];
-            let signed4 = select(-xv4, xv4, mask4);
-            block_acc += vec4<f32>(signed4);
+            block_acc += select(-xv4, xv4, mask4);
           }
         }
-        acc = acc + d * (block_acc.x + block_acc.y + block_acc.z + block_acc.w);
+        let lane_sum = f32(block_acc.x + block_acc.y + block_acc.z + block_acc.w);
+        acc = acc + d * lane_sum;
       }
     }
     workgroupBarrier();

@@ -33,11 +33,11 @@ struct Params {
 @group(0) @binding(1) var<storage, read> logits: array<u32>;
 @group(0) @binding(2) var<storage, read_write> result: array<u32>;
 
-const WG: u32 = 64u;
+const WG: u32 = 256u;
 const K_MAX: u32 = 32u;
 
-var<workgroup> sh_val: array<f32, 2048u>;   // WG * K_MAX
-var<workgroup> sh_idx: array<u32, 2048u>;
+var<workgroup> sh_val: array<f32, 8192u>;   // WG * K_MAX
+var<workgroup> sh_idx: array<u32, 8192u>;
 
 // Sift-down for a min-heap rooted at `base`, restoring heap property after
 // (potentially) replacing the root.

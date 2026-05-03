@@ -23,7 +23,12 @@ struct Params {
 @group(0) @binding(2) var<storage, read> w: array<f16>;
 
 const SG_SIZE: u32 = {{SG_SIZE}}u;
-const WG: u32 = 64u;
+// 512 threads / WG = 8 wave64. For the per-layer n_embd norm (single WG over
+// 2560 elements, called 73× per token) this is the only knob that controls
+// in-flight memory ops on the one CU running the WG; bumping from 64 → 512
+// lets that CU keep 8× more loads outstanding, which is what closes the gap
+// vs. llama.cpp's BLOCK_SIZE=512 rms_norm and is by itself worth ~+10% tg t/s.
+const WG: u32 = 512u;
 const N_SG: u32 = WG / SG_SIZE;
 
 // Sized for cross-subgroup partials. With SG_SIZE == WG (e.g. AMD wave64) this
