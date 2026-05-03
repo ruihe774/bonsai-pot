@@ -57,51 +57,71 @@ mod tests {
     #[test]
     fn display_each_variant() {
         assert!(make_io_error().to_string().contains("/tmp/fake"));
-        assert!(PotError::Config("bad ini key")
-            .to_string()
-            .contains("bad ini key"));
-        assert!(PotError::Vocab("bad magic")
-            .to_string()
-            .contains("bad magic"));
+        assert!(
+            PotError::Config("bad ini key")
+                .to_string()
+                .contains("bad ini key")
+        );
+        assert!(
+            PotError::Vocab("bad magic")
+                .to_string()
+                .contains("bad magic")
+        );
         assert!(PotError::NoAdapter.to_string().contains("GPU adapter"));
-        assert!(PotError::FeatureUnsupported("SHADER_F16")
+        assert!(
+            PotError::FeatureUnsupported("SHADER_F16")
+                .to_string()
+                .contains("SHADER_F16")
+        );
+        assert!(
+            PotError::BufferMap(wgpu::BufferAsyncError)
+                .to_string()
+                .contains("buffer")
+        );
+        assert!(
+            PotError::ContextOverflow {
+                pos: 1020,
+                n: 8,
+                max: 1024
+            }
             .to_string()
-            .contains("SHADER_F16"));
-        assert!(PotError::BufferMap(wgpu::BufferAsyncError)
+            .contains("pos 1020")
+        );
+        assert!(
+            PotError::ContextOverflow {
+                pos: 1020,
+                n: 8,
+                max: 1024
+            }
             .to_string()
-            .contains("buffer"));
-        assert!(PotError::ContextOverflow {
-            pos: 1020,
-            n: 8,
-            max: 1024
-        }
-        .to_string()
-        .contains("pos 1020"));
-        assert!(PotError::ContextOverflow {
-            pos: 1020,
-            n: 8,
-            max: 1024
-        }
-        .to_string()
-        .contains("max_seq 1024"));
-        assert!(PotError::PrefillTooLarge { n: 600, max: 512 }
+            .contains("max_seq 1024")
+        );
+        assert!(
+            PotError::PrefillTooLarge { n: 600, max: 512 }
+                .to_string()
+                .contains("600")
+        );
+        assert!(
+            PotError::Config("bad value")
+                .to_string()
+                .contains("bad value")
+        );
+        assert!(
+            PotError::DeviceLost {
+                reason: wgpu::DeviceLostReason::Destroyed,
+                message: "test".to_string()
+            }
             .to_string()
-            .contains("600"));
-        assert!(PotError::Config("bad value")
+            .contains("Destroyed")
+        );
+        assert!(
+            PotError::DeviceLost {
+                reason: wgpu::DeviceLostReason::Destroyed,
+                message: "test".to_string()
+            }
             .to_string()
-            .contains("bad value"));
-        assert!(PotError::DeviceLost {
-            reason: wgpu::DeviceLostReason::Destroyed,
-            message: "test".to_string()
-        }
-        .to_string()
-        .contains("Destroyed"));
-        assert!(PotError::DeviceLost {
-            reason: wgpu::DeviceLostReason::Destroyed,
-            message: "test".to_string()
-        }
-        .to_string()
-        .contains("test"));
+            .contains("test")
+        );
     }
 
     #[test]
@@ -111,25 +131,33 @@ mod tests {
         assert!(PotError::Vocab("x").source().is_none());
         assert!(PotError::NoAdapter.source().is_none());
         assert!(PotError::FeatureUnsupported("x").source().is_none());
-        assert!(PotError::BufferMap(wgpu::BufferAsyncError)
+        assert!(
+            PotError::BufferMap(wgpu::BufferAsyncError)
+                .source()
+                .is_none()
+        );
+        assert!(
+            PotError::ContextOverflow {
+                pos: 0,
+                n: 1,
+                max: 1
+            }
             .source()
-            .is_none());
-        assert!(PotError::ContextOverflow {
-            pos: 0,
-            n: 1,
-            max: 1
-        }
-        .source()
-        .is_none());
-        assert!(PotError::PrefillTooLarge { n: 1, max: 1 }
-            .source()
-            .is_none());
+            .is_none()
+        );
+        assert!(
+            PotError::PrefillTooLarge { n: 1, max: 1 }
+                .source()
+                .is_none()
+        );
         assert!(PotError::Config("x").source().is_none());
-        assert!(PotError::DeviceLost {
-            reason: wgpu::DeviceLostReason::Unknown,
-            message: String::new()
-        }
-        .source()
-        .is_none());
+        assert!(
+            PotError::DeviceLost {
+                reason: wgpu::DeviceLostReason::Unknown,
+                message: String::new()
+            }
+            .source()
+            .is_none()
+        );
     }
 }

@@ -26,10 +26,10 @@ use bytemuck::Pod;
 
 use crate::error::{PotError, Result};
 use crate::model::{
-    AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams, KvWritebackParams,
-    MatmulParams, MatvecFusedParams, MatvecParams, Model, QuantParams, RmsNormParams, RopeParams,
-    SiluMulParams, TopKParams, WeightSet, ATTN_CHUNK_SIZE, TOPK_MAX, UNIFORM_POOL_SLOTS,
-    UNIFORM_SLOT_SIZE,
+    ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
+    KvWritebackParams, MatmulParams, MatvecFusedParams, MatvecParams, Model, QuantParams,
+    RmsNormParams, RopeParams, SiluMulParams, TOPK_MAX, TopKParams, UNIFORM_POOL_SLOTS,
+    UNIFORM_SLOT_SIZE, WeightSet,
 };
 
 // ---------- Q8_0 KV cache layout helpers ------------------------------------
@@ -1457,9 +1457,9 @@ pub mod bench_internals {
     use wgpu::PollType;
 
     use super::{
+        AttnParams, Config, EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
         kv_layer_offsets, kv_writeback, matvec_q1_0, matvec_q1_0_fused_pass, prefill_matmul_topk,
-        rms_norm, rope, silu_mul, step_matvec_no_sample, step_matvec_topk, AttnParams, Config,
-        EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
+        rms_norm, rope, silu_mul, step_matvec_no_sample, step_matvec_topk,
     };
     use crate::error::PotError;
 
@@ -1892,7 +1892,9 @@ pub mod bench_internals {
         println!(
             "|-------------------------------------|-----------:|--------:|--------:|------:|"
         );
-        println!("| TOTAL (sum of isolated)             |            |         | {total_ms:>7.3} |       |");
+        println!(
+            "| TOTAL (sum of isolated)             |            |         | {total_ms:>7.3} |       |"
+        );
         println!(
             "expected tg t/s if isolated sum was reality: {:.1}",
             1000.0 / total_ms

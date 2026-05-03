@@ -19,7 +19,7 @@
 
 use std::env;
 use std::fmt::Display;
-use std::io::{stdin, stdout, Read as _, Write as _};
+use std::io::{Read as _, Write as _, stdin, stdout};
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;

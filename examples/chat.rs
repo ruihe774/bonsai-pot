@@ -29,9 +29,9 @@
 
 use std::env;
 use std::fmt::Display;
-use std::io::{stdin, stdout, Write as _};
+use std::io::{Write as _, stdin, stdout};
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command, Stdio};
+use std::process::{Command, Stdio, exit};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
