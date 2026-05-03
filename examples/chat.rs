@@ -8,16 +8,16 @@
 //! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
 //! Bonsai is an instruction-tuned model family; we render each turn into the
-//! Qwen-style `ChatML` template (`<|im_start|>...<|im_end|>`), shell out to
-//! `scripts/bpe.py` for tokenization, prefill, and stream the assistant's
-//! reply token-by-token. Multi-turn conversation is preserved across the
-//! `Session`'s KV cache.
+//! Qwen-style `ChatML` template (`<|im_start|>...<|im_end|>`), tokenize with
+//! the `tokenizers` crate (Qwen2 byte-level BPE, built from the model dir's
+//! `vocab.bin` + `merges.txt`), prefill, and stream the assistant's reply
+//! token-by-token. Multi-turn conversation is preserved across the `Session`'s
+//! KV cache.
 //!
 //! Run:
 //!   cargo run --release --example chat -- ./model
 //!
 //! Optional flags:
-//!   --bpe scripts/bpe.py       path to the bpe.py tokenizer script
 //!   --system "..."             override the system prompt
 //!   --temperature 0.7
 //!   --top-p 0.9
@@ -27,19 +27,24 @@
 //!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use std::env;
 use std::fmt::Display;
 use std::io::{Write as _, stdin, stdout};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio, exit};
+use std::process::exit;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 
 use bonsai_pot::{KvSnapshot, Model, ModelOptions, PotError, Sampler};
+use tokenizers::models::bpe::{BPE, Vocab};
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 struct Args {
     model_dir: PathBuf,
-    bpe: String,
     system: String,
     temperature: f32,
     top_p: Option<f32>,
@@ -62,8 +67,6 @@ ARGS:
                            vocab.bin, vocab_offsets.bin, merges.txt).
 
 OPTIONS:
-    --bpe <path>           Path to the bpe.py tokenizer script.
-                           [default: scripts/bpe.py]
     --system <text>        System prompt prepended on the first turn.
                            [default: \"You are a helpful assistant.\"]
     --temperature <f>      Sampling temperature; 0.0 ⇒ greedy/argmax.
@@ -123,7 +126,6 @@ fn parse_args() -> Args {
     let default_cache = model_dir.join("pipeline_cache.bin");
     let mut a = Args {
         model_dir,
-        bpe: "scripts/bpe.py".into(),
         system: "You are a helpful assistant.".into(),
         temperature: 0.7,
         top_p: Some(0.9),
@@ -144,10 +146,6 @@ fn parse_args() -> Args {
             })
         };
         match argv[i].as_str() {
-            "--bpe" => {
-                a.bpe = val();
-                i += 2;
-            }
             "--system" => {
                 a.system = val();
                 i += 2;
@@ -193,23 +191,72 @@ fn parse_args() -> Args {
     a
 }
 
-/// Tokenize `text` by shelling out to `bpe.py`. The script reads vocab and
-/// merges from `model_dir` and emits raw little-endian u32 token IDs on
-/// stdout. Subprocess overhead (~tens of ms) is negligible compared to a
-/// single GPU prefill, so we just spawn one per turn.
-fn tokenize(bpe: &str, model_dir: &Path, text: &str) -> Vec<u32> {
-    let out = Command::new("uv")
-        .args(["run", "--quiet", bpe])
-        .arg(model_dir)
-        .arg(text)
-        .stderr(Stdio::inherit())
-        .output()
-        .expect("failed to spawn bpe.py — is `uv` on PATH?");
-    if !out.status.success() {
-        eprintln!("bpe.py exited with status {}", out.status);
-        exit(2);
+// Qwen2 pretokenizer regex (from llama.cpp's qwen2 branch / scripts/bpe.py).
+// Exhaustively matches every character so there are no unmatched gaps.
+const QWEN2_RE: &str = concat!(
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|",
+    r"[^\r\n\p{L}\p{N}]?\p{L}+|",
+    r"\p{N}|",
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*|",
+    r"\s*[\r\n]+|",
+    r"\s+(?!\S)|",
+    r"\s+",
+);
+
+fn build_tokenizer(model: &bonsai_pot::Model, model_dir: &Path) -> Tokenizer {
+    // Vocab from Model's already-loaded table (GPT-2 byte-encoded strings).
+    let mut token_id: u32 = 0;
+    let mut token_strs: Vec<String> = Vec::new();
+    while let Some(s) = model.vocab_token(token_id) {
+        token_strs.push(s.to_owned());
+        token_id += 1;
     }
-    bytemuck::cast_slice(&out.stdout).to_vec()
+
+    let specials: Vec<AddedToken> = token_strs
+        .iter()
+        .filter(|s| s.starts_with("<|") && s.ends_with("|>"))
+        .map(|s| AddedToken::from(s.as_str(), true))
+        .collect();
+
+    let vocab: Vocab = token_strs
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (s, i as u32))
+        .collect();
+
+    let merges: Vec<(String, String)> = fs::read_to_string(model_dir.join("merges.txt"))
+        .expect("merges.txt not found")
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (a, b) = l.split_once(' ').expect("malformed merges.txt");
+            (a.to_owned(), b.to_owned())
+        })
+        .collect();
+
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .byte_fallback(false)
+        .build()
+        .expect("build BPE model");
+
+    let mut tok = Tokenizer::new(bpe);
+
+    // Qwen2 pretokenizer: regex matches tokens to keep (invert=true), then
+    // ByteLevel maps each UTF-8 byte to its GPT-2 unicode codepoint.
+    let split = Split::new(
+        SplitPattern::Regex(QWEN2_RE.to_owned()),
+        SplitDelimiterBehavior::Isolated,
+        true,
+    )
+    .expect("build Split pretokenizer");
+    tok.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+        PreTokenizerWrapper::Split(split),
+        PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+    ]))));
+
+    let _ = tok.add_special_tokens(specials);
+    tok
 }
 
 fn read_user_line() -> Option<String> {
@@ -287,6 +334,7 @@ fn main() {
             top_p: args.top_p,
             seed: args.seed,
         };
+        let tok = build_tokenizer(&model, &args.model_dir);
         let mut sess = model.new_session();
         let mut stdout = stdout().lock();
 
@@ -294,7 +342,11 @@ fn main() {
         // (requires pos == 0), then snapshot the KV state. /reset restores
         // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
         let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system);
-        let system_tokens = tokenize(&args.bpe, &args.model_dir, &system_segment);
+        let system_tokens: Vec<u32> = tok
+            .encode(system_segment.as_str(), false)
+            .expect("tokenize system segment")
+            .get_ids()
+            .to_vec();
         eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
         sess.prefill(&system_tokens, &sampler)
             .expect("system prefill");
@@ -342,7 +394,11 @@ fn main() {
                      <|im_start|>assistant\n"
                 )
             };
-            let tokens = tokenize(&args.bpe, &args.model_dir, &segment);
+            let tokens: Vec<u32> = tok
+                .encode(segment.as_str(), false)
+                .expect("tokenize turn segment")
+                .get_ids()
+                .to_vec();
 
             // All user-turn prefills use the matvec-loop path (pos > 0 after
             // the system prompt). The first sampled token is not yet in KV —
