@@ -6,10 +6,10 @@
 //! `RoPE` cos/sin table are also f16; `Q8_0` scales remain f32.
 
 use std::collections::HashMap;
-use std::fs::{read, read_to_string, write};
+use std::fs::{read, read_to_string};
 use std::mem::size_of;
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, OnceLock};
 
@@ -515,10 +515,6 @@ pub struct ModelOptions {
     /// a sequence-length limit, so any value up to the model's
     /// `context_length` is supported (subject to VRAM).
     pub max_seq: u32,
-    /// Path to persist the wgpu pipeline cache between runs. `None` disables
-    /// caching. Best-effort: backends without `Features::PIPELINE_CACHE`
-    /// silently skip, and read/write errors are logged but never fatal.
-    pub pipeline_cache_path: Option<PathBuf>,
     /// Priority of the command queue, a normalized floating-point value between 0.0 and 1.0,
     /// which is then translated to a discrete priority level by the implementation.
     /// Higher values indicate a higher priority,
@@ -531,7 +527,6 @@ impl Default for ModelOptions {
     fn default() -> Self {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
-            pipeline_cache_path: None,
             queue_priority: 0.0,
         }
     }
@@ -894,12 +889,6 @@ impl Model {
         if !adapter.features().contains(wgpu::Features::SUBGROUP) {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
-        let pipeline_cache_supported = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
-        if opts.pipeline_cache_path.is_some() && !pipeline_cache_supported {
-            log::info!(
-                "pipeline_cache_path set but adapter does not support PIPELINE_CACHE; skipping"
-            );
-        }
 
         let info = adapter.get_info();
         log::info!(
@@ -920,13 +909,9 @@ impl Model {
         limits.max_storage_buffers_per_shader_stage =
             limits.max_storage_buffers_per_shader_stage.max(8);
 
-        let mut required_features = wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP;
-        if pipeline_cache_supported && opts.pipeline_cache_path.is_some() {
-            required_features |= wgpu::Features::PIPELINE_CACHE;
-        }
         let desc = wgpu::DeviceDescriptor {
             label: None,
-            required_features,
+            required_features: wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -1019,35 +1004,6 @@ impl Model {
                 adapter.request_device(&desc).await?
             }
             None => adapter.request_device(&desc).await?,
-        };
-
-        // ---- pipeline cache (best-effort) -----------------------------------
-        // Only created when the caller supplied a path AND the adapter supports
-        // PIPELINE_CACHE. On a cold start `prior` is None and the cache is
-        // created empty; the driver populates it as pipelines compile, and the
-        // writeback step after pipeline construction persists it for future runs.
-        let pipeline_cache = match (pipeline_cache_supported, opts.pipeline_cache_path.as_ref()) {
-            (true, Some(path)) => {
-                let prior = read(path).ok();
-                log::info!(
-                    "pipeline cache: loading {} prior bytes from {}",
-                    prior.as_deref().map_or(0, <[u8]>::len),
-                    path.display(),
-                );
-                // SAFETY: `fallback: true` means the driver silently discards
-                // invalid data (e.g. corrupt file, driver version change) rather
-                // than causing UB. Data comes from a prior `get_data()` call so
-                // the driver family normally matches; fallback handles the rest.
-                let cache = unsafe {
-                    device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                        label: Some("pot_pipeline_cache"),
-                        data: prior.as_deref(),
-                        fallback: true,
-                    })
-                };
-                Some((cache, path.clone(), prior))
-            }
-            _ => None,
         };
 
         // ---- wire up device-lost and uncaptured-error callbacks ------------
@@ -1326,7 +1282,7 @@ impl Model {
                 module: sh,
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: pipeline_cache.as_ref().map(|(c, _, _)| c),
+                cache: None,
             })
         };
         let pipes = Pipelines {
@@ -1344,15 +1300,6 @@ impl Model {
             topk_reduce: mk_pipe(&bgls.topk_reduce, &sh_topk, "topk_reduce"),
             kv_writeback: mk_pipe(&bgls.kv_writeback, &sh_kv_writeback, "kv_writeback"),
         };
-
-        // ---- persist pipeline cache -----------------------------------------
-        if let Some((cache, path, prior)) = &pipeline_cache
-            && let Some(data) = cache.get_data()
-            && prior.as_deref() != Some(data.as_slice())
-            && let Err(e) = write(path, &data)
-        {
-            log::warn!("failed to write pipeline cache to {}: {e}", path.display());
-        }
 
         // ---- vocab ----------------------------------------------------------
         let vocab_path = model_dir.join("vocab.bin");

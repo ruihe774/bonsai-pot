@@ -39,7 +39,6 @@ struct Args {
     top_k: Option<u32>,
     top_p: Option<f32>,
     seed: u64,
-    pipeline_cache_path: Option<PathBuf>,
 }
 
 const HELP: &str = "\
@@ -84,10 +83,6 @@ BENCH OPTIONS:
 LOAD OPTIONS:
     --max-seq <n>          KV-cache capacity (positions). Larger values cost
                            VRAM linearly. [default: 1024]
-    --pipeline-cache <p>   Path to persist the compiled pipeline cache across
-                           runs. Ignored on backends without PIPELINE_CACHE
-                           support. [default: <model_dir>/pipeline_cache.bin]
-    --no-pipeline-cache    Disable pipeline caching entirely.
 
 OTHER:
     -h, --help             Show this help and exit.
@@ -119,7 +114,6 @@ fn parse_args() -> Args {
         exit(1);
     };
     let model_dir = PathBuf::from(model_dir_arg);
-    let default_cache = model_dir.join("pipeline_cache.bin");
     let mut a = Args {
         model_dir,
         mode: "gen".to_string(),
@@ -133,7 +127,6 @@ fn parse_args() -> Args {
         top_k: None,
         top_p: None,
         seed: 0,
-        pipeline_cache_path: Some(default_cache),
     };
     let mut i = 2;
     while i < argv.len() {
@@ -167,14 +160,6 @@ fn parse_args() -> Args {
             "--max-seq" => {
                 a.max_seq = parse_or_die("--max-seq", &next());
                 i += 2;
-            }
-            "--pipeline-cache" => {
-                a.pipeline_cache_path = Some(PathBuf::from(next()));
-                i += 2;
-            }
-            "--no-pipeline-cache" => {
-                a.pipeline_cache_path = None;
-                i += 1;
             }
             "--temperature" => {
                 a.temperature = parse_or_die("--temperature", &next());
@@ -216,7 +201,6 @@ fn main() {
             &args.model_dir,
             ModelOptions {
                 max_seq: args.max_seq,
-                pipeline_cache_path: args.pipeline_cache_path,
                 ..Default::default()
             },
         )
