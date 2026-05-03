@@ -68,8 +68,17 @@ fn main(
   let lx = tid % WG_N;
   let ly = tid / WG_N;
 
-  var acc: array<f32, 16>;
-  for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc[i] = 0.0; }
+  // 4×4 register-tile accumulator. Stored as 16 named scalars rather than
+  // `var acc: array<f32, 16>` because AMD's Windows shader-compilation stack
+  // (both AMDVLK / Vulkan and DXIL / DX12) miscompiles function-scope
+  // `array<f32, N>` whenever it's accessed by a dynamic index anywhere in
+  // the function — the array gets lowered to spill/scratch memory and
+  // produces garbage outputs. Linux RADV is unaffected. Replacing with
+  // scalars keeps every value in registers across all backends.
+  var acc00: f32 = 0.0; var acc01: f32 = 0.0; var acc02: f32 = 0.0; var acc03: f32 = 0.0;
+  var acc10: f32 = 0.0; var acc11: f32 = 0.0; var acc12: f32 = 0.0; var acc13: f32 = 0.0;
+  var acc20: f32 = 0.0; var acc21: f32 = 0.0; var acc22: f32 = 0.0; var acc23: f32 = 0.0;
+  var acc30: f32 = 0.0; var acc31: f32 = 0.0; var acc32: f32 = 0.0; var acc33: f32 = 0.0;
 
   for (var b: u32 = 0u; b < nb_q1; b = b + 1u) {
     // ---- Cooperative loads ----
@@ -177,6 +186,9 @@ fn main(
         w3_7 = expand_4_bits((bw3 >> 28u) & 0xFu);
       }
 
+      // Inner `tm` loop fully unrolled — see the acc declaration above for
+      // why we don't use a function-scope `array<f32, 16>` with a dynamic
+      // index into it.
       for (var tm: u32 = 0u; tm < TM; tm = tm + 1u) {
         let m_local = ly * TM + tm;
         let a_d = a_d_lds[s * 64u + m_local];
@@ -223,10 +235,16 @@ fn main(
         sumi2 = dot4I8Packed(w2_7, a7) + sumi2;
         sumi3 = dot4I8Packed(w3_7, a7) + sumi3;
 
-        acc[tm * TN + 0u] = acc[tm * TN + 0u] + a_d * wd0 * f32(sumi0);
-        acc[tm * TN + 1u] = acc[tm * TN + 1u] + a_d * wd1 * f32(sumi1);
-        acc[tm * TN + 2u] = acc[tm * TN + 2u] + a_d * wd2 * f32(sumi2);
-        acc[tm * TN + 3u] = acc[tm * TN + 3u] + a_d * wd3 * f32(sumi3);
+        let v0 = a_d * wd0 * f32(sumi0);
+        let v1 = a_d * wd1 * f32(sumi1);
+        let v2 = a_d * wd2 * f32(sumi2);
+        let v3 = a_d * wd3 * f32(sumi3);
+        switch (tm) {
+          case 0u: { acc00 = acc00 + v0; acc01 = acc01 + v1; acc02 = acc02 + v2; acc03 = acc03 + v3; }
+          case 1u: { acc10 = acc10 + v0; acc11 = acc11 + v1; acc12 = acc12 + v2; acc13 = acc13 + v3; }
+          case 2u: { acc20 = acc20 + v0; acc21 = acc21 + v1; acc22 = acc22 + v2; acc23 = acc23 + v3; }
+          default: { acc30 = acc30 + v0; acc31 = acc31 + v1; acc32 = acc32 + v2; acc33 = acc33 + v3; }
+        }
       }
     }
     workgroupBarrier();
@@ -239,7 +257,33 @@ fn main(
       let n_idx = n_base + lx * TN + tn;
       if (n_idx >= p.n) { continue; }
       let yi = p.out_offset + m_idx * p.n + n_idx;
-      let val = acc[tm * TN + tn];
+      var val: f32 = 0.0;
+      switch (tm) {
+        case 0u: {
+          switch (tn) {
+            case 0u: { val = acc00; } case 1u: { val = acc01; }
+            case 2u: { val = acc02; } default: { val = acc03; }
+          }
+        }
+        case 1u: {
+          switch (tn) {
+            case 0u: { val = acc10; } case 1u: { val = acc11; }
+            case 2u: { val = acc12; } default: { val = acc13; }
+          }
+        }
+        case 2u: {
+          switch (tn) {
+            case 0u: { val = acc20; } case 1u: { val = acc21; }
+            case 2u: { val = acc22; } default: { val = acc23; }
+          }
+        }
+        default: {
+          switch (tn) {
+            case 0u: { val = acc30; } case 1u: { val = acc31; }
+            case 2u: { val = acc32; } default: { val = acc33; }
+          }
+        }
+      }
       if (p.accumulate != 0u) {
         y[yi] = f16(f32(y[yi]) + val);
       } else {
