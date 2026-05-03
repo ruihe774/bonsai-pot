@@ -912,11 +912,7 @@ impl Model {
         let public_cfg = ModelConfig::from_raw(&cfg);
 
         // ---- wgpu init ------------------------------------------------------
-        // Use new_without_display_handle_from_env() so that WGPU_BACKEND and
-        // WGPU_ADAPTER_NAME env vars are honoured at instance creation time.
-        // Instance::default() uses all backends and ignores WGPU_BACKEND.
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
