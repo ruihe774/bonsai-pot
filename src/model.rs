@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::fs::{read, read_to_string};
 use std::mem::size_of;
-use std::num::NonZeroU64;
 use std::path::Path;
 use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, OnceLock};
@@ -276,9 +275,6 @@ pub struct KvWritebackFusedParams {
     pub(crate) eps: f32,
 }
 
-// All of these <= 64 bytes; we pack each into a 256-byte uniform slot.
-pub const UNIFORM_SLOT_SIZE: u64 = 256;
-
 /// Maximum K supported by the `topk_reduce` shader (matches `K_MAX` in the WGSL).
 pub const TOPK_MAX: u32 = 32;
 
@@ -372,7 +368,6 @@ pub struct Buffers {
     pub(crate) act_q8: wgpu::Buffer,        // Q8_0 activations (raw u32 buffer)
     pub(crate) attn_partials: wgpu::Buffer, // f32 partials for split-K attention
     pub(crate) rope_table: wgpu::Buffer,
-    pub(crate) uniform: wgpu::Buffer,  // pool of 256-byte slots
     pub(crate) sample: wgpu::Buffer, // u32 storage: input token id @ [0..M], topk output @ [0..2K]
     pub(crate) readback: wgpu::Buffer, // u32 readback (mappable)
 }
@@ -393,32 +388,29 @@ pub struct BindGroupLayouts {
     pub(crate) q_norm_rope_fused: wgpu::BindGroupLayout,
 }
 
-/// Pre-built bind groups indexed by (BGL kind, weight buffer). The UBO binding
-/// in every cached BG is sized to one full uniform slot (`UNIFORM_SLOT_SIZE`)
-/// since we use dynamic offsets and the slot is large enough to hold any of
-/// the per-dispatch params structs. One BG per (kind, weight buffer) is reused
-/// across every dispatch of that kind in a step.
+/// Pre-built bind groups indexed by (BGL kind, weight buffer). One BG per
+/// (kind, weight buffer) is reused across every dispatch of that kind in a step.
 pub struct CachedBindGroups {
-    pub(crate) embed: wgpu::BindGroup, // (uniform, w_embed, act, sample)
-    pub(crate) rms_norm: wgpu::BindGroup, // (uniform, act, w_norms)
-    pub(crate) matvec_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act)
-    pub(crate) matvec_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act)
-    pub(crate) matvec_w_ffn_d: wgpu::BindGroup, // (uniform, w_ffn_d,  act)
-    pub(crate) matvec_w_embed: wgpu::BindGroup, // (uniform, w_embed,  act) — LM head
-    pub(crate) matvec_fused_normed_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act, w_norms)
-    pub(crate) matvec_fused_normed_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act, w_norms)
-    pub(crate) quantize: wgpu::BindGroup, // (uniform, act, act_q8)
-    pub(crate) matmul_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act_q8, act)
+    pub(crate) embed: wgpu::BindGroup,         // (w_embed, act, sample)
+    pub(crate) rms_norm: wgpu::BindGroup,      // (act, w_norms)
+    pub(crate) matvec_w_attn: wgpu::BindGroup, // (w_attn,   act)
+    pub(crate) matvec_w_ffn_gu: wgpu::BindGroup, // (w_ffn_gu, act)
+    pub(crate) matvec_w_ffn_d: wgpu::BindGroup, // (w_ffn_d,  act)
+    pub(crate) matvec_w_embed: wgpu::BindGroup, // (w_embed,  act) — LM head
+    pub(crate) matvec_fused_normed_w_attn: wgpu::BindGroup, // (w_attn,   act, w_norms)
+    pub(crate) matvec_fused_normed_w_ffn_gu: wgpu::BindGroup, // (w_ffn_gu, act, w_norms)
+    pub(crate) quantize: wgpu::BindGroup,      // (act, act_q8)
+    pub(crate) matmul_w_attn: wgpu::BindGroup, // (w_attn,   act_q8, act)
     pub(crate) matmul_w_ffn_gu: wgpu::BindGroup,
     pub(crate) matmul_w_ffn_d: wgpu::BindGroup,
     pub(crate) matmul_w_embed: wgpu::BindGroup,
-    pub(crate) attn: wgpu::BindGroup, // (uniform, act, kv_k, kv_v)
-    pub(crate) attn_split: wgpu::BindGroup, // (uniform, act, kv_k, kv_v, attn_partials)
-    pub(crate) attn_merge: wgpu::BindGroup, // (uniform, act, attn_partials)
-    pub(crate) silu_mul: wgpu::BindGroup, // (uniform, act)
-    pub(crate) topk_reduce: wgpu::BindGroup, // (uniform, act, sample)
-    pub(crate) kv_writeback_fused: wgpu::BindGroup, // (uniform, act, w_norms, rope_cs, kv_k, kv_v)
-    pub(crate) q_norm_rope_fused: wgpu::BindGroup, // (uniform, act, w_norms, rope_cs)
+    pub(crate) attn: wgpu::BindGroup,        // (act, kv_k, kv_v)
+    pub(crate) attn_split: wgpu::BindGroup,  // (act, kv_k, kv_v, attn_partials)
+    pub(crate) attn_merge: wgpu::BindGroup,  // (act, attn_partials)
+    pub(crate) silu_mul: wgpu::BindGroup,    // (act)
+    pub(crate) topk_reduce: wgpu::BindGroup, // (act, sample)
+    pub(crate) kv_writeback_fused: wgpu::BindGroup, // (act, w_norms, rope_cs, kv_k, kv_v)
+    pub(crate) q_norm_rope_fused: wgpu::BindGroup, // (act, w_norms, rope_cs)
 }
 
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
@@ -505,10 +497,6 @@ const DEFAULT_MAX_SEQ: u32 = 1024;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.wgsl`.
 pub const ATTN_CHUNK_SIZE: u32 = 32;
-// 4096 * 256 B = 1 MiB. Each per-token step uses ~450 slots, matmul prefill ~470.
-// 4096 leaves ~8x headroom and is 16x smaller than the historical 65536.
-pub const UNIFORM_POOL_SLOTS: u64 = 4096;
-
 /// System-wide GPU queue scheduling priority, passed via `VK_EXT_global_priority`.
 ///
 /// Controls how the OS/driver kernel schedules this process's GPU work relative
@@ -861,18 +849,6 @@ impl Model {
     pub async fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
         // Hoisted constants/items so we don't trip items-after-statements lints.
         const SAMPLE_BYTES: u64 = 4 * 1024;
-        const fn ubo_dyn(binding: u32) -> wgpu::BindGroupLayoutEntry {
-            wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: None,
-                },
-                count: None,
-            }
-        }
         const fn ssbo(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             wgpu::BindGroupLayoutEntry {
                 binding,
@@ -915,6 +891,9 @@ impl Model {
         if !adapter.features().contains(wgpu::Features::SUBGROUP) {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
+        if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
+            return Err(PotError::FeatureUnsupported("IMMEDIATES"));
+        }
 
         let info = adapter.get_info();
         log::info!(
@@ -934,10 +913,15 @@ impl Model {
         limits.max_buffer_size = limits.max_buffer_size.max(300 * 1024 * 1024);
         limits.max_storage_buffers_per_shader_stage =
             limits.max_storage_buffers_per_shader_stage.max(8);
+        // Immediates (push constants): 128 bytes covers the largest Params struct
+        // (MatvecFusedNormedParams, 72 bytes) with generous headroom.
+        limits.max_immediate_size = limits.max_immediate_size.max(128);
 
         let desc = wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
+            required_features: wgpu::Features::SHADER_F16
+                | wgpu::Features::SUBGROUP
+                | wgpu::Features::IMMEDIATES,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -1229,13 +1213,6 @@ impl Model {
             mapped_at_creation: false,
         });
 
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniform"),
-            size: UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         // Sample storage + readback. Sized for: M_MAX prompt token ids during
         // matmul prefill (M_MAX * 4 = 2048 bytes), or 2*TOPK_MAX u32 entries
         // for the topk_reduce output (K floats + K indices = 2*64*4 = 512 bytes).
@@ -1267,7 +1244,6 @@ impl Model {
             act_q8: act_q8_buf,
             attn_partials: attn_partials_buf,
             rope_table: rope_buf,
-            uniform: uniform_buf,
             sample,
             readback,
         };
@@ -1329,10 +1305,10 @@ impl Model {
 
         let make_bgl =
             |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {
-                let mut entries = vec![ubo_dyn(0)];
+                let mut entries = Vec::new();
                 for i in 0..n_storage {
                     let read_only = (rw_mask >> i) & 1 == 0;
-                    entries.push(ssbo(i + 1, read_only));
+                    entries.push(ssbo(i, read_only));
                 }
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some(label),
@@ -1357,12 +1333,13 @@ impl Model {
 
         let mk_pipe = |layout: &wgpu::BindGroupLayout,
                        sh: &wgpu::ShaderModule,
-                       label: &str|
+                       label: &str,
+                       imm_size: u32|
          -> wgpu::ComputePipeline {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{label}_pl")),
                 bind_group_layouts: &[Some(layout)],
-                immediate_size: 0,
+                immediate_size: imm_size,
             });
             // Every shader's workgroup memory is fully written before being
             // read (cooperative tile loads + barrier, or per-thread slot
@@ -1381,32 +1358,95 @@ impl Model {
             })
         };
         let pipes = Pipelines {
-            embed: mk_pipe(&bgls.embed, &sh_embed, "embed"),
-            rms_norm: mk_pipe(&bgls.rms_norm, &sh_rms, "rms_norm"),
-            matvec: mk_pipe(&bgls.matvec, &sh_matvec, "matvec"),
-            matvec_fused: mk_pipe(&bgls.matvec, &sh_matvec_fused, "matvec_fused"),
-            matvec_silu: mk_pipe(&bgls.matvec, &sh_matvec_silu, "matvec_silu"),
+            embed: mk_pipe(
+                &bgls.embed,
+                &sh_embed,
+                "embed",
+                size_of::<EmbedParams>() as u32,
+            ),
+            rms_norm: mk_pipe(
+                &bgls.rms_norm,
+                &sh_rms,
+                "rms_norm",
+                size_of::<RmsNormParams>() as u32,
+            ),
+            matvec: mk_pipe(
+                &bgls.matvec,
+                &sh_matvec,
+                "matvec",
+                size_of::<MatvecParams>() as u32,
+            ),
+            matvec_fused: mk_pipe(
+                &bgls.matvec,
+                &sh_matvec_fused,
+                "matvec_fused",
+                size_of::<MatvecFusedParams>() as u32,
+            ),
+            matvec_silu: mk_pipe(
+                &bgls.matvec,
+                &sh_matvec_silu,
+                "matvec_silu",
+                size_of::<MatvecSiluParams>() as u32,
+            ),
             matvec_fused_normed: mk_pipe(
                 &bgls.matvec_fused_normed,
                 &sh_matvec_fused_normed,
                 "matvec_fused_normed",
+                size_of::<MatvecFusedNormedParams>() as u32,
             ),
-            quantize: mk_pipe(&bgls.quantize, &sh_quant, "quantize"),
-            matmul: mk_pipe(&bgls.matmul, &sh_matmul, "matmul"),
-            attention: mk_pipe(&bgls.attn, &sh_attn, "attention"),
-            attention_split: mk_pipe(&bgls.attn_split, &sh_attn_split, "attention_split"),
-            attention_merge: mk_pipe(&bgls.attn_merge, &sh_attn_merge, "attention_merge"),
-            silu_mul: mk_pipe(&bgls.silu_mul, &sh_silu, "silu_mul"),
-            topk_reduce: mk_pipe(&bgls.topk_reduce, &sh_topk, "topk_reduce"),
+            quantize: mk_pipe(
+                &bgls.quantize,
+                &sh_quant,
+                "quantize",
+                size_of::<QuantParams>() as u32,
+            ),
+            matmul: mk_pipe(
+                &bgls.matmul,
+                &sh_matmul,
+                "matmul",
+                size_of::<MatmulParams>() as u32,
+            ),
+            attention: mk_pipe(
+                &bgls.attn,
+                &sh_attn,
+                "attention",
+                size_of::<AttnParams>() as u32,
+            ),
+            attention_split: mk_pipe(
+                &bgls.attn_split,
+                &sh_attn_split,
+                "attention_split",
+                size_of::<AttnSplitParams>() as u32,
+            ),
+            attention_merge: mk_pipe(
+                &bgls.attn_merge,
+                &sh_attn_merge,
+                "attention_merge",
+                size_of::<AttnMergeParams>() as u32,
+            ),
+            silu_mul: mk_pipe(
+                &bgls.silu_mul,
+                &sh_silu,
+                "silu_mul",
+                size_of::<SiluMulParams>() as u32,
+            ),
+            topk_reduce: mk_pipe(
+                &bgls.topk_reduce,
+                &sh_topk,
+                "topk_reduce",
+                size_of::<TopKParams>() as u32,
+            ),
             kv_writeback_fused: mk_pipe(
                 &bgls.kv_writeback_fused,
                 &sh_kv_writeback_fused,
                 "kv_writeback_fused",
+                size_of::<KvWritebackFusedParams>() as u32,
             ),
             q_norm_rope_fused: mk_pipe(
                 &bgls.q_norm_rope_fused,
                 &sh_q_norm_rope_fused,
                 "q_norm_rope_fused",
+                size_of::<QNormRopeFusedParams>() as u32,
             ),
         };
 
@@ -1627,34 +1667,18 @@ fn build_cached_bind_groups(
     bgls: &BindGroupLayouts,
     buffers: &Buffers,
 ) -> CachedBindGroups {
-    // The UBO binding always uses UNIFORM_SLOT_SIZE — every params struct
-    // fits in one slot, and the dynamic offset selects which slot.
-    #[allow(
-        clippy::unwrap_used,
-        reason = "UNIFORM_SLOT_SIZE is a non-zero compile-time constant"
-    )]
-    let ubo_size = NonZeroU64::new(UNIFORM_SLOT_SIZE).unwrap();
-    let ubo = || {
-        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &buffers.uniform,
-            offset: 0,
-            size: Some(ubo_size),
-        })
-    };
     let mk = |label: &str,
               layout: &wgpu::BindGroupLayout,
               storages: &[&wgpu::Buffer]|
      -> wgpu::BindGroup {
-        let mut entries = vec![wgpu::BindGroupEntry {
-            binding: 0,
-            resource: ubo(),
-        }];
-        for (i, b) in storages.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry {
-                binding: i as u32 + 1,
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = storages
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
                 resource: b.as_entire_binding(),
-            });
-        }
+            })
+            .collect();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout,
@@ -1856,23 +1880,25 @@ mod tests {
     }
 
     #[test]
-    fn params_struct_sizes_fit_uniform_slot() {
-        let limit = UNIFORM_SLOT_SIZE as usize;
-        assert!(size_of::<EmbedParams>() <= limit);
-        assert!(size_of::<RmsNormParams>() <= limit);
-        assert!(size_of::<MatvecParams>() <= limit);
-        assert!(size_of::<MatvecSiluParams>() <= limit);
-        assert!(size_of::<MatvecFusedParams>() <= limit);
-        assert!(size_of::<MatvecFusedNormedParams>() <= limit);
-        assert!(size_of::<QuantParams>() <= limit);
-        assert!(size_of::<MatmulParams>() <= limit);
-        assert!(size_of::<AttnParams>() <= limit);
-        assert!(size_of::<AttnSplitParams>() <= limit);
-        assert!(size_of::<AttnMergeParams>() <= limit);
-        assert!(size_of::<SiluMulParams>() <= limit);
-        assert!(size_of::<TopKParams>() <= limit);
-        assert!(size_of::<KvWritebackFusedParams>() <= limit);
-        assert!(size_of::<QNormRopeFusedParams>() <= limit);
+    fn params_struct_sizes_fit_immediate_limit() {
+        // All Params structs must fit within the 128-byte minimum Vulkan push-constant
+        // (immediates) limit, which is what we request via max_immediate_size.
+        const LIMIT: usize = 128;
+        assert!(size_of::<EmbedParams>() <= LIMIT);
+        assert!(size_of::<RmsNormParams>() <= LIMIT);
+        assert!(size_of::<MatvecParams>() <= LIMIT);
+        assert!(size_of::<MatvecSiluParams>() <= LIMIT);
+        assert!(size_of::<MatvecFusedParams>() <= LIMIT);
+        assert!(size_of::<MatvecFusedNormedParams>() <= LIMIT);
+        assert!(size_of::<QuantParams>() <= LIMIT);
+        assert!(size_of::<MatmulParams>() <= LIMIT);
+        assert!(size_of::<AttnParams>() <= LIMIT);
+        assert!(size_of::<AttnSplitParams>() <= LIMIT);
+        assert!(size_of::<AttnMergeParams>() <= LIMIT);
+        assert!(size_of::<SiluMulParams>() <= LIMIT);
+        assert!(size_of::<TopKParams>() <= LIMIT);
+        assert!(size_of::<KvWritebackFusedParams>() <= LIMIT);
+        assert!(size_of::<QNormRopeFusedParams>() <= LIMIT);
     }
 
     #[test]

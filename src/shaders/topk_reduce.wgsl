@@ -27,11 +27,11 @@ struct Params {
   k: u32,
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
+var<immediate> p: Params;
 // Bound to the same act buffer as the shaders that produce logits (which use
 // `array<f16>`), but viewed here as u32 so each load returns 2 packed f16.
-@group(0) @binding(1) var<storage, read> logits: array<u32>;
-@group(0) @binding(2) var<storage, read_write> result: array<u32>;
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read_write> result: array<u32>;
 
 const WG: u32 = 256u;
 const K_MAX: u32 = 32u;

@@ -21,9 +21,9 @@ struct Params {
   n_chunks_active: u32,
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read_write> act: array<f16>;
-@group(0) @binding(2) var<storage, read> partials: array<f32>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read_write> act: array<f16>;
+@group(0) @binding(1) var<storage, read> partials: array<f32>;
 
 const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 64u;

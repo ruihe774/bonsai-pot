@@ -24,9 +24,9 @@ struct Params {
   d_offset_2: u32, qs_offset_2: u32, n_2: u32, output_offset_2: u32,
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> weights: array<u32>;
-@group(0) @binding(2) var<storage, read_write> act: array<f16>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read_write> act: array<f16>;
 
 fn load_f16_at(b_offset: u32) -> f32 {
   let word = weights[b_offset >> 2u];

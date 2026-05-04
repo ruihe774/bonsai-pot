@@ -17,10 +17,10 @@ struct Params {
   accumulate: u32,
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> weights: array<u32>;
-@group(0) @binding(2) var<storage, read> acts: array<u32>;
-@group(0) @binding(3) var<storage, read_write> y: array<f16>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> acts: array<u32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f16>;
 
 const WG_N: u32 = 16u;
 const WG_M: u32 = 16u;

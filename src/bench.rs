@@ -124,13 +124,13 @@ fn bench_fused_normed(
         n_2: n2,
         output_offset_2: o2,
     };
-    let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some("matvec_fused_normed"),
         timestamp_writes: None,
     });
     cp.set_pipeline(&model.pipes.matvec_fused_normed);
-    cp.set_bind_group(0, matvec_fused_normed_bg(model, weights), &[off]);
+    cp.set_bind_group(0, matvec_fused_normed_bg(model, weights), &[]);
+    cp.set_immediates(0, bytemuck::bytes_of(&p));
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -173,13 +173,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 accumulate: 0,
                 dispatch_x_dim: dispatch_x,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("matvec"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.matvec);
-            cp.set_bind_group(0, matvec_bg(model, WeightSet::Attn), &[off]);
+            cp.set_bind_group(0, matvec_bg(model, WeightSet::Attn), &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }),
     ));
@@ -205,13 +205,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 accumulate: 0,
                 dispatch_x_dim: dispatch_x,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("matvec"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.matvec);
-            cp.set_bind_group(0, matvec_bg(model, WeightSet::Embed), &[off]);
+            cp.set_bind_group(0, matvec_bg(model, WeightSet::Embed), &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }),
     ));
@@ -281,13 +281,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 weight_offset: output_norm_off,
                 eps: cfg.rms_eps,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rms_norm"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.rms_norm);
-            cp.set_bind_group(0, &model.cached.rms_norm, &[off]);
+            cp.set_bind_group(0, &model.cached.rms_norm, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(1, 1, 1);
         }),
     ));
@@ -313,13 +313,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 accumulate: 1,
                 dispatch_x_dim: dispatch_x,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("matvec_silu"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.matvec_silu);
-            cp.set_bind_group(0, matvec_bg(model, WeightSet::FfnD), &[off]);
+            cp.set_bind_group(0, matvec_bg(model, WeightSet::FfnD), &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }),
     ));
@@ -351,17 +351,17 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 out_offset: model.act_layout.attn_out,
                 n_chunks_active,
             };
-            let ps_off = se.alloc_uniform(&ps);
-            let pm_off = se.alloc_uniform(&pm);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("attn_split+merge"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.attention_split);
-            cp.set_bind_group(0, &model.cached.attn_split, &[ps_off]);
+            cp.set_bind_group(0, &model.cached.attn_split, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&ps));
             cp.dispatch_workgroups(cfg.n_kv_head, n_chunks_active, 1);
             cp.set_pipeline(&model.pipes.attention_merge);
-            cp.set_bind_group(0, &model.cached.attn_merge, &[pm_off]);
+            cp.set_bind_group(0, &model.cached.attn_merge, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&pm));
             cp.dispatch_workgroups(cfg.n_head, 1, 1);
         }),
     ));
@@ -385,13 +385,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 nb_per_row,
                 eps: cfg.rms_eps,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("kv_writeback_fused"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.kv_writeback_fused);
-            cp.set_bind_group(0, &model.cached.kv_writeback_fused, &[off]);
+            cp.set_bind_group(0, &model.cached.kv_writeback_fused, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(cfg.n_kv_head, 1, 1);
         }),
     ));
@@ -409,13 +409,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 q_dim: cfg.q_dim,
                 eps: cfg.rms_eps,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("q_norm_rope_fused"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.q_norm_rope_fused);
-            cp.set_bind_group(0, &model.cached.q_norm_rope_fused, &[off]);
+            cp.set_bind_group(0, &model.cached.q_norm_rope_fused, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(cfg.n_head, 1, 1);
         }),
     ));
@@ -432,13 +432,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 output_offset: model.act_layout.x,
                 sample_offset: 0,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("embed"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.embed);
-            cp.set_bind_group(0, &model.cached.embed, &[off]);
+            cp.set_bind_group(0, &model.cached.embed, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(1, 1, 1);
         }),
     ));
@@ -453,13 +453,13 @@ pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
                 out_offset: 0,
                 k: 1,
             };
-            let off = se.alloc_uniform(&p);
             let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("topk_reduce"),
                 timestamp_writes: None,
             });
             cp.set_pipeline(&model.pipes.topk_reduce);
-            cp.set_bind_group(0, &model.cached.topk_reduce, &[off]);
+            cp.set_bind_group(0, &model.cached.topk_reduce, &[]);
+            cp.set_immediates(0, bytemuck::bytes_of(&p));
             cp.dispatch_workgroups(1, 1, 1);
         }),
     ));

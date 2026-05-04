@@ -25,12 +25,12 @@ struct Params {
   eps: f32,
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read>       act: array<f16>;
-@group(0) @binding(2) var<storage, read>       w_norms: array<f16>;
-@group(0) @binding(3) var<storage, read>       rope_cs: array<f16>;
-@group(0) @binding(4) var<storage, read_write> kv_k: array<u32>;
-@group(0) @binding(5) var<storage, read_write> kv_v: array<u32>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read>       act: array<f16>;
+@group(0) @binding(1) var<storage, read>       w_norms: array<f16>;
+@group(0) @binding(2) var<storage, read>       rope_cs: array<f16>;
+@group(0) @binding(3) var<storage, read_write> kv_k: array<u32>;
+@group(0) @binding(4) var<storage, read_write> kv_v: array<u32>;
 
 const HEAD_DIM: u32 = 128u;
 const HALF_DIM: u32 = 64u;

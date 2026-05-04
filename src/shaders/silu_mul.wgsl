@@ -13,8 +13,8 @@ struct Params {
   dispatch_x_count: u32,    // = dispatch_x_dim * 64 (workgroup_size)
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read_write> act: array<f16>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read_write> act: array<f16>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

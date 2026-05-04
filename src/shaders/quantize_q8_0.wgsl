@@ -16,9 +16,9 @@ struct Params {
   dispatch_x_dim: u32,
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> x: array<f16>;
-@group(0) @binding(2) var<storage, read_write> outbuf: array<u32>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read> x: array<f16>;
+@group(0) @binding(1) var<storage, read_write> outbuf: array<u32>;
 
 const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 32u;

@@ -16,10 +16,10 @@ struct Params {
   sample_offset: u32, // base index into sample[] for the input tokens
 };
 
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> weights: array<u32>;
-@group(0) @binding(2) var<storage, read_write> x: array<f16>;
-@group(0) @binding(3) var<storage, read> sample: array<u32>;
+var<immediate> p: Params;
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read_write> x: array<f16>;
+@group(0) @binding(2) var<storage, read> sample: array<u32>;
 
 fn load_f16_at(b_offset: u32) -> f32 {
   let word = weights[b_offset >> 2u];
