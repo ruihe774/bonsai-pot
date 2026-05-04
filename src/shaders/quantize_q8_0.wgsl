@@ -28,12 +28,13 @@ const WG: u32 = 32u;
 // never written. If SUBGROUP_MIN_SIZE <= WG, this gives the exact worst case.
 const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
+// Only used on the subgroup_size < 32 path; the fast path uses subgroupShuffle.
 var<workgroup> q_sh: array<u32, 32>;
 var<workgroup> sg_amax: array<f32, SG_PARTIAL_MAX>;
 
 fn wg_max(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_m = subgroupMax(local);
-  if (num_subgroups == 1u) { return sg_m; }
+  if (SUBGROUP_MIN_SIZE >= WG || num_subgroups == 1u) { return sg_m; }
   if (sg_inv_id == 0u) { sg_amax[sg_id] = sg_m; }
   workgroupBarrier();
   if (sg_id == 0u) {
@@ -69,17 +70,34 @@ fn main(
   let id_inv = select(0.0, 1.0 / d, d > 0.0);
   let qv = u32(i32(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
 
-  // Pack via shmem: each thread stores its byte; tid 0..7 then assembles
-  // four bytes into one u32 and writes it out.
-  q_sh[tid] = qv;
-  workgroupBarrier();
-
+  // Pack each thread's byte into 8 output u32s (4 bytes per word). Two paths:
+  //   - subgroup_size >= 32 (one subgroup covers WG): reach lane 31 via
+  //     subgroupShuffle, no LDS round-trip needed. The compile-time arm
+  //     (SUBGROUP_MIN_SIZE >= WG) lets the compiler drop the else branch and
+  //     `q_sh` shmem on AMD/NVIDIA; the runtime arm catches Intel-class
+  //     hardware where min < 32 but the actual size is >= 32.
+  //   - else: LDS fallback.
+  // Assumes subgroup_invocation_id == local_invocation_index (universal on
+  // AMD/NVIDIA/Intel/Apple; same assumption already relied on in matvec_q1_0).
+  var packed: u32;
+  if (SUBGROUP_MIN_SIZE >= WG || num_subgroups == 1u) {
+    let base = (tid & 7u) * 4u;
+    packed = subgroupShuffle(qv, base + 0u)
+           | (subgroupShuffle(qv, base + 1u) <<  8u)
+           | (subgroupShuffle(qv, base + 2u) << 16u)
+           | (subgroupShuffle(qv, base + 3u) << 24u);
+  } else {
+    q_sh[tid] = qv;
+    workgroupBarrier();
+    if (tid < 8u) {
+      let base = tid * 4u;
+      packed = q_sh[base + 0u]
+             | (q_sh[base + 1u] <<  8u)
+             | (q_sh[base + 2u] << 16u)
+             | (q_sh[base + 3u] << 24u);
+    }
+  }
   if (tid < 8u) {
-    let base = tid * 4u;
-    let packed = q_sh[base + 0u]
-               | (q_sh[base + 1u] <<  8u)
-               | (q_sh[base + 2u] << 16u)
-               | (q_sh[base + 3u] << 24u);
     let qs_byte = p.qs_offset + m_idx * p.k + b_idx * 32u;
     outbuf[(qs_byte >> 2u) + tid] = packed;
   }
