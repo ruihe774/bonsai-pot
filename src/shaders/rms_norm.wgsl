@@ -7,6 +7,9 @@ enable f16;
 // For per-head Q-/K-norm: n_groups=n_head (or n_kv_head), group_size=head_dim,
 // `w[group_size]` reused across all groups.
 // dispatch: (n_groups, 1, 1)
+//
+// When n_groups_0 < n_groups (fused Q/K dispatch): groups 0..n_groups_0 use
+// {input,output,weight}_offset; the rest use the _1 variants.
 
 struct Params {
   group_size: u32,
@@ -15,7 +18,10 @@ struct Params {
   output_offset: u32,
   weight_offset: u32,
   eps: f32,
-  _p0: u32, _p1: u32,
+  input_offset_1: u32,
+  output_offset_1: u32,
+  weight_offset_1: u32,
+  n_groups_0: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -51,8 +57,21 @@ fn main(
   if (gi >= p.n_groups) { return; }
   let tid = lid.x;
   let n = p.group_size;
-  let in_base = p.input_offset + gi * n;
-  let out_base = p.output_offset + gi * n;
+  // Fused Q/K dispatch: groups below n_groups_0 use the primary offsets,
+  // the rest use the _1 variants.
+  var in_base: u32;
+  var out_base: u32;
+  var w_base: u32;
+  if (gi < p.n_groups_0) {
+    in_base = p.input_offset + gi * n;
+    out_base = p.output_offset + gi * n;
+    w_base = p.weight_offset;
+  } else {
+    let gi1 = gi - p.n_groups_0;
+    in_base = p.input_offset_1 + gi1 * n;
+    out_base = p.output_offset_1 + gi1 * n;
+    w_base = p.weight_offset_1;
+  }
 
   var s: f32;
   for (var i: u32 = tid; i < n; i += WG) {
@@ -81,6 +100,6 @@ fn main(
 
   let inv_h = f16(inverseSqrt(total / f32(n) + p.eps));
   for (var i: u32 = tid; i < n; i += WG) {
-    act[out_base + i] = act[in_base + i] * inv_h * w[p.weight_offset + i];
+    act[out_base + i] = act[in_base + i] * inv_h * w[w_base + i];
   }
 }
