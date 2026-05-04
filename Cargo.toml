@@ -14,7 +14,7 @@ path = "src/bin/bonsai-pot.rs"
 required-features = ["bench-internals"]
 
 [features]
-default = []
+default = ["half"]
 # Exposes bench/microbench utilities under `bonsai_pot::__bench` and pulls in
 # the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
 # stable public library API.
@@ -22,13 +22,15 @@ bench-internals = ["dep:pollster", "dep:env_logger"]
 # Use the built-in primitive `f16` type (requires a nightly toolchain with
 # `#![feature(f16)]`) instead of the `half` crate.
 nightly = []
+# Use the `half` crate. This is required if `nightly` is not enabled
+half = ["dep:half"]
 
 [dependencies]
 # Library deps.
 wgpu = { version = "29", default-features = false, features = ["std", "vulkan", "wgsl"] }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
-half = { version = "2", features = ["bytemuck"] }
+half = { version = "2", features = ["bytemuck"], optional = true }
 log = "0.4"
 thiserror = "2"
 
