@@ -523,6 +523,9 @@ fn global_priority_fallback_to_queue_prio(priority: GlobalPriority) -> f32 {
     (priority.as_raw().clamp(LOWEST, HIGHEST) - LOWEST) as f32 / (HIGHEST - LOWEST) as f32
 }
 
+/// Power Preference when choosing a physical adapter.
+pub type PowerPerference = wgpu::PowerPreference;
+
 /// Allocate-time tunables for [`Model::load_with_options`].
 ///
 /// These affect GPU buffer sizing (KV cache, `RoPE` table) and so cannot be
@@ -545,6 +548,11 @@ pub struct LoadOptions {
     /// which is appropriate for background inference. If the driver does not
     /// expose `VK_EXT_global_priority` this field is silently ignored.
     pub priority: GlobalPriority,
+    /// Power Preference when choosing a physical adapter.
+    ///
+    /// See [`PowerPerference`] for for the available levels. Default is
+    /// [`PowerPerference::HighPerformance`].
+    pub power_perference: PowerPerference,
 }
 
 impl Default for LoadOptions {
@@ -552,6 +560,7 @@ impl Default for LoadOptions {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
             priority: GlobalPriority::LOW,
+            power_perference: PowerPerference::HighPerformance,
         }
     }
 }
@@ -892,7 +901,7 @@ impl Model {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference: opts.power_perference,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
