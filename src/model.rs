@@ -29,7 +29,10 @@ pub type F16 = f16;
 pub(crate) type F16 = half::f16;
 
 #[inline]
-#[allow(clippy::missing_const_for_fn, reason = "half::f16::from_f32 is not const")]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "half::f16::from_f32 is not const"
+)]
 pub fn f16_from_f32(v: f32) -> F16 {
     #[cfg(feature = "nightly")]
     {
@@ -128,9 +131,6 @@ pub struct EmbedParams {
     pub(crate) qs_offset: u32,
     pub(crate) output_offset: u32,
     pub(crate) sample_offset: u32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
-    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -141,8 +141,6 @@ pub struct RmsNormParams {
     pub(crate) output_offset: u32,
     pub(crate) weight_offset: u32,
     pub(crate) eps: f32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -168,9 +166,6 @@ pub struct MatvecSiluParams {
     pub(crate) output_offset: u32,
     pub(crate) accumulate: u32,
     pub(crate) dispatch_x_dim: u32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
-    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -223,8 +218,6 @@ pub struct QuantParams {
     pub(crate) d_offset: u32,
     pub(crate) qs_offset: u32,
     pub(crate) dispatch_x_dim: u32,
-    pub(crate) _p1: u32,
-    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -238,9 +231,6 @@ pub struct MatmulParams {
     pub(crate) a_qs_offset: u32,
     pub(crate) out_offset: u32,
     pub(crate) accumulate: u32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
-    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -283,10 +273,6 @@ pub struct AttnMergeParams {
     pub(crate) n_head: u32,
     pub(crate) out_offset: u32,
     pub(crate) n_chunks_active: u32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
-    pub(crate) _p2: u32,
-    pub(crate) _p3: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -297,8 +283,6 @@ pub struct SiluMulParams {
     pub(crate) up_offset: u32,
     pub(crate) out_offset: u32,
     pub(crate) dispatch_x_count: u32,
-    pub(crate) _p1: u32,
-    pub(crate) _p2: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -317,8 +301,6 @@ pub struct QNormRopeFusedParams {
     pub(crate) pos_base: u32,
     pub(crate) q_dim: u32,
     pub(crate) eps: f32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -333,8 +315,6 @@ pub struct KvWritebackFusedParams {
     pub(crate) kv_dim: u32,
     pub(crate) nb_per_row: u32,
     pub(crate) eps: f32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
 }
 
 // All of these <= 64 bytes; we pack each into a 256-byte uniform slot.

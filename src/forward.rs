@@ -196,7 +196,6 @@ fn dispatch_rms_norm(
         output_offset: out_off,
         weight_offset: w_off,
         eps: cfg.rms_eps,
-        ..Default::default()
     };
     let off = uniforms.alloc(&p);
     pass.set_pipeline(&model.pipes.rms_norm);
@@ -322,7 +321,6 @@ fn dispatch_matvec_q1_0_silu(
         output_offset: out_off,
         accumulate: u32::from(accumulate),
         dispatch_x_dim: dispatch_x,
-        ..Default::default()
     };
     let off = uniforms.alloc(&p);
     pass.set_pipeline(&model.pipes.matvec_silu);
@@ -432,8 +430,6 @@ fn dispatch_kv_writeback_fused(
         kv_dim: cfg.kv_dim,
         nb_per_row,
         eps: cfg.rms_eps,
-        _p0: 0,
-        _p1: 0,
     };
     let off = uniforms.alloc(&p);
     pass.set_pipeline(&model.pipes.kv_writeback_fused);
@@ -460,8 +456,6 @@ fn dispatch_q_norm_rope_fused(
         pos_base,
         q_dim: cfg.q_dim,
         eps: cfg.rms_eps,
-        _p0: 0,
-        _p1: 0,
     };
     let off = uniforms.alloc(&p);
     pass.set_pipeline(&model.pipes.q_norm_rope_fused);
@@ -557,7 +551,6 @@ pub fn encode_step_matvec(
             qs_offset: ot.token_embd_qs,
             output_offset: m.act_layout.x,
             sample_offset: sample_in,
-            ..Default::default()
         };
         let off = uniforms.alloc(&p);
         pass.set_pipeline(&m.pipes.embed);
@@ -749,7 +742,6 @@ fn layer_post_kv_in_pass(
             n_head: cfg.n_head,
             out_offset: model.act_layout.attn_out,
             n_chunks_active,
-            ..Default::default()
         };
         let off = uniforms.alloc(&pm);
         pass.set_pipeline(&model.pipes.attention_merge);
@@ -911,7 +903,6 @@ pub fn prefill_matmul_topk(
             qs_offset: ot.token_embd_qs,
             output_offset: model.act_layout.x,
             sample_offset: 0,
-            ..Default::default()
         };
         let off = se.uniforms.alloc(&p);
         let mut pass = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -946,7 +937,6 @@ pub fn prefill_matmul_topk(
     let last_input_offset = model.act_layout.x_norm + (m - 1) * cfg.n_embd;
     matvec_q1_0(
         model,
-        cfg,
         &mut se,
         cfg.n_embd,
         cfg.n_vocab,
@@ -998,11 +988,10 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         lt.attn_norm_off,
     );
 
-    let (a_d_off, a_qs_off) = quantize_act(model, cfg, se, cfg.n_embd, m, model.act_layout.x_norm);
+    let (a_d_off, a_qs_off) = quantize_act(model, se, cfg.n_embd, m, model.act_layout.x_norm);
 
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.n_embd,
         cfg.q_dim,
@@ -1017,7 +1006,6 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     );
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.n_embd,
         cfg.kv_dim,
@@ -1032,7 +1020,6 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     );
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.n_embd,
         cfg.kv_dim,
@@ -1100,10 +1087,9 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         cp.dispatch_workgroups(cfg.n_head, m, 1);
     }
 
-    let (a_d2, a_qs2) = quantize_act(model, cfg, se, cfg.q_dim, m, model.act_layout.attn_out);
+    let (a_d2, a_qs2) = quantize_act(model, se, cfg.q_dim, m, model.act_layout.attn_out);
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.q_dim,
         cfg.n_embd,
@@ -1128,10 +1114,9 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         lt.ffn_norm_off,
     );
 
-    let (a_d3, a_qs3) = quantize_act(model, cfg, se, cfg.n_embd, m, model.act_layout.x_norm);
+    let (a_d3, a_qs3) = quantize_act(model, se, cfg.n_embd, m, model.act_layout.x_norm);
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.n_embd,
         cfg.n_ff,
@@ -1146,7 +1131,6 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
     );
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.n_embd,
         cfg.n_ff,
@@ -1170,10 +1154,9 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         model.act_layout.ffn_in,
     );
 
-    let (a_d4, a_qs4) = quantize_act(model, cfg, se, cfg.n_ff, m, model.act_layout.ffn_in);
+    let (a_d4, a_qs4) = quantize_act(model, se, cfg.n_ff, m, model.act_layout.ffn_in);
     matmul_q1_0(
         model,
-        cfg,
         se,
         cfg.n_ff,
         cfg.n_embd,
@@ -1207,7 +1190,6 @@ fn rms_norm(
         output_offset: out_off,
         weight_offset: w_off,
         eps: cfg.rms_eps,
-        ..Default::default()
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1221,7 +1203,6 @@ fn rms_norm(
 
 fn matvec_q1_0(
     model: &Model,
-    _cfg: &Config,
     se: &mut StepEncoder,
     k: u32,
     n: u32,
@@ -1258,7 +1239,6 @@ fn matvec_q1_0(
 
 fn quantize_act(
     model: &Model,
-    _cfg: &Config,
     se: &mut StepEncoder,
     k: u32,
     m: u32,
@@ -1277,7 +1257,6 @@ fn quantize_act(
         d_offset: d_off,
         qs_offset: qs_off,
         dispatch_x_dim: dispatch_x,
-        ..Default::default()
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1314,8 +1293,6 @@ fn kv_writeback_fused(
         kv_dim: cfg.kv_dim,
         nb_per_row,
         eps: cfg.rms_eps,
-        _p0: 0,
-        _p1: 0,
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1343,8 +1320,6 @@ fn q_norm_rope_fused(
         pos_base,
         q_dim: cfg.q_dim,
         eps: cfg.rms_eps,
-        _p0: 0,
-        _p1: 0,
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1376,7 +1351,6 @@ fn silu_mul(
         up_offset: up_off,
         out_offset: out_off,
         dispatch_x_count: dispatch_x * 64,
-        ..Default::default()
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1390,7 +1364,6 @@ fn silu_mul(
 
 fn matmul_q1_0(
     model: &Model,
-    _cfg: &Config,
     se: &mut StepEncoder,
     k: u32,
     n: u32,
@@ -1413,7 +1386,6 @@ fn matmul_q1_0(
         a_qs_offset: a_qs,
         out_offset: out_off,
         accumulate: u32::from(accumulate),
-        ..Default::default()
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1613,10 +1585,9 @@ pub mod bench_internals {
             entries.push((
                 label,
                 calls,
-                Box::new(move |model, cfg, se| {
+                Box::new(move |model, _cfg, se| {
                     matvec_q1_0(
                         model,
-                        cfg,
                         se,
                         k,
                         n,
@@ -1732,7 +1703,6 @@ pub mod bench_internals {
                     output_offset: model.act_layout.x,
                     accumulate: 1,
                     dispatch_x_dim: dispatch_x,
-                    ..Default::default()
                 };
                 let off = se.alloc_uniform(&p);
                 let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1771,7 +1741,6 @@ pub mod bench_internals {
                     n_head: cfg.n_head,
                     out_offset: model.act_layout.attn_out,
                     n_chunks_active,
-                    ..Default::default()
                 };
                 let ps_off = se.alloc_uniform(&ps);
                 let pm_off = se.alloc_uniform(&pm);
@@ -1799,7 +1768,6 @@ pub mod bench_internals {
                     qs_offset: ot.token_embd_qs,
                     output_offset: model.act_layout.x,
                     sample_offset: 0,
-                    ..Default::default()
                 };
                 let off = se.alloc_uniform(&p);
                 let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
