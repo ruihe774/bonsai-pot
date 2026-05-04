@@ -140,11 +140,49 @@ pub struct MatvecParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct MatvecSiluParams {
+    pub(crate) k: u32,
+    pub(crate) n: u32,
+    pub(crate) d_offset: u32,
+    pub(crate) qs_offset: u32,
+    pub(crate) gate_offset: u32,
+    pub(crate) up_offset: u32,
+    pub(crate) output_offset: u32,
+    pub(crate) accumulate: u32,
+    pub(crate) dispatch_x_dim: u32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
+    pub(crate) _p2: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct MatvecFusedParams {
     pub(crate) k: u32,
     pub(crate) n_total: u32,
     pub(crate) input_offset: u32,
     pub(crate) dispatch_x_dim: u32,
+    pub(crate) d_offset_0: u32,
+    pub(crate) qs_offset_0: u32,
+    pub(crate) n_0: u32,
+    pub(crate) output_offset_0: u32,
+    pub(crate) d_offset_1: u32,
+    pub(crate) qs_offset_1: u32,
+    pub(crate) n_1: u32,
+    pub(crate) output_offset_1: u32,
+    pub(crate) d_offset_2: u32,
+    pub(crate) qs_offset_2: u32,
+    pub(crate) n_2: u32,
+    pub(crate) output_offset_2: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct MatvecFusedNormedParams {
+    pub(crate) k: u32,
+    pub(crate) n_total: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) dispatch_x_dim: u32,
+    pub(crate) w_norm_off: u32,
+    pub(crate) eps: f32,
     pub(crate) d_offset_0: u32,
     pub(crate) qs_offset_0: u32,
     pub(crate) n_0: u32,
@@ -347,7 +385,13 @@ pub struct Pipelines {
     pub(crate) embed: wgpu::ComputePipeline,
     pub(crate) rms_norm: wgpu::ComputePipeline,
     pub(crate) matvec: wgpu::ComputePipeline,
+    // Kept built but unused on the active code path: the matvec single-token
+    // path's two callers both fold in the preceding rms_norm via
+    // `matvec_fused_normed`. Retained for future no-rms-norm fused callers.
+    #[allow(dead_code, reason = "kept for future no-rms-norm callers")]
     pub(crate) matvec_fused: wgpu::ComputePipeline,
+    pub(crate) matvec_silu: wgpu::ComputePipeline,
+    pub(crate) matvec_fused_normed: wgpu::ComputePipeline,
     pub(crate) quantize: wgpu::ComputePipeline,
     pub(crate) matmul: wgpu::ComputePipeline,
     pub(crate) attention: wgpu::ComputePipeline,
@@ -380,6 +424,7 @@ pub struct BindGroupLayouts {
     pub(crate) embed: wgpu::BindGroupLayout,
     pub(crate) rms_norm: wgpu::BindGroupLayout,
     pub(crate) matvec: wgpu::BindGroupLayout,
+    pub(crate) matvec_fused_normed: wgpu::BindGroupLayout,
     pub(crate) quantize: wgpu::BindGroupLayout,
     pub(crate) matmul: wgpu::BindGroupLayout,
     pub(crate) attn: wgpu::BindGroupLayout,
@@ -403,6 +448,8 @@ pub struct CachedBindGroups {
     pub(crate) matvec_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act)
     pub(crate) matvec_w_ffn_d: wgpu::BindGroup, // (uniform, w_ffn_d,  act)
     pub(crate) matvec_w_embed: wgpu::BindGroup, // (uniform, w_embed,  act) — LM head
+    pub(crate) matvec_fused_normed_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act, w_norms)
+    pub(crate) matvec_fused_normed_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act, w_norms)
     pub(crate) quantize: wgpu::BindGroup, // (uniform, act, act_q8)
     pub(crate) matmul_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act_q8, act)
     pub(crate) matmul_w_ffn_gu: wgpu::BindGroup,
@@ -1288,6 +1335,11 @@ impl Model {
         let subgroup_min_size_str = subgroup_min_size.to_string();
         let max_chunks = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
         let max_chunks_str = max_chunks.to_string();
+        // n_embd is baked into matvec_q1_0_fused_normed.wgsl so the in-LDS
+        // x_sh array is sized exactly to this model (5 KiB at 4B / 8 KiB at 8B)
+        // — this maximizes WG-occupancy on AMD RDNA, which allocates LDS in
+        // 1 KiB granularity per WG.
+        let n_embd_v4_str = (cfg.n_embd / 4).to_string();
 
         // Pre-flight: check the attention_merge LDS budget before shader compile.
         // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs SG_PARTIAL_MAX
@@ -1305,7 +1357,8 @@ impl Model {
                 let src: &str = include_str!(concat!("shaders/", $file));
                 let templated = src
                     .replace("{{SUBGROUP_MIN_SIZE}}", &subgroup_min_size_str)
-                    .replace("{{MAX_CHUNKS}}", &max_chunks_str);
+                    .replace("{{MAX_CHUNKS}}", &max_chunks_str)
+                    .replace("{{N_EMBD_V4}}", &n_embd_v4_str);
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some($file),
                     source: wgpu::ShaderSource::Wgsl(templated.into()),
@@ -1316,6 +1369,8 @@ impl Model {
         let sh_rms = load_shader!("rms_norm.wgsl");
         let sh_matvec = load_shader!("matvec_q1_0.wgsl");
         let sh_matvec_fused = load_shader!("matvec_q1_0_fused.wgsl");
+        let sh_matvec_silu = load_shader!("matvec_q1_0_silu.wgsl");
+        let sh_matvec_fused_normed = load_shader!("matvec_q1_0_fused_normed.wgsl");
         let sh_quant = load_shader!("quantize_q8_0.wgsl");
         let sh_matmul = load_shader!("matmul_q1_0_q8_0.wgsl");
         let sh_attn = load_shader!("attention.wgsl");
@@ -1342,9 +1397,10 @@ impl Model {
             embed: make_bgl("embed_bgl", 3, 0b010), // weights ro, act rw, sample ro
             rms_norm: make_bgl("rms_norm_bgl", 2, 0b01), // act rw, w ro
             matvec: make_bgl("matvec_bgl", 2, 0b10), // weights ro, act rw
-            quantize: make_bgl("quantize_bgl", 2, 0b10), // act ro, outbuf rw
+            matvec_fused_normed: make_bgl("matvec_fused_normed_bgl", 3, 0b010), // weights ro, act rw, w_norms ro
+            quantize: make_bgl("quantize_bgl", 2, 0b10),                        // act ro, outbuf rw
             matmul: make_bgl("matmul_bgl", 3, 0b100), // weights ro, acts ro, y rw
-            attn: make_bgl("attn_bgl", 3, 0b001),   // act rw, k ro, v ro
+            attn: make_bgl("attn_bgl", 3, 0b001),     // act rw, k ro, v ro
             attn_split: make_bgl("attn_split_bgl", 4, 0b1000), // act ro, k ro, v ro, partials rw
             attn_merge: make_bgl("attn_merge_bgl", 2, 0b01), // act rw, partials ro
             silu_mul: make_bgl("silu_mul_bgl", 1, 0b1), // act rw
@@ -1383,6 +1439,12 @@ impl Model {
             rms_norm: mk_pipe(&bgls.rms_norm, &sh_rms, "rms_norm"),
             matvec: mk_pipe(&bgls.matvec, &sh_matvec, "matvec"),
             matvec_fused: mk_pipe(&bgls.matvec, &sh_matvec_fused, "matvec_fused"),
+            matvec_silu: mk_pipe(&bgls.matvec, &sh_matvec_silu, "matvec_silu"),
+            matvec_fused_normed: mk_pipe(
+                &bgls.matvec_fused_normed,
+                &sh_matvec_fused_normed,
+                "matvec_fused_normed",
+            ),
             quantize: mk_pipe(&bgls.quantize, &sh_quant, "quantize"),
             matmul: mk_pipe(&bgls.matmul, &sh_matmul, "matmul"),
             attention: mk_pipe(&bgls.attn, &sh_attn, "attention"),
@@ -1691,6 +1753,16 @@ fn build_cached_bind_groups(
             &bgls.matvec,
             &[&buffers.w_embed, &buffers.act],
         ),
+        matvec_fused_normed_w_attn: mk(
+            "cached_matvec_fused_normed_attn",
+            &bgls.matvec_fused_normed,
+            &[&buffers.w_attn, &buffers.act, &buffers.w_norms],
+        ),
+        matvec_fused_normed_w_ffn_gu: mk(
+            "cached_matvec_fused_normed_ffngu",
+            &bgls.matvec_fused_normed,
+            &[&buffers.w_ffn_gu, &buffers.act, &buffers.w_norms],
+        ),
         quantize: mk(
             "cached_quantize",
             &bgls.quantize,
@@ -1854,7 +1926,9 @@ mod tests {
         assert!(size_of::<EmbedParams>() <= limit);
         assert!(size_of::<RmsNormParams>() <= limit);
         assert!(size_of::<MatvecParams>() <= limit);
+        assert!(size_of::<MatvecSiluParams>() <= limit);
         assert!(size_of::<MatvecFusedParams>() <= limit);
+        assert!(size_of::<MatvecFusedNormedParams>() <= limit);
         assert!(size_of::<QuantParams>() <= limit);
         assert!(size_of::<MatmulParams>() <= limit);
         assert!(size_of::<AttnParams>() <= limit);

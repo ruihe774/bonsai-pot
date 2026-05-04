@@ -27,9 +27,9 @@ use bytemuck::Pod;
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
-    KvWritebackFusedParams, MatmulParams, MatvecFusedParams, MatvecParams, Model,
-    QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams, TOPK_MAX, TopKParams,
-    UNIFORM_POOL_SLOTS, UNIFORM_SLOT_SIZE, WeightSet,
+    KvWritebackFusedParams, MatmulParams, MatvecFusedNormedParams, MatvecFusedParams, MatvecParams,
+    MatvecSiluParams, Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams,
+    TOPK_MAX, TopKParams, UNIFORM_POOL_SLOTS, UNIFORM_SLOT_SIZE, WeightSet,
 };
 
 // ---------- Q8_0 KV cache layout helpers ------------------------------------
@@ -149,6 +149,21 @@ const fn matvec_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
     }
 }
 
+/// Bind group for `matvec_q1_0_fused_normed`. Only `Attn` (QKV) and `FfnGU`
+/// (gate+up) are valid: those are the two sites in the matvec single-token
+/// path that are preceded by an `rms_norm` and use the fused matvec.
+#[allow(
+    clippy::panic,
+    reason = "internal invariant: only Attn / FfnGU are wired up"
+)]
+const fn matvec_fused_normed_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
+    match ws {
+        WeightSet::Attn => &model.cached.matvec_fused_normed_w_attn,
+        WeightSet::FfnGU => &model.cached.matvec_fused_normed_w_ffn_gu,
+        _ => panic!("matvec_fused_normed only supports WeightSet::Attn / FfnGU"),
+    }
+}
+
 const fn matmul_bg(model: &Model, ws: WeightSet) -> &wgpu::BindGroup {
     match ws {
         WeightSet::Attn => &model.cached.matmul_w_attn,
@@ -222,6 +237,11 @@ fn dispatch_matvec_q1_0(
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
+// Currently unused: both call sites (QKV, gate+up) on the matvec single-token
+// path now go through `dispatch_matvec_q1_0_fused_normed` which folds in the
+// preceding `rms_norm`. Kept as the canonical 2-/3-range fused matvec for any
+// future caller that doesn't have an `rms_norm` immediately before it.
+#[allow(dead_code, reason = "kept for future no-rms-norm callers")]
 fn dispatch_matvec_q1_0_fused(
     model: &Model,
     uniforms: &mut UniformPool,
@@ -268,32 +288,98 @@ fn dispatch_matvec_q1_0_fused(
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
-fn dispatch_silu_mul(
+/// `matvec_q1_0` with the `silu(gate) * up` activation fold on the input side
+/// (no separate `silu_mul` dispatch + `ffn_in` round-trip). Used for the
+/// `Wd/ffn_down` dispatch on the matvec single-token path. Same multi-row WG
+/// shape and bind-group layout as `dispatch_matvec_q1_0` — the only
+/// difference is the kernel reads two activation regions (`gate`, `up`) and
+/// fuses `silu(g)*u` per element.
+fn dispatch_matvec_q1_0_silu(
     model: &Model,
     uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>,
+    k: u32,
     n: u32,
-    m: u32,
+    weights: WeightSet,
+    w_d: u32,
+    w_qs: u32,
     gate_off: u32,
     up_off: u32,
     out_off: u32,
+    accumulate: bool,
 ) {
-    let total = n * m;
-    let groups = total.div_ceil(64);
-    let dispatch_x = groups.min(65535);
-    let dispatch_y = groups.div_ceil(dispatch_x);
-    let p = SiluMulParams {
+    const ROWS_PER_WG: u32 = 8;
+    let n_wg = n.div_ceil(ROWS_PER_WG);
+    let dispatch_x = n_wg.min(65535);
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
+    let p = MatvecSiluParams {
+        k,
         n,
-        m,
+        d_offset: w_d,
+        qs_offset: w_qs,
         gate_offset: gate_off,
         up_offset: up_off,
-        out_offset: out_off,
-        dispatch_x_count: dispatch_x * 64,
+        output_offset: out_off,
+        accumulate: u32::from(accumulate),
+        dispatch_x_dim: dispatch_x,
         ..Default::default()
     };
     let off = uniforms.alloc(&p);
-    pass.set_pipeline(&model.pipes.silu_mul);
-    pass.set_bind_group(0, &model.cached.silu_mul, &[off]);
+    pass.set_pipeline(&model.pipes.matvec_silu);
+    pass.set_bind_group(0, matvec_bg(model, weights), &[off]);
+    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+}
+
+/// Fused: `rms_norm(x) * w_norm` → multi-range `Q1_0` matvec, in one dispatch.
+/// Replaces `dispatch_rms_norm + dispatch_matvec_q1_0_fused` for the matvec
+/// single-token path. See `shaders/matvec_q1_0_fused_normed.wgsl`.
+fn dispatch_matvec_q1_0_fused_normed(
+    model: &Model,
+    cfg: &Config,
+    uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    k: u32,
+    input_offset: u32,
+    w_norm_off: u32,
+    weights: WeightSet,
+    ranges: &[(u32, u32, u32, u32)],
+) {
+    const ROWS_PER_WG: u32 = 8;
+    debug_assert!(ranges.len() == 2 || ranges.len() == 3);
+    for (_, _, n, _) in ranges {
+        debug_assert!(n % 8 == 0);
+    }
+    let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
+    let (d0, qs0, n0, o0) = r(0);
+    let (d1, qs1, n1, o1) = r(1);
+    let (d2, qs2, n2, o2) = r(2);
+    let n_total = n0 + n1 + n2;
+    let n_wg = n_total.div_ceil(ROWS_PER_WG);
+    let dispatch_x = n_wg.min(65535);
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
+    let p = MatvecFusedNormedParams {
+        k,
+        n_total,
+        input_offset,
+        dispatch_x_dim: dispatch_x,
+        w_norm_off,
+        eps: cfg.rms_eps,
+        d_offset_0: d0,
+        qs_offset_0: qs0,
+        n_0: n0,
+        output_offset_0: o0,
+        d_offset_1: d1,
+        qs_offset_1: qs1,
+        n_1: n1,
+        output_offset_1: o1,
+        d_offset_2: d2,
+        qs_offset_2: qs2,
+        n_2: n2,
+        output_offset_2: o2,
+    };
+    let off = uniforms.alloc(&p);
+    pass.set_pipeline(&model.pipes.matvec_fused_normed);
+    pass.set_bind_group(0, matvec_fused_normed_bg(model, weights), &[off]);
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -434,10 +520,10 @@ fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
 /// the LM-head/topk suffix is omitted (the `topk_out = None` path used by
 /// `prefill_matvec_loop_topk`'s non-last steps).
 fn encode_step_matvec_slots_no_suffix(cfg: &Config) -> u64 {
-    // 1 embed + 11 per layer (rms, qkv_fused, q_norm_rope_fused,
-    // kv_writeback_fused, attn_split, attn_merge, Wo, ffn_norm,
-    // gate_up_fused, silu_mul, Wd).
-    1 + 11 * u64::from(cfg.n_layer)
+    // 1 embed + 8 per layer (qkv_fused_normed, q_norm_rope_fused,
+    // kv_writeback_fused, attn_split, attn_merge, Wo,
+    // gate_up_fused_normed, Wd_silu).
+    1 + 8 * u64::from(cfg.n_layer)
 }
 
 /// Encode one tg step into the given encoder. The input token is read from
@@ -585,24 +671,18 @@ fn layer_pre_kv_in_pass(
     pos: u32,
 ) {
     let lt = &model.layer_tensors[il as usize];
-    dispatch_rms_norm(
+    // Fused: rms_norm(x) * w_attn_norm → matvec_q1_0_fused (QKV).
+    // Replaces a 2-dispatch sequence (rms_norm, matvec_q1_0_fused).
+    // x is read directly (NOT x_norm); the kernel stages x to LDS, normalizes
+    // in place, and runs the matvec inner loop off the normed shmem.
+    dispatch_matvec_q1_0_fused_normed(
         model,
         cfg,
         uniforms,
         pass,
-        1,
         cfg.n_embd,
         model.act_layout.x,
-        model.act_layout.x_norm,
         lt.attn_norm_off,
-    );
-
-    dispatch_matvec_q1_0_fused(
-        model,
-        uniforms,
-        pass,
-        cfg.n_embd,
-        model.act_layout.x_norm,
         WeightSet::Attn,
         &[
             (lt.wq.0, lt.wq.1, cfg.q_dim, model.act_layout.q),
@@ -691,24 +771,16 @@ fn layer_post_kv_in_pass(
         true, /*accumulate*/
     );
 
-    dispatch_rms_norm(
+    // Fused: rms_norm(x) * w_ffn_norm → matvec_q1_0_fused (gate+up).
+    // Replaces a 2-dispatch sequence (rms_norm, matvec_q1_0_fused).
+    dispatch_matvec_q1_0_fused_normed(
         model,
         cfg,
         uniforms,
         pass,
-        1,
         cfg.n_embd,
         model.act_layout.x,
-        model.act_layout.x_norm,
         lt.ffn_norm_off,
-    );
-
-    dispatch_matvec_q1_0_fused(
-        model,
-        uniforms,
-        pass,
-        cfg.n_embd,
-        model.act_layout.x_norm,
         WeightSet::FfnGU,
         &[
             (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
@@ -716,18 +788,11 @@ fn layer_post_kv_in_pass(
         ],
     );
 
-    dispatch_silu_mul(
-        model,
-        uniforms,
-        pass,
-        cfg.n_ff,
-        1,
-        model.act_layout.gate,
-        model.act_layout.up,
-        model.act_layout.ffn_in,
-    );
-
-    dispatch_matvec_q1_0(
+    // Fused: silu(gate) * up on the input side of Wd, in one dispatch (no
+    // ffn_in round-trip, no standalone silu_mul). The standalone silu_mul
+    // shader and the matmul-prefill path's `silu_mul -> matmul_q1_0_q8_0`
+    // pair are unchanged — this fusion is matvec-path-only.
+    dispatch_matvec_q1_0_silu(
         model,
         uniforms,
         pass,
@@ -736,7 +801,8 @@ fn layer_post_kv_in_pass(
         WeightSet::FfnD,
         lt.wd.0,
         lt.wd.1,
-        model.act_layout.ffn_in,
+        model.act_layout.gate,
+        model.act_layout.up,
         model.act_layout.x,
         true, /*accumulate*/
     );
@@ -1154,11 +1220,13 @@ fn rms_norm(
 }
 
 #[cfg(feature = "bench-internals")]
-fn matvec_q1_0_fused_pass(
+fn matvec_q1_0_fused_normed_pass(
     model: &Model,
+    cfg: &Config,
     se: &mut StepEncoder,
     k: u32,
     input_offset: u32,
+    w_norm_off: u32,
     weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
@@ -1175,11 +1243,13 @@ fn matvec_q1_0_fused_pass(
     let n_wg = n_total.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
     let dispatch_y = n_wg.div_ceil(dispatch_x);
-    let p = MatvecFusedParams {
+    let p = MatvecFusedNormedParams {
         k,
         n_total,
         input_offset,
         dispatch_x_dim: dispatch_x,
+        w_norm_off,
+        eps: cfg.rms_eps,
         d_offset_0: d0,
         qs_offset_0: qs0,
         n_0: n0,
@@ -1195,11 +1265,11 @@ fn matvec_q1_0_fused_pass(
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("matvec_fused"),
+        label: Some("matvec_fused_normed"),
         timestamp_writes: None,
     });
-    cp.set_pipeline(&model.pipes.matvec_fused);
-    cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
+    cp.set_pipeline(&model.pipes.matvec_fused_normed);
+    cp.set_bind_group(0, matvec_fused_normed_bg(model, weights), &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -1236,6 +1306,46 @@ fn matvec_q1_0(
         timestamp_writes: None,
     });
     cp.set_pipeline(&model.pipes.matvec);
+    cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
+    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+}
+
+fn matvec_q1_0_silu(
+    model: &Model,
+    _cfg: &Config,
+    se: &mut StepEncoder,
+    k: u32,
+    n: u32,
+    weights: WeightSet,
+    w_d: u32,
+    w_qs: u32,
+    gate_off: u32,
+    up_off: u32,
+    out_off: u32,
+    accumulate: bool,
+) {
+    const ROWS_PER_WG: u32 = 8;
+    let n_wg = n.div_ceil(ROWS_PER_WG);
+    let dispatch_x = n_wg.min(65535);
+    let dispatch_y = n_wg.div_ceil(dispatch_x);
+    let p = MatvecSiluParams {
+        k,
+        n,
+        d_offset: w_d,
+        qs_offset: w_qs,
+        gate_offset: gate_off,
+        up_offset: up_off,
+        output_offset: out_off,
+        accumulate: u32::from(accumulate),
+        dispatch_x_dim: dispatch_x,
+        ..Default::default()
+    };
+    let off = se.alloc_uniform(&p);
+    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("matvec_silu"),
+        timestamp_writes: None,
+    });
+    cp.set_pipeline(&model.pipes.matvec_silu);
     cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
@@ -1428,8 +1538,8 @@ pub mod bench_internals {
 
     use super::{
         AttnParams, Config, EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
-        kv_layer_offsets, kv_writeback_fused, matvec_q1_0, matvec_q1_0_fused_pass,
-        prefill_matmul_topk, q_norm_rope_fused, rms_norm, silu_mul, step_matvec_no_sample,
+        kv_layer_offsets, kv_writeback_fused, matvec_q1_0, matvec_q1_0_fused_normed_pass,
+        matvec_q1_0_silu, prefill_matmul_topk, q_norm_rope_fused, rms_norm, step_matvec_no_sample,
         step_matvec_topk,
     };
     use crate::error::PotError;
@@ -1518,6 +1628,9 @@ pub mod bench_internals {
         let lt0 = &model.layer_tensors[0];
         let ot = &model.output_tensors;
         let n_layer = cfg.n_layer;
+        // Wdown is no longer here — it's fused with silu_mul into a single
+        // `matvec_q1_0_silu` dispatch (entry below). Wo and LM_head still use
+        // the plain `matvec_q1_0` kernel.
         let matvec_shapes: Vec<(String, u32, u32, u32, WeightSet, u32, u32)> = vec![
             (
                 format!("matvec Wo K={} N={}", cfg.q_dim, cfg.n_embd),
@@ -1527,15 +1640,6 @@ pub mod bench_internals {
                 WeightSet::Attn,
                 lt0.wo.0,
                 lt0.wo.1,
-            ),
-            (
-                format!("matvec Wdown K={} N={}", cfg.n_ff, cfg.n_embd),
-                cfg.n_ff,
-                cfg.n_embd,
-                n_layer,
-                WeightSet::FfnD,
-                lt0.wd.0,
-                lt0.wd.1,
             ),
             (
                 format!("matvec LM_head K={} N={}", cfg.n_embd, cfg.n_vocab),
@@ -1572,15 +1676,20 @@ pub mod bench_internals {
         }
 
         entries.push((
-            format!("matvec QKV fused N={}", cfg.q_dim + cfg.kv_dim + cfg.kv_dim),
+            format!(
+                "matvec QKV fused+normed N={}",
+                cfg.q_dim + cfg.kv_dim + cfg.kv_dim
+            ),
             n_layer,
             Box::new(move |model, cfg, se| {
                 let lt = &model.layer_tensors[0];
-                matvec_q1_0_fused_pass(
+                matvec_q1_0_fused_normed_pass(
                     model,
+                    cfg,
                     se,
                     cfg.n_embd,
-                    model.act_layout.x_norm,
+                    model.act_layout.x,
+                    lt.attn_norm_off,
                     WeightSet::Attn,
                     &[
                         (lt.wq.0, lt.wq.1, cfg.q_dim, model.act_layout.q),
@@ -1591,15 +1700,17 @@ pub mod bench_internals {
             }),
         ));
         entries.push((
-            format!("matvec gate_up fused N={}", 2 * cfg.n_ff),
+            format!("matvec gate_up fused+normed N={}", 2 * cfg.n_ff),
             n_layer,
             Box::new(move |model, cfg, se| {
                 let lt = &model.layer_tensors[0];
-                matvec_q1_0_fused_pass(
+                matvec_q1_0_fused_normed_pass(
                     model,
+                    cfg,
                     se,
                     cfg.n_embd,
-                    model.act_layout.x_norm,
+                    model.act_layout.x,
+                    lt.ffn_norm_off,
                     WeightSet::FfnGU,
                     &[
                         (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
@@ -1610,14 +1721,16 @@ pub mod bench_internals {
         ));
 
         // (label, n_groups, group_size, calls/step, norm_off)
-        // NOTE: per-K-head rms_norm + K-side rope are folded into kv_writeback_fused,
-        // and per-Q-head rms_norm + Q-side rope are folded into q_norm_rope_fused,
-        // so neither appears here.
+        // NOTE: per-layer rms_norm calls (attn_norm, ffn_norm) are folded into
+        // matvec_q1_0_fused_normed; per-K-head rms_norm + K-side rope are
+        // folded into kv_writeback_fused; per-Q-head rms_norm + Q-side rope
+        // are folded into q_norm_rope_fused. The lone remaining rms_norm
+        // dispatch is the output_norm in the LM-head suffix (1 call/step).
         let rms_shapes: Vec<(String, u32, u32, u32, u32)> = vec![(
-            format!("rms_norm ng=1 gs={}", cfg.n_embd),
+            format!("rms_norm ng=1 gs={} (output_norm)", cfg.n_embd),
             1,
             cfg.n_embd,
-            2 * n_layer + 1,
+            1,
             lt0.attn_norm_off,
         )];
         for (label, ng, gs, calls, norm_off) in &rms_shapes {
@@ -1641,17 +1754,23 @@ pub mod bench_internals {
         }
 
         entries.push((
-            format!("silu_mul n={}", cfg.n_ff),
+            format!("matvec Wdown_silu K={} N={}", cfg.n_ff, cfg.n_embd),
             n_layer,
             Box::new(move |model, cfg, se| {
-                silu_mul(
+                let lt = &model.layer_tensors[0];
+                matvec_q1_0_silu(
                     model,
+                    cfg,
                     se,
                     cfg.n_ff,
-                    1,
+                    cfg.n_embd,
+                    WeightSet::FfnD,
+                    lt.wd.0,
+                    lt.wd.1,
                     model.act_layout.gate,
                     model.act_layout.up,
-                    model.act_layout.ffn_in,
+                    model.act_layout.x,
+                    true,
                 );
             }),
         ));
