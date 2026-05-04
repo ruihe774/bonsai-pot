@@ -1964,38 +1964,79 @@ pub mod bench_internals {
             ));
         }
 
-        println!();
-        println!(
-            "| kernel                              | calls/step | us/call | ms/step | %step |"
-        );
-        println!(
-            "|-------------------------------------|-----------:|--------:|--------:|------:|"
-        );
-        let total_ms: f32 = breakdown
+        // Calibrate by timing real tg steps now that the GPU is warm. Scale
+        // per-kernel times so the corrected total matches measured throughput
+        // (covers per-pass overhead + readback that isolated dispatches miss).
+        let step_ms: f32 = {
+            let n: u32 = 32;
+            let mut pos = 0u32;
+            step_matvec_no_sample(model, 1, pos);
+            if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                model.check_device()?;
+                return Err(PotError::Poll(e));
+            }
+            pos += 1;
+            let t = Instant::now();
+            for _ in 0..n {
+                step_matvec_topk(model, 1, pos, 1)?;
+                pos += 1;
+            }
+            let per_step = t.elapsed().as_secs_f32() / n as f32;
+            eprintln!(
+                "calibration (incl. readback): {:.3} ms/step  ({:.1} t/s)",
+                per_step * 1000.0,
+                1.0 / per_step
+            );
+            per_step * 1000.0
+        };
+
+        let raw_total_ms: f32 = breakdown
             .iter()
             .map(|(_, c, us)| (*c as f32) * (*us) / 1000.0)
             .sum();
+        let scale = step_ms / raw_total_ms;
         let mut sorted = breakdown.clone();
         sorted.sort_by(|a, b| {
             let ma = a.1 as f32 * a.2;
             let mb = b.1 as f32 * b.2;
             mb.partial_cmp(&ma).unwrap_or(Ordering::Equal)
         });
-        for (label, calls, per_us) in &sorted {
-            let ms_step = (*calls as f32) * (*per_us) / 1000.0;
-            let pct = 100.0 * ms_step / total_ms;
-            println!("| {label:<35} | {calls:>10} | {per_us:>7.2} | {ms_step:>7.3} | {pct:>5.1} |");
+        let adj_total_ms: f32 = sorted
+            .iter()
+            .map(|(_, c, us)| (*c as f32) * (*us) * scale / 1000.0)
+            .sum();
+
+        println!();
+        println!(
+            "| kernel                              | calls/step | raw us | adj us | raw ms | adj ms | %step |"
+        );
+        println!(
+            "|-------------------------------------|-----------:|-------:|-------:|-------:|-------:|------:|"
+        );
+        for (label, calls, raw_us) in &sorted {
+            let adj_us = raw_us * scale;
+            let raw_ms = (*calls as f32) * (*raw_us) / 1000.0;
+            let adj_ms = (*calls as f32) * adj_us / 1000.0;
+            let pct = 100.0 * adj_ms / adj_total_ms;
+            println!(
+                "| {label:<35} | {calls:>10} | {raw_us:>6.2} | {adj_us:>6.2} | {raw_ms:>6.3} | {adj_ms:>6.3} | {pct:>5.1} |"
+            );
         }
         println!(
-            "|-------------------------------------|-----------:|--------:|--------:|------:|"
+            "|-------------------------------------|-----------:|-------:|-------:|-------:|-------:|------:|"
         );
         println!(
-            "| TOTAL (sum of isolated)             |            |         | {total_ms:>7.3} |       |"
+            "| TOTAL (isolated)                    |            |        |        | {raw_total_ms:>6.3} | {adj_total_ms:>6.3} |       |"
         );
+        println!();
+        println!("raw (isolated):           {:.1} t/s", 1000.0 / raw_total_ms);
         println!(
-            "expected tg t/s if isolated sum was reality: {:.1}",
-            1000.0 / total_ms
+            "calibrated step:          {:.3} ms  ({:.1} t/s)",
+            step_ms,
+            1000.0 / step_ms
         );
+        println!("scale factor:             ×{scale:.4}");
+        println!("corrected (scaled):       {:.1} t/s", 1000.0 / adj_total_ms);
         Ok(())
     }
 }
