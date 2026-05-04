@@ -557,40 +557,12 @@ pub const UNIFORM_POOL_SLOTS: u64 = 4096;
 /// to *all* other GPU clients (compositors, games, other ML processes). Requires
 /// driver support for `VK_EXT_global_priority`; if unsupported the requested
 /// value is ignored and a warning is logged.
-///
-/// Maps to `VkQueueGlobalPriorityKHR`: `Low` = 128, `Medium` = 256,
-/// `High` = 512, `Realtime` = 1024. `Realtime` typically requires elevated OS
-/// privileges and may cause `vkCreateDevice` to fail on unprivileged processes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GlobalPriority {
-    /// Yields to other GPU clients. Good for background inference. (Default)
-    #[default]
-    Low,
-    /// Vulkan's implicit default when no global priority is specified.
-    Medium,
-    /// Inference takes precedence over normal GPU clients.
-    High,
-    /// Highest priority; requires system privileges.
-    Realtime,
-}
+pub type GlobalPriority = vk::QueueGlobalPriorityKHR;
 
-impl GlobalPriority {
-    const fn to_vk(self) -> vk::QueueGlobalPriorityKHR {
-        match self {
-            Self::Low => vk::QueueGlobalPriorityKHR::LOW,
-            Self::Medium => vk::QueueGlobalPriorityKHR::MEDIUM,
-            Self::High => vk::QueueGlobalPriorityKHR::HIGH,
-            Self::Realtime => vk::QueueGlobalPriorityKHR::REALTIME,
-        }
-    }
-
-    const fn to_queue_prio(self) -> f32 {
-        match self {
-            Self::Low => 0.0,
-            Self::Medium => 0.5,
-            Self::High | Self::Realtime => 1.0,
-        }
-    }
+fn global_priority_fallback_to_queue_prio(priority: GlobalPriority) -> f32 {
+    const LOWEST: i32 = GlobalPriority::LOW.as_raw();
+    const HIGHEST: i32 = GlobalPriority::HIGH.as_raw();
+    (priority.as_raw().clamp(LOWEST, HIGHEST) - LOWEST) as f32 / (HIGHEST - LOWEST) as f32
 }
 
 /// Allocate-time tunables for [`Model::load_with_options`].
@@ -611,7 +583,7 @@ pub struct LoadOptions {
     /// System-wide GPU scheduling priority via `VK_EXT_global_priority`.
     ///
     /// See [`GlobalPriority`] for the available levels. Default is
-    /// [`GlobalPriority::Low`] — yields to compositors and other GPU clients,
+    /// [`GlobalPriority::LOW`] — yields to compositors and other GPU clients,
     /// which is appropriate for background inference. If the driver does not
     /// expose `VK_EXT_global_priority` this field is silently ignored.
     pub priority: GlobalPriority,
@@ -621,7 +593,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
-            priority: GlobalPriority::Low,
+            priority: GlobalPriority::LOW,
         }
     }
 }
@@ -1049,9 +1021,9 @@ impl Model {
                     .iter()
                     .any(|e| e.extension_name_as_c_str() == Ok(global_priority::NAME));
 
-                let priorities = [opts.priority.to_queue_prio()];
+                let priorities = [global_priority_fallback_to_queue_prio(opts.priority)];
                 let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
-                    .global_priority(opts.priority.to_vk());
+                    .global_priority(opts.priority);
                 let mut qci = vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(family_idx)
                     .queue_priorities(&priorities);
