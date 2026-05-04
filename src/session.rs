@@ -1,5 +1,5 @@
 use crate::error::{PotError, Result};
-use crate::forward;
+use crate::forward::{self, build_step_matvec_topk_cb, wait_topk_readback};
 use crate::kv_snapshot::{self, KvSnapshot};
 use crate::model::{Model, TOPK_MAX};
 
@@ -232,6 +232,9 @@ impl<'m> Session<'m> {
     /// including `first_token`). The stop predicate, when it returns `true`,
     /// terminates generation **before** the token is delivered to the callback.
     ///
+    /// Pipelined: the `CommandBuffer` for step i+1 is encoded on the CPU while
+    /// the GPU drains step i, hiding the encode latency behind the GPU step time.
+    ///
     /// # Errors
     ///
     /// Returns an error if generation would overflow the KV cache, or if the
@@ -245,24 +248,62 @@ impl<'m> Session<'m> {
         self.model.check_device()?;
         let default_eos = self.model.cfg.eos_token_id;
         let is_stop = |t: u32| opts.stop_pred.as_ref().map_or(t == default_eos, |p| p(t));
-        let mut next = first_token;
-        for _ in 0..opts.max_new_tokens {
-            if self.pos + 1 > self.model.max_seq {
-                return Err(PotError::ContextOverflow {
-                    pos: self.pos,
-                    n: 1,
-                    max: self.model.max_seq,
-                });
-            }
-            let k = effective_k(&opts.sampler);
-            let (logits, indices) = forward::step_matvec_topk(self.model, next, self.pos, k)?;
+        let max_new = opts.max_new_tokens;
+        let max_seq = self.model.max_seq;
+        let k = effective_k(&opts.sampler);
+
+        if max_new == 0 {
+            return Ok(StopReason::MaxTokens);
+        }
+        if self.pos + 1 > max_seq {
+            return Err(PotError::ContextOverflow {
+                pos: self.pos,
+                n: 1,
+                max: max_seq,
+            });
+        }
+
+        // --- prime step 0 ---
+        let model = self.model;
+        model
+            .queue
+            .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&first_token));
+        model
+            .queue
+            .submit(Some(build_step_matvec_topk_cb(model, self.pos, k)));
+
+        for i in 0..max_new {
+            // Encode next step's CB while the GPU drains the current one.
+            // Gated on pos+2 <= max_seq and a next iteration existing.
+            let next_cb = if self.pos + 2 <= max_seq && i + 1 < max_new {
+                Some(build_step_matvec_topk_cb(model, self.pos + 1, k))
+            } else {
+                None
+            };
+
+            let (logits, indices) = wait_topk_readback(model, k)?;
             let chosen = sample_from_topk(&logits, &indices, &opts.sampler, self.pos);
             self.pos += 1;
+
             if is_stop(chosen) {
                 return Ok(StopReason::Eos);
             }
             on_token(chosen);
-            next = chosen;
+
+            if i + 1 == max_new {
+                return Ok(StopReason::MaxTokens);
+            }
+            let Some(cb) = next_cb else {
+                return Err(PotError::ContextOverflow {
+                    pos: self.pos,
+                    n: 1,
+                    max: max_seq,
+                });
+            };
+            model
+                .queue
+                .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&chosen));
+            model.queue.submit(Some(cb));
         }
         Ok(StopReason::MaxTokens)
     }

@@ -529,7 +529,7 @@ fn dispatch_attention(
 ///
 /// This must be called AFTER the step's command buffer has been submitted —
 /// i.e. the readback copy is in flight. There is no separate submit here.
-fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
+pub fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
     use core::result::Result as StdResult;
     use std::sync::{Arc, OnceLock};
 
@@ -657,6 +657,25 @@ pub fn encode_step_matvec(
     drop(pass);
 }
 
+/// Build (but do not submit) one full tg-step `CommandBuffer`: embed → all
+/// layers → `output_norm` → LM head → `topk_reduce` → sample→readback copy.
+///
+/// The input token is read from `sample[0]` at GPU execution time; callers
+/// must issue `queue.write_buffer(&buffers.sample, 0, &token_id)` before
+/// or between `submit` calls to ensure `sample[0]` holds the right value.
+/// The `topk_reduce` dispatch then overwrites `sample[0..2k]` with the K
+/// f32 logits + K u32 indices for CPU readback. The two roles never alias
+/// inside one CB (embed runs before `topk_reduce`), and across pipelined CBs
+/// the host's `write_buffer` is queue-ordered after the prior submit, so
+/// `sample[0]` is restored to the next input before the next CB starts.
+pub fn build_step_matvec_topk_cb(model: &Model, pos: u32, k: u32) -> wgpu::CommandBuffer {
+    let k = k.clamp(1, TOPK_MAX);
+    let mut se = StepEncoder::new(model);
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos);
+    se.copy_sample_to_readback(u64::from(k) * 8);
+    se.finish()
+}
+
 /// Run one matvec step at `pos`, reading the current token from CPU and
 /// returning the top-`k` logits + indices for the next token.
 pub fn step_matvec_topk(
@@ -669,13 +688,9 @@ pub fn step_matvec_topk(
     model
         .queue
         .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&token_id));
-    let mut se = StepEncoder::new(model);
-    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos);
-    // Fold the readback copy into the same command buffer so the step + the
-    // sample→readback transfer are one submit, not two.
-    se.copy_sample_to_readback(u64::from(k) * 8);
-    let cb = se.finish();
-    model.queue.submit(Some(cb));
+    model
+        .queue
+        .submit(Some(build_step_matvec_topk_cb(model, pos, k)));
     wait_topk_readback(model, k)
 }
 

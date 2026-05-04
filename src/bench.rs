@@ -12,8 +12,8 @@ use wgpu::PollType;
 use super::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnSplitParams, Config, EmbedParams,
     MatvecFusedNormedParams, MatvecSiluParams, Model, Result, StepEncoder, TopKParams, WeightSet,
-    kv_layer_offsets, matvec_bg, matvec_fused_normed_bg, prefill_matmul_topk,
-    step_matvec_no_sample, step_matvec_topk,
+    build_step_matvec_topk_cb, kv_layer_offsets, matvec_bg, matvec_fused_normed_bg,
+    prefill_matmul_topk, step_matvec_no_sample, step_matvec_topk, wait_topk_readback,
 };
 use crate::error::PotError;
 use crate::model::{KvWritebackFusedParams, MatvecParams, QNormRopeFusedParams, RmsNormParams};
@@ -49,16 +49,12 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     let pp_t_s_std = pp_t_s_mean * (pp_std / pp_mean);
 
     // ----- tg{tg_n} (from empty KV) -----
+    // Uses the same pipelined path as Session::generate_streaming: encode step
+    // i+1 on CPU while GPU drains step i.
     let mut tg_times = Vec::with_capacity(repeats as usize);
     for _ in 0..repeats {
         let t = Instant::now();
-        for pos in 0..tg_n {
-            let (_, _) = step_matvec_topk(model, 1u32, pos, 1)?;
-        }
-        if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
-            model.check_device()?;
-            return Err(PotError::Poll(e));
-        }
+        pipelined_tg(model, tg_n)?;
         tg_times.push(t.elapsed().as_secs_f32());
     }
     let tg_mean = tg_times.iter().sum::<f32>() / tg_times.len() as f32;
@@ -71,6 +67,43 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     println!("| ------------------ | ------------- | ----------------: |");
     println!("| bonsai-pot        |        pp{pp_n:<3} | {pp_t_s_mean:>9.2} ± {pp_t_s_std:>5.2} |");
     println!("| bonsai-pot        |        tg{tg_n:<3} | {tg_t_s_mean:>9.2} ± {tg_t_s_std:>5.2} |");
+    Ok(())
+}
+
+/// Pipelined tg drive: encode step i+1 on CPU while GPU drains step i.
+/// k=1 (greedy argmax of single top-K candidate) — no stochastic sampler
+/// needed for bench. The argmax is fed as the next input, matching what
+/// `Session::generate_streaming` does; kernel timings don't depend on the
+/// token value so this doesn't bias the measurement.
+fn pipelined_tg(model: &Model, tg_n: u32) -> Result<()> {
+    const TOK: u32 = 1;
+    if tg_n == 0 {
+        return Ok(());
+    }
+    model
+        .queue
+        .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&TOK));
+    model
+        .queue
+        .submit(Some(build_step_matvec_topk_cb(model, 0, 1)));
+
+    for i in 0..tg_n {
+        let next_cb = if i + 1 < tg_n {
+            Some(build_step_matvec_topk_cb(model, i + 1, 1))
+        } else {
+            None
+        };
+
+        let (_, indices) = wait_topk_readback(model, 1)?;
+        let next_tok = indices[0];
+
+        if let Some(cb) = next_cb {
+            model
+                .queue
+                .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&next_tok));
+            model.queue.submit(Some(cb));
+        }
+    }
     Ok(())
 }
 
