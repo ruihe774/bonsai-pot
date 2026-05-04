@@ -59,7 +59,7 @@ var<workgroup> sg_partial1: array<f32, SG_PARTIAL_MAX>;
 
 fn wg_sum_v4(local: vec4<f32>, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> vec4<f32> {
   let sg_sum = subgroupAdd(local);
-  if (num_subgroups == 1u) {
+  if (SUBGROUP_MIN_SIZE >= WG || num_subgroups == 1u) {
     return sg_sum;
   }
   if (sg_inv_id == 0u) { sg_partial4[sg_id] = sg_sum; }
@@ -76,7 +76,7 @@ fn wg_sum_v4(local: vec4<f32>, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -
 
 fn wg_sum_f32(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_sum = subgroupAdd(local);
-  if (num_subgroups == 1u) {
+  if (SUBGROUP_MIN_SIZE >= WG || num_subgroups == 1u) {
     return sg_sum;
   }
   if (sg_inv_id == 0u) { sg_partial1[sg_id] = sg_sum; }

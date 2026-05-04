@@ -40,7 +40,7 @@ var<workgroup> weights_sh: array<f32, MAX_CHUNKS>;
 
 fn wg_max(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_m = subgroupMax(local);
-  if (num_subgroups == 1u) { return sg_m; }
+  if (SUBGROUP_MIN_SIZE >= WG || num_subgroups == 1u) { return sg_m; }
   if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_m; }
   workgroupBarrier();
   if (sg_id == 0u) {
@@ -55,7 +55,7 @@ fn wg_max(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
 
 fn wg_sum(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_s = subgroupAdd(local);
-  if (num_subgroups == 1u) { return sg_s; }
+  if (SUBGROUP_MIN_SIZE >= WG || num_subgroups == 1u) { return sg_s; }
   if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_s; }
   workgroupBarrier();
   if (sg_id == 0u) {
