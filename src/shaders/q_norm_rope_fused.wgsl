@@ -14,7 +14,6 @@ struct Params {
   pos_base: u32,             // first absolute RoPE position
   q_dim: u32,                // = n_head * head_dim
   eps: f32,
-  _p0: u32, _p1: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;

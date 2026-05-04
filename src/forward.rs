@@ -831,8 +831,8 @@ pub fn prefill_matvec_loop_topk(
             .queue
             .write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(rest));
         // Each non-last step allocates a fixed number of uniform slots
-        // (one for embed + 14 per transformer layer; no suffix). The 1 MiB
-        // pool fits ~8 steps at n_layer=36, so for any prefill longer than
+        // (one for embed + 8 per transformer layer; no suffix). The 1 MiB
+        // pool fits ~14 steps at n_layer=36, so for any prefill longer than
         // that we split the work into multiple submits — KV-cache writes from
         // a previous submit are visible to the next one's attention reads.
         let slots_per_step = encode_step_matvec_slots_no_suffix(&model.cfg);
@@ -1661,7 +1661,7 @@ pub mod bench_internals {
             1,
             cfg.n_embd,
             1,
-            lt0.attn_norm_off,
+            ot.output_norm_off,
         )];
         for (label, ng, gs, calls, norm_off) in &rms_shapes {
             let (label, ng, gs, calls, norm_off) = (label.clone(), *ng, *gs, *calls, *norm_off);

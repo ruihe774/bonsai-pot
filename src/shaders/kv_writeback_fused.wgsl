@@ -23,7 +23,6 @@ struct Params {
   kv_dim: u32,               // = n_kv_head * head_dim
   nb_per_row: u32,           // = kv_dim / 32
   eps: f32,
-  _p0: u32, _p1: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;

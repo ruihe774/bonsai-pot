@@ -24,9 +24,6 @@ struct Params {
   output_offset: u32,
   accumulate: u32,
   dispatch_x_dim: u32,
-  _p0: u32,
-  _p1: u32,
-  _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;

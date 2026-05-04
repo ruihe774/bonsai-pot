@@ -24,16 +24,16 @@ use crate::decode;
 use crate::error::{PotError, Result};
 
 #[cfg(feature = "nightly")]
-pub type F16 = f16;
+type F16 = f16;
 #[cfg(not(feature = "nightly"))]
-pub(crate) type F16 = half::f16;
+type F16 = half::f16;
 
 #[inline]
 #[allow(
     clippy::missing_const_for_fn,
     reason = "half::f16::from_f32 is not const"
 )]
-pub fn f16_from_f32(v: f32) -> F16 {
+fn f16_from_f32(v: f32) -> F16 {
     #[cfg(feature = "nightly")]
     {
         v as f16

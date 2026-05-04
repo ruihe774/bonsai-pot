@@ -19,7 +19,6 @@ struct Params {
   n_head: u32,
   out_offset: u32,
   n_chunks_active: u32,
-  _p0: u32, _p1: u32, _p2: u32, _p3: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -101,6 +100,16 @@ fn main(
     l_local = l_local + l_c * w;
   }
   let l_global = wg_sum(l_local, sg_id, sg_inv_id, num_subgroups);
+
+  // weights_sh is written by Phase B (each thread writes the chunks it owns,
+  // strided by WG) and read by every thread in Phase C. When num_subgroups > 1
+  // the workgroupBarriers inside wg_sum sync these writes. On the
+  // num_subgroups == 1 fast path (RDNA wave64 with WG=64) wg_sum returns
+  // directly after a subgroupAdd, which is not a workgroup-scope memory
+  // barrier — strict WGSL would require one here. We skip it: the only
+  // hardware that takes this fast path is RDNA wave64, which executes the
+  // entire workgroup in lockstep so the writes are visible to every reader
+  // by the time Phase C starts. Spec-noncompliant but correct in practice.
 
   // Phase C: per-thread o accumulation using precomputed weights. The per-d
   // loops below assume head_dim == ELEMS_PER_THREAD * WG (true for the Bonsai

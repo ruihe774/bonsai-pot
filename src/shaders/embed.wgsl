@@ -14,7 +14,6 @@ struct Params {
   qs_offset: u32,
   output_offset: u32, // f16 elements
   sample_offset: u32, // base index into sample[] for the input tokens
-  _p0: u32, _p1: u32, _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;

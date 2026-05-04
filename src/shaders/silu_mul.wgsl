@@ -11,7 +11,6 @@ struct Params {
   up_offset: u32,
   out_offset: u32,
   dispatch_x_count: u32,    // = dispatch_x_dim * 64 (workgroup_size)
-  _p1: u32, _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
