@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "nightly", feature(f16))]
 //! Bonsai (`Qwen3` architecture) `Q1_0` inference on wgpu compute shaders.
 //!
 //! See the README for a one-page tour of the engine. This crate exposes the

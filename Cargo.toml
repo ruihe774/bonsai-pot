@@ -19,6 +19,9 @@ default = []
 # the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
 # stable public library API.
 bench-internals = ["dep:pollster", "dep:env_logger"]
+# Use the built-in primitive `f16` type (requires a nightly toolchain with
+# `#![feature(f16)]`) instead of the `half` crate.
+nightly = []
 
 [dependencies]
 # Library deps.
@@ -54,6 +57,7 @@ expect_used = "warn"
 float_cmp = "allow"
 many_single_char_names = "allow"
 panic = "warn"
+similar_names = "allow"
 too_many_arguments = "allow"
 too_many_lines = "allow"
 unused_trait_names = "warn"

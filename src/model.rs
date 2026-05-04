@@ -23,6 +23,24 @@ use wgpu::util::DeviceExt as _;
 use crate::decode;
 use crate::error::{PotError, Result};
 
+#[cfg(feature = "nightly")]
+pub type F16 = f16;
+#[cfg(not(feature = "nightly"))]
+pub(crate) type F16 = half::f16;
+
+#[inline]
+#[allow(clippy::missing_const_for_fn, reason = "half::f16::from_f32 is not const")]
+pub fn f16_from_f32(v: f32) -> F16 {
+    #[cfg(feature = "nightly")]
+    {
+        v as f16
+    }
+    #[cfg(not(feature = "nightly"))]
+    {
+        half::f16::from_f32(v)
+    }
+}
+
 // ----- config & manifest ----------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -1192,11 +1210,23 @@ impl Model {
 
         // ---- build RoPE table (f32 host-side, then downcast to f16) --------
         let rope_table_f32 = build_rope_table(&cfg, opts.max_seq);
-        let rope_table_f16: Vec<half::f16> = rope_table_f32
-            .iter()
-            .map(|&v| half::f16::from_f32(v))
-            .collect();
-        let rope_buf = make_storage("rope_table", cast_slice(&rope_table_f16));
+        let rope_table_f16: Vec<F16> = rope_table_f32.iter().map(|&v| f16_from_f32(v)).collect();
+        let rope_bytes: &[u8] = {
+            #[cfg(feature = "nightly")]
+            // SAFETY: F16 is primitive f16, 2 bytes, no padding, IEEE 754 binary16.
+            unsafe {
+                use std::slice::from_raw_parts;
+                from_raw_parts(
+                    rope_table_f16.as_ptr().cast::<u8>(),
+                    rope_table_f16.len() * size_of::<F16>(),
+                )
+            }
+            #[cfg(not(feature = "nightly"))]
+            {
+                cast_slice(&rope_table_f16)
+            }
+        };
+        let rope_buf = make_storage("rope_table", rope_bytes);
 
         // ---- KV cache (Q8_0), activations, scratch -------------------------
         // Layout per buffer (kv_k / kv_v):
@@ -1249,7 +1279,7 @@ impl Model {
         });
 
         let act_layout = ActLayout::build(&cfg, M_MAX);
-        let act_size = (u64::from(act_layout.total_elems) * size_of::<half::f16>() as u64 + 3) & !3;
+        let act_size = (u64::from(act_layout.total_elems) * size_of::<F16>() as u64 + 3) & !3;
         let act_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("act"),
             size: act_size,
@@ -1501,7 +1531,7 @@ impl Model {
                 let qn = tensor(&cfg, &format!("blk.{il}.attn_q_norm.weight"));
                 let kn = tensor(&cfg, &format!("blk.{il}.attn_k_norm.weight"));
                 let fn_ = tensor(&cfg, &format!("blk.{il}.ffn_norm.weight"));
-                let act_elem_bytes = size_of::<half::f16>() as u64;
+                let act_elem_bytes = size_of::<F16>() as u64;
                 LayerTensors {
                     wq: (q.d_offset as u32, q.qs_offset as u32),
                     wk: (k.d_offset as u32, k.qs_offset as u32),
@@ -1526,7 +1556,7 @@ impl Model {
             } else {
                 tensor(&cfg, "output.weight")
             };
-            let act_elem_bytes = size_of::<half::f16>() as u64;
+            let act_elem_bytes = size_of::<F16>() as u64;
             OutputTensors {
                 token_embd_d: te.d_offset as u32,
                 token_embd_qs: te.qs_offset as u32,
