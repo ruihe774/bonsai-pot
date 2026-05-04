@@ -1219,60 +1219,6 @@ fn rms_norm(
     cp.dispatch_workgroups(n_groups, 1, 1);
 }
 
-#[cfg(feature = "bench-internals")]
-fn matvec_q1_0_fused_normed_pass(
-    model: &Model,
-    cfg: &Config,
-    se: &mut StepEncoder,
-    k: u32,
-    input_offset: u32,
-    w_norm_off: u32,
-    weights: WeightSet,
-    ranges: &[(u32, u32, u32, u32)],
-) {
-    const ROWS_PER_WG: u32 = 8;
-    debug_assert!(ranges.len() == 2 || ranges.len() == 3);
-    for (_, _, n, _) in ranges {
-        debug_assert!(n % 8 == 0);
-    }
-    let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
-    let (d0, qs0, n0, o0) = r(0);
-    let (d1, qs1, n1, o1) = r(1);
-    let (d2, qs2, n2, o2) = r(2);
-    let n_total = n0 + n1 + n2;
-    let n_wg = n_total.div_ceil(ROWS_PER_WG);
-    let dispatch_x = n_wg.min(65535);
-    let dispatch_y = n_wg.div_ceil(dispatch_x);
-    let p = MatvecFusedNormedParams {
-        k,
-        n_total,
-        input_offset,
-        dispatch_x_dim: dispatch_x,
-        w_norm_off,
-        eps: cfg.rms_eps,
-        d_offset_0: d0,
-        qs_offset_0: qs0,
-        n_0: n0,
-        output_offset_0: o0,
-        d_offset_1: d1,
-        qs_offset_1: qs1,
-        n_1: n1,
-        output_offset_1: o1,
-        d_offset_2: d2,
-        qs_offset_2: qs2,
-        n_2: n2,
-        output_offset_2: o2,
-    };
-    let off = se.alloc_uniform(&p);
-    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("matvec_fused_normed"),
-        timestamp_writes: None,
-    });
-    cp.set_pipeline(&model.pipes.matvec_fused_normed);
-    cp.set_bind_group(0, matvec_fused_normed_bg(model, weights), &[off]);
-    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-}
-
 fn matvec_q1_0(
     model: &Model,
     _cfg: &Config,
@@ -1306,46 +1252,6 @@ fn matvec_q1_0(
         timestamp_writes: None,
     });
     cp.set_pipeline(&model.pipes.matvec);
-    cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
-    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-}
-
-fn matvec_q1_0_silu(
-    model: &Model,
-    _cfg: &Config,
-    se: &mut StepEncoder,
-    k: u32,
-    n: u32,
-    weights: WeightSet,
-    w_d: u32,
-    w_qs: u32,
-    gate_off: u32,
-    up_off: u32,
-    out_off: u32,
-    accumulate: bool,
-) {
-    const ROWS_PER_WG: u32 = 8;
-    let n_wg = n.div_ceil(ROWS_PER_WG);
-    let dispatch_x = n_wg.min(65535);
-    let dispatch_y = n_wg.div_ceil(dispatch_x);
-    let p = MatvecSiluParams {
-        k,
-        n,
-        d_offset: w_d,
-        qs_offset: w_qs,
-        gate_offset: gate_off,
-        up_offset: up_off,
-        output_offset: out_off,
-        accumulate: u32::from(accumulate),
-        dispatch_x_dim: dispatch_x,
-        ..Default::default()
-    };
-    let off = se.alloc_uniform(&p);
-    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("matvec_silu"),
-        timestamp_writes: None,
-    });
-    cp.set_pipeline(&model.pipes.matvec_silu);
     cp.set_bind_group(0, matvec_bg(model, weights), &[off]);
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
@@ -1537,9 +1443,10 @@ pub mod bench_internals {
     use wgpu::PollType;
 
     use super::{
-        AttnParams, Config, EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
-        kv_layer_offsets, kv_writeback_fused, matvec_q1_0, matvec_q1_0_fused_normed_pass,
-        matvec_q1_0_silu, prefill_matmul_topk, q_norm_rope_fused, rms_norm, step_matvec_no_sample,
+        ATTN_CHUNK_SIZE, AttnMergeParams, AttnSplitParams, Config, EmbedParams,
+        MatvecFusedNormedParams, MatvecSiluParams, Model, Result, StepEncoder, TopKParams,
+        WeightSet, kv_layer_offsets, kv_writeback_fused, matvec_bg, matvec_fused_normed_bg,
+        matvec_q1_0, prefill_matmul_topk, q_norm_rope_fused, rms_norm, step_matvec_no_sample,
         step_matvec_topk,
     };
     use crate::error::PotError;
@@ -1613,6 +1520,55 @@ pub mod bench_internals {
         var.sqrt()
     }
 
+    fn bench_fused_normed(
+        model: &Model,
+        cfg: &Config,
+        se: &mut StepEncoder,
+        k: u32,
+        input_offset: u32,
+        w_norm_off: u32,
+        weights: WeightSet,
+        ranges: &[(u32, u32, u32, u32)],
+    ) {
+        const ROWS_PER_WG: u32 = 8;
+        let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
+        let (d0, qs0, n0, o0) = r(0);
+        let (d1, qs1, n1, o1) = r(1);
+        let (d2, qs2, n2, o2) = r(2);
+        let n_total = n0 + n1 + n2;
+        let n_wg = n_total.div_ceil(ROWS_PER_WG);
+        let dispatch_x = n_wg.min(65535);
+        let dispatch_y = n_wg.div_ceil(dispatch_x);
+        let p = MatvecFusedNormedParams {
+            k,
+            n_total,
+            input_offset,
+            dispatch_x_dim: dispatch_x,
+            w_norm_off,
+            eps: cfg.rms_eps,
+            d_offset_0: d0,
+            qs_offset_0: qs0,
+            n_0: n0,
+            output_offset_0: o0,
+            d_offset_1: d1,
+            qs_offset_1: qs1,
+            n_1: n1,
+            output_offset_1: o1,
+            d_offset_2: d2,
+            qs_offset_2: qs2,
+            n_2: n2,
+            output_offset_2: o2,
+        };
+        let off = se.alloc_uniform(&p);
+        let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("matvec_fused_normed"),
+            timestamp_writes: None,
+        });
+        cp.set_pipeline(&model.pipes.matvec_fused_normed);
+        cp.set_bind_group(0, matvec_fused_normed_bg(model, weights), &[off]);
+        cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
     pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
         type DispatchFn<'a> = Box<dyn Fn(&Model, &Config, &mut StepEncoder) + 'a>;
 
@@ -1683,7 +1639,12 @@ pub mod bench_internals {
             n_layer,
             Box::new(move |model, cfg, se| {
                 let lt = &model.layer_tensors[0];
-                matvec_q1_0_fused_normed_pass(
+                let ranges = [
+                    (lt.wq.0, lt.wq.1, cfg.q_dim, model.act_layout.q),
+                    (lt.wk.0, lt.wk.1, cfg.kv_dim, model.act_layout.k_cur),
+                    (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
+                ];
+                bench_fused_normed(
                     model,
                     cfg,
                     se,
@@ -1691,11 +1652,7 @@ pub mod bench_internals {
                     model.act_layout.x,
                     lt.attn_norm_off,
                     WeightSet::Attn,
-                    &[
-                        (lt.wq.0, lt.wq.1, cfg.q_dim, model.act_layout.q),
-                        (lt.wk.0, lt.wk.1, cfg.kv_dim, model.act_layout.k_cur),
-                        (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
-                    ],
+                    &ranges,
                 );
             }),
         ));
@@ -1704,7 +1661,12 @@ pub mod bench_internals {
             n_layer,
             Box::new(move |model, cfg, se| {
                 let lt = &model.layer_tensors[0];
-                matvec_q1_0_fused_normed_pass(
+                let ranges = [
+                    (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
+                    (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
+                    (0, 0, 0, 0),
+                ];
+                bench_fused_normed(
                     model,
                     cfg,
                     se,
@@ -1712,10 +1674,7 @@ pub mod bench_internals {
                     model.act_layout.x,
                     lt.ffn_norm_off,
                     WeightSet::FfnGU,
-                    &[
-                        (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
-                        (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
-                    ],
+                    &ranges,
                 );
             }),
         ));
@@ -1757,53 +1716,74 @@ pub mod bench_internals {
             format!("matvec Wdown_silu K={} N={}", cfg.n_ff, cfg.n_embd),
             n_layer,
             Box::new(move |model, cfg, se| {
+                const ROWS_PER_WG: u32 = 8;
                 let lt = &model.layer_tensors[0];
-                matvec_q1_0_silu(
-                    model,
-                    cfg,
-                    se,
-                    cfg.n_ff,
-                    cfg.n_embd,
-                    WeightSet::FfnD,
-                    lt.wd.0,
-                    lt.wd.1,
-                    model.act_layout.gate,
-                    model.act_layout.up,
-                    model.act_layout.x,
-                    true,
-                );
+                let (k, n) = (cfg.n_ff, cfg.n_embd);
+                let n_wg = n.div_ceil(ROWS_PER_WG);
+                let dispatch_x = n_wg.min(65535);
+                let dispatch_y = n_wg.div_ceil(dispatch_x);
+                let p = MatvecSiluParams {
+                    k,
+                    n,
+                    d_offset: lt.wd.0,
+                    qs_offset: lt.wd.1,
+                    gate_offset: model.act_layout.gate,
+                    up_offset: model.act_layout.up,
+                    output_offset: model.act_layout.x,
+                    accumulate: 1,
+                    dispatch_x_dim: dispatch_x,
+                    ..Default::default()
+                };
+                let off = se.alloc_uniform(&p);
+                let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("matvec_silu"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&model.pipes.matvec_silu);
+                cp.set_bind_group(0, matvec_bg(model, WeightSet::FfnD), &[off]);
+                cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }),
         ));
 
         entries.push((
-            format!("attention pos={attn_pos}"),
+            format!("attn_split+merge pos={attn_pos}"),
             n_layer,
             Box::new(move |model, cfg, se| {
-                // Layer 0: d-section starts at byte 0; qs-section starts at d_total.
                 let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, 0);
-                let p = AttnParams {
+                let cur_pos = attn_pos + 1;
+                let n_chunks_active = cur_pos.div_ceil(ATTN_CHUNK_SIZE);
+                let ps = AttnSplitParams {
                     head_dim: cfg.head_dim,
                     n_head: cfg.n_head,
                     n_kv_head: cfg.n_kv_head,
-                    pos: attn_pos,
+                    pos: cur_pos,
                     kv_stride: cfg.kv_dim,
                     q_offset: model.act_layout.q,
                     k_d_word_offset: d_word,
                     k_qs_byte_offset: qs_byte,
                     v_d_word_offset: d_word,
                     v_qs_byte_offset: qs_byte,
-                    out_offset: model.act_layout.attn_out,
+                    n_chunks_active,
                     scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-                    m_tokens: 1,
-                    is_prefill: 0,
                 };
-                let off = se.alloc_uniform(&p);
+                let pm = AttnMergeParams {
+                    head_dim: cfg.head_dim,
+                    n_head: cfg.n_head,
+                    out_offset: model.act_layout.attn_out,
+                    n_chunks_active,
+                    ..Default::default()
+                };
+                let ps_off = se.alloc_uniform(&ps);
+                let pm_off = se.alloc_uniform(&pm);
                 let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("attn"),
+                    label: Some("attn_split+merge"),
                     timestamp_writes: None,
                 });
-                cp.set_pipeline(&model.pipes.attention);
-                cp.set_bind_group(0, &model.cached.attn, &[off]);
+                cp.set_pipeline(&model.pipes.attention_split);
+                cp.set_bind_group(0, &model.cached.attn_split, &[ps_off]);
+                cp.dispatch_workgroups(cfg.n_kv_head, n_chunks_active, 1);
+                cp.set_pipeline(&model.pipes.attention_merge);
+                cp.set_bind_group(0, &model.cached.attn_merge, &[pm_off]);
                 cp.dispatch_workgroups(cfg.n_head, 1, 1);
             }),
         ));
