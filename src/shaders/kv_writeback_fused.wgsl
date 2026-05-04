@@ -40,13 +40,15 @@ const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 128u;
 const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
-// Two scratch arrays: f32 for normed/RoPE'd values + amax tree, u32 for byte
-// packing. Reuse k_sh / v_sh across phases (rms read -> rope -> amax).
+// Only shmem live across barriers. k_sh holds normed-and-weighted K so RoPE
+// can fetch each thread's pair partner across the head-half boundary
+// (partners always cross a subgroup boundary at WG=128). After RoPE the
+// rotated value lives in a register; k_sh is dead and not reused.
 var<workgroup> k_sh: array<f32, 128>;
-var<workgroup> v_sh: array<f32, 128>;
-var<workgroup> qk_sh: array<u32, 128>;
-var<workgroup> qv_sh: array<u32, 128>;
-var<workgroup> sg_partial: array<f32, SG_PARTIAL_MAX>;
+// Used by the RMS cross-subgroup merge (slot 0..num_subgroups; only .x), and
+// when SUBGROUP_MIN_SIZE < 32 also by the amax cross-cluster merge that
+// finishes the per-32 reduction (writes both .x=K, .y=V).
+var<workgroup> sg_partial: array<vec2<f32>, SG_PARTIAL_MAX>;
 
 @compute @workgroup_size(WG)
 fn main(
@@ -70,16 +72,16 @@ fn main(
   if (num_subgroups == 1u) {
     total = sg_sum;
   } else {
-    if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_sum; }
+    if (sg_inv_id == 0u) { sg_partial[sg_id].x = sg_sum; }
     workgroupBarrier();
     if (sg_id == 0u) {
-      var c: f32;
-      if (sg_inv_id < num_subgroups) { c = sg_partial[sg_inv_id]; }
+      var c: f32 = 0.0;
+      if (sg_inv_id < num_subgroups) { c = sg_partial[sg_inv_id].x; }
       let f = subgroupAdd(c);
-      if (sg_inv_id == 0u) { sg_partial[0] = f; }
+      if (sg_inv_id == 0u) { sg_partial[0].x = f; }
     }
     workgroupBarrier();
-    total = sg_partial[0];
+    total = sg_partial[0].x;
   }
   let inv_h = inverseSqrt(total / f32(HEAD_DIM) + p.eps);
 
@@ -87,82 +89,99 @@ fn main(
   k_sh[tid] = k_raw * inv_h * f32(w_norms[p.w_k_norm_off + tid]);
   workgroupBarrier();
 
-  // ---- NEOX RoPE: rotate (j, j + half_dim) pairs --------------------------
+  // ---- NEOX RoPE: each lane computes its own output, kept in a register ---
+  // Lower-half (tid in [0, 64)) emits the cosθ·x0 - sinθ·x1 component; the
+  // upper-half emits sinθ·x0 + cosθ·x1 with the same (c, s) for j = tid - 64.
+  // No second shmem round-trip / barrier; k_sh is dead from here on.
   let pos_abs = p.pos_base + tok;
   let cs_base = p.rope_offset + pos_abs * HEAD_DIM;
+  var k_post: f32;
   if (tid < HALF_DIM) {
     let c = f32(rope_cs[cs_base + tid * 2u]);
     let s = f32(rope_cs[cs_base + tid * 2u + 1u]);
-    let x0 = k_sh[tid];
-    let x1 = k_sh[tid + HALF_DIM];
-    k_sh[tid]            = x0 * c - x1 * s;
-    k_sh[tid + HALF_DIM] = x0 * s + x1 * c;
+    k_post = k_sh[tid] * c - k_sh[tid + HALF_DIM] * s;
+  } else {
+    let j = tid - HALF_DIM;
+    let c = f32(rope_cs[cs_base + j * 2u]);
+    let s = f32(rope_cs[cs_base + j * 2u + 1u]);
+    k_post = k_sh[j] * s + k_sh[tid] * c;
   }
-  workgroupBarrier();
-  let k_post = k_sh[tid];
 
-  // ---- per-32-block amax for K and V (shmem tree, 5 levels) ---------------
-  // Reuse k_sh / v_sh: now holds abs(value) for amax reduction.
-  k_sh[tid] = abs(k_post);
-  v_sh[tid] = abs(v_raw);
-  workgroupBarrier();
+  // ---- Per-32-block amax for K and V via subgroup butterfly ---------------
+  // Replaces the 5-level shmem tree. Masks 1/2/4 are always safe
+  // (SUBGROUP_MIN_SIZE >= 8 is enforced at load time); 8/16 are gated on the
+  // baked SG_MIN_SIZE so the dead branches constant-fold away. After the
+  // butterfly each lane in a SG_MIN_SIZE-cluster holds that cluster's amax;
+  // when SG_MIN_SIZE < 32 a single shmem merge stitches per-32 results.
+  var ak = abs(k_post);
+  var av = abs(v_raw);
 
-  let lane32 = tid & 31u;
-  if (lane32 < 16u) {
-    k_sh[tid] = max(k_sh[tid], k_sh[tid + 16u]);
-    v_sh[tid] = max(v_sh[tid], v_sh[tid + 16u]);
+  ak = max(ak, subgroupShuffleXor(ak, 1u));
+  av = max(av, subgroupShuffleXor(av, 1u));
+  ak = max(ak, subgroupShuffleXor(ak, 2u));
+  av = max(av, subgroupShuffleXor(av, 2u));
+  ak = max(ak, subgroupShuffleXor(ak, 4u));
+  av = max(av, subgroupShuffleXor(av, 4u));
+  if (SUBGROUP_MIN_SIZE >= 16u) {
+    ak = max(ak, subgroupShuffleXor(ak, 8u));
+    av = max(av, subgroupShuffleXor(av, 8u));
   }
-  workgroupBarrier();
-  if (lane32 < 8u) {
-    k_sh[tid] = max(k_sh[tid], k_sh[tid + 8u]);
-    v_sh[tid] = max(v_sh[tid], v_sh[tid + 8u]);
+  if (SUBGROUP_MIN_SIZE >= 32u) {
+    ak = max(ak, subgroupShuffleXor(ak, 16u));
+    av = max(av, subgroupShuffleXor(av, 16u));
   }
-  workgroupBarrier();
-  if (lane32 < 4u) {
-    k_sh[tid] = max(k_sh[tid], k_sh[tid + 4u]);
-    v_sh[tid] = max(v_sh[tid], v_sh[tid + 4u]);
+  if (SUBGROUP_MIN_SIZE < 32u) {
+    // Stitch the in-subgroup partials into per-32 blocks. Each cluster of
+    // SG_MIN_SIZE lanes contributes one entry; a 32-block spans
+    // 32/SG_MIN_SIZE entries (2 for SG=16, 4 for SG=8).
+    let sg_lane = tid % SUBGROUP_MIN_SIZE;
+    let cluster_id = tid / SUBGROUP_MIN_SIZE;
+    if (sg_lane == 0u) {
+      sg_partial[cluster_id] = vec2<f32>(ak, av);
+    }
+    workgroupBarrier();
+    let group_id = tid >> 5u;
+    let g_base = group_id * (32u / SUBGROUP_MIN_SIZE);
+    var mk: f32 = 0.0;
+    var mv: f32 = 0.0;
+    for (var i: u32 = 0u; i < 32u / SUBGROUP_MIN_SIZE; i = i + 1u) {
+      let m = sg_partial[g_base + i];
+      mk = max(mk, m.x);
+      mv = max(mv, m.y);
+    }
+    ak = mk;
+    av = mv;
   }
-  workgroupBarrier();
-  if (lane32 < 2u) {
-    k_sh[tid] = max(k_sh[tid], k_sh[tid + 2u]);
-    v_sh[tid] = max(v_sh[tid], v_sh[tid + 2u]);
-  }
-  workgroupBarrier();
-  if (lane32 < 1u) {
-    k_sh[tid] = max(k_sh[tid], k_sh[tid + 1u]);
-    v_sh[tid] = max(v_sh[tid], v_sh[tid + 1u]);
-  }
-  workgroupBarrier();
 
   let block_in_head = tid >> 5u;          // 0..3
-  let block_base    = block_in_head * 32u;
-  let amax_k = k_sh[block_base];
-  let amax_v = v_sh[block_base];
-  let dk = amax_k / 127.0;
-  let dv = amax_v / 127.0;
+  let dk = ak / 127.0;
+  let dv = av / 127.0;
   let inv_dk = select(0.0, 1.0 / dk, dk > 0.0);
   let inv_dv = select(0.0, 1.0 / dv, dv > 0.0);
 
   let qk = u32(i32(clamp(round(k_post * inv_dk), -127.0, 127.0))) & 0xFFu;
   let qv = u32(i32(clamp(round(v_raw  * inv_dv), -127.0, 127.0))) & 0xFFu;
 
-  // ---- pack 4 bytes into one u32 via shmem, write to cache ----------------
-  qk_sh[tid] = qk;
-  qv_sh[tid] = qv;
-  workgroupBarrier();
+  // ---- Pack 4 bytes into one u32 via subgroup shuffle, write to cache -----
+  // 4-lane clusters (tid % 4 == 0 lanes are the leaders) live entirely
+  // within one subgroup since SUBGROUP_MIN_SIZE >= 8, so subgroupShuffle can
+  // gather the partner bytes without going through shmem. Shuffles are
+  // unconditional (uniform CF requirement); only the leader writes.
+  let cluster_base = sg_inv_id & ~3u;
+  let qk0 = subgroupShuffle(qk, cluster_base);
+  let qk1 = subgroupShuffle(qk, cluster_base + 1u);
+  let qk2 = subgroupShuffle(qk, cluster_base + 2u);
+  let qk3 = subgroupShuffle(qk, cluster_base + 3u);
+  let qv0 = subgroupShuffle(qv, cluster_base);
+  let qv1 = subgroupShuffle(qv, cluster_base + 1u);
+  let qv2 = subgroupShuffle(qv, cluster_base + 2u);
+  let qv3 = subgroupShuffle(qv, cluster_base + 3u);
 
   // qs base byte for THIS head's elements within the layer's qs-section:
   //   layer_base + pos_abs*kv_dim + head*HEAD_DIM (bytes; one byte per elem).
-  // Lanes (tid % 4 == 0) emit one packed u32 each (32 emitters per head).
   if ((tid & 3u) == 0u) {
-    let pk = qk_sh[tid + 0u]
-           | (qk_sh[tid + 1u] <<  8u)
-           | (qk_sh[tid + 2u] << 16u)
-           | (qk_sh[tid + 3u] << 24u);
-    let pv = qv_sh[tid + 0u]
-           | (qv_sh[tid + 1u] <<  8u)
-           | (qv_sh[tid + 2u] << 16u)
-           | (qv_sh[tid + 3u] << 24u);
+    let pk = qk0 | (qk1 <<  8u) | (qk2 << 16u) | (qk3 << 24u);
+    let pv = qv0 | (qv1 <<  8u) | (qv2 << 16u) | (qv3 << 24u);
     let qs_byte_in_layer =
       p.dst_qs_byte_offset + pos_abs * p.kv_dim + head * HEAD_DIM + tid;
     kv_k[qs_byte_in_layer >> 2u] = pk;
@@ -170,7 +189,7 @@ fn main(
   }
 
   // d (FP32 scale) — one writer per block.
-  if (lane32 == 0u) {
+  if ((tid & 31u) == 0u) {
     let block_global =
       pos_abs * p.nb_per_row + head * NB_PER_HEAD + block_in_head;
     kv_k[p.dst_d_word_offset + block_global] = bitcast<u32>(dk);
