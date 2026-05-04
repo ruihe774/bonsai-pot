@@ -463,6 +463,129 @@ fn dispatch_q_norm_rope_fused(
     pass.dispatch_workgroups(cfg.n_head, m_tokens, 1);
 }
 
+fn dispatch_quantize_act(
+    model: &Model,
+    uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    k: u32,
+    m: u32,
+    in_off_f32: u32,
+) -> (u32, u32) {
+    let nb_q8 = k / 32;
+    let d_off = 0u32;
+    let qs_off = m * nb_q8 * 4;
+    let total = m * nb_q8;
+    let dispatch_x = total.min(65535);
+    let dispatch_y = total.div_ceil(dispatch_x);
+    let p = QuantParams {
+        k,
+        m,
+        input_offset: in_off_f32,
+        d_offset: d_off,
+        qs_offset: qs_off,
+        dispatch_x_dim: dispatch_x,
+    };
+    let off = uniforms.alloc(&p);
+    pass.set_pipeline(&model.pipes.quantize);
+    pass.set_bind_group(0, &model.cached.quantize, &[off]);
+    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    (d_off, qs_off)
+}
+
+fn dispatch_matmul_q1_0(
+    model: &Model,
+    uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    k: u32,
+    n: u32,
+    m: u32,
+    weights: WeightSet,
+    w_d: u32,
+    w_qs: u32,
+    a_d: u32,
+    a_qs: u32,
+    out_off: u32,
+    accumulate: bool,
+) {
+    let p = MatmulParams {
+        k,
+        n,
+        m,
+        w_d_offset: w_d,
+        w_qs_offset: w_qs,
+        a_d_offset: a_d,
+        a_qs_offset: a_qs,
+        out_offset: out_off,
+        accumulate: u32::from(accumulate),
+    };
+    let off = uniforms.alloc(&p);
+    pass.set_pipeline(&model.pipes.matmul);
+    pass.set_bind_group(0, matmul_bg(model, weights), &[off]);
+    pass.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);
+}
+
+fn dispatch_silu_mul(
+    model: &Model,
+    uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    n: u32,
+    m: u32,
+    gate_off: u32,
+    up_off: u32,
+    out_off: u32,
+) {
+    let total = n * m;
+    let groups = total.div_ceil(64);
+    let dispatch_x = groups.min(65535);
+    let dispatch_y = groups.div_ceil(dispatch_x);
+    let p = SiluMulParams {
+        n,
+        m,
+        gate_offset: gate_off,
+        up_offset: up_off,
+        out_offset: out_off,
+        dispatch_x_count: dispatch_x * 64,
+    };
+    let off = uniforms.alloc(&p);
+    pass.set_pipeline(&model.pipes.silu_mul);
+    pass.set_bind_group(0, &model.cached.silu_mul, &[off]);
+    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+}
+
+fn dispatch_attention(
+    model: &Model,
+    cfg: &Config,
+    uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    layer_il: u32,
+    max_seq: u32,
+    pos: u32,
+    m_tokens: u32,
+    is_prefill: bool,
+) {
+    let (d_word, qs_byte) = kv_layer_offsets(cfg, max_seq, layer_il);
+    let p = AttnParams {
+        head_dim: cfg.head_dim,
+        n_head: cfg.n_head,
+        n_kv_head: cfg.n_kv_head,
+        pos,
+        kv_stride: cfg.kv_dim,
+        q_offset: model.act_layout.q,
+        k_d_word_offset: d_word,
+        k_qs_byte_offset: qs_byte,
+        v_d_word_offset: d_word,
+        v_qs_byte_offset: qs_byte,
+        out_offset: model.act_layout.attn_out,
+        scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+        m_tokens,
+        is_prefill: u32::from(is_prefill),
+    };
+    let off = uniforms.alloc(&p);
+    pass.set_pipeline(&model.pipes.attention);
+    pass.set_bind_group(0, &model.cached.attn, &[off]);
+    pass.dispatch_workgroups(cfg.n_head, m_tokens, 1);
+}
+
 // ---------- async readback helper -------------------------------------------
 
 /// Wait the `sample → readback` copy that was already encoded into the
@@ -578,7 +701,8 @@ pub fn encode_step_matvec(
         layer_post_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
     }
     if let Some((topk_out_u32_base, k)) = topk_out {
-        // output suffix (was inside the last layer's pass before)
+        // output suffix: rms_norm in-place on x, then LM head reads
+        // directly from x (saves one f16 vector round-trip vs. x_norm staging).
         dispatch_rms_norm(
             m,
             cfg,
@@ -587,7 +711,7 @@ pub fn encode_step_matvec(
             1,
             cfg.n_embd,
             m.act_layout.x,
-            m.act_layout.x_norm,
+            m.act_layout.x,
             ot.output_norm_off,
         );
         dispatch_matvec_q1_0(
@@ -599,7 +723,7 @@ pub fn encode_step_matvec(
             WeightSet::Embed,
             ot.lm_head_d,
             ot.lm_head_qs,
-            m.act_layout.x_norm,
+            m.act_layout.x,
             m.act_layout.logits,
             false,
         );
@@ -887,16 +1011,24 @@ pub fn prefill_matmul_topk(
     let k = k.clamp(1, TOPK_MAX);
 
     // ---- All phases (embed → per-layer transformer → final norm/LM-head/topk
-    //      → readback copy) into ONE command buffer / ONE submit. ------------
+    //      → readback copy) into ONE command buffer / ONE submit, with all
+    //      compute dispatches sharing ONE pass to amortize the
+    //      begin_compute_pass cost (~25us each on RADV).
     model
         .queue
         .write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(prompt));
     let mut se = StepEncoder::new(model);
+    let StepEncoder {
+        encoder, uniforms, ..
+    } = &mut se;
 
-    // Phase 1: embed all M tokens in a SINGLE dispatch (m, 1, 1). The shader
-    // reads its row from sample[sample_offset + wg.x] and writes to row wg.x
-    // of the output activation buffer.
     {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prefill_matmul"),
+            timestamp_writes: None,
+        });
+
+        // Phase 1: embed all M tokens (one dispatch).
         let p = EmbedParams {
             k: cfg.n_embd,
             d_offset: ot.token_embd_d,
@@ -904,64 +1036,51 @@ pub fn prefill_matmul_topk(
             output_offset: model.act_layout.x,
             sample_offset: 0,
         };
-        let off = se.uniforms.alloc(&p);
-        let mut pass = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("prefill_embed"),
-            timestamp_writes: None,
-        });
+        let off = uniforms.alloc(&p);
         pass.set_pipeline(&model.pipes.embed);
         pass.set_bind_group(0, &model.cached.embed, &[off]);
         pass.dispatch_workgroups(m, 1, 1);
-    }
 
-    // Phase 2: per-layer transformer. `layer_step_matmul` opens its own
-    // compute passes for each kernel; that's fine — the KV-cache copies it
-    // emits are transfer commands and are legal between compute passes inside
-    // the same command encoder.
-    for il in 0..cfg.n_layer {
-        layer_step_matmul(model, cfg, &mut se, il, m);
-    }
+        // Phase 2: per-layer transformer.
+        for il in 0..cfg.n_layer {
+            layer_step_matmul_in_pass(model, cfg, uniforms, &mut pass, il, m);
+        }
 
-    // Phase 3: final RMSNorm + LM head + topk_reduce on the LAST token.
-    rms_norm(
-        model,
-        cfg,
-        &mut se,
-        m,
-        cfg.n_embd,
-        model.act_layout.x,
-        model.act_layout.x_norm,
-        ot.output_norm_off,
-    );
-
-    let last_input_offset = model.act_layout.x_norm + (m - 1) * cfg.n_embd;
-    matvec_q1_0(
-        model,
-        &mut se,
-        cfg.n_embd,
-        cfg.n_vocab,
-        WeightSet::Embed,
-        ot.lm_head_d,
-        ot.lm_head_qs,
-        last_input_offset,
-        model.act_layout.logits,
-        false,
-    );
-    {
-        let p = TopKParams {
-            n: cfg.n_vocab,
-            in_offset: model.act_layout.logits,
-            out_offset: 0,
+        // Phase 3: output_norm (last token, in-place) + LM head + topk_reduce.
+        let last_x = model.act_layout.x + (m - 1) * cfg.n_embd;
+        dispatch_rms_norm(
+            model,
+            cfg,
+            uniforms,
+            &mut pass,
+            1,
+            cfg.n_embd,
+            last_x,
+            last_x,
+            ot.output_norm_off,
+        );
+        dispatch_matvec_q1_0(
+            model,
+            uniforms,
+            &mut pass,
+            cfg.n_embd,
+            cfg.n_vocab,
+            WeightSet::Embed,
+            ot.lm_head_d,
+            ot.lm_head_qs,
+            last_x,
+            model.act_layout.logits,
+            false,
+        );
+        dispatch_topk_reduce(
+            model,
+            uniforms,
+            &mut pass,
+            cfg.n_vocab,
             k,
-        };
-        let off = se.alloc_uniform(&p);
-        let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("topk_reduce"),
-            timestamp_writes: None,
-        });
-        cp.set_pipeline(&model.pipes.topk_reduce);
-        cp.set_bind_group(0, &model.cached.topk_reduce, &[off]);
-        cp.dispatch_workgroups(1, 1, 1);
+            model.act_layout.logits,
+            0,
+        );
     }
 
     // Phase 4: append readback copy so it ships with this same command buffer.
@@ -973,124 +1092,133 @@ pub fn prefill_matmul_topk(
     wait_topk_readback(model, k)
 }
 
-fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32, m: u32) {
+fn layer_step_matmul_in_pass(
+    model: &Model,
+    cfg: &Config,
+    uniforms: &mut UniformPool,
+    pass: &mut wgpu::ComputePass<'_>,
+    il: u32,
+    m: u32,
+) {
     let pos_base = 0u32;
     let lt = &model.layer_tensors[il as usize];
 
-    rms_norm(
+    // attn_norm + quantize + Q/K/V matmul.
+    dispatch_rms_norm(
         model,
         cfg,
-        se,
+        uniforms,
+        pass,
         m,
         cfg.n_embd,
         model.act_layout.x,
         model.act_layout.x_norm,
         lt.attn_norm_off,
     );
-
-    let (a_d_off, a_qs_off) = quantize_act(model, se, cfg.n_embd, m, model.act_layout.x_norm);
-
-    matmul_q1_0(
+    let (a_d, a_qs) = dispatch_quantize_act(
         model,
-        se,
+        uniforms,
+        pass,
+        cfg.n_embd,
+        m,
+        model.act_layout.x_norm,
+    );
+    dispatch_matmul_q1_0(
+        model,
+        uniforms,
+        pass,
         cfg.n_embd,
         cfg.q_dim,
         m,
         WeightSet::Attn,
         lt.wq.0,
         lt.wq.1,
-        a_d_off,
-        a_qs_off,
+        a_d,
+        a_qs,
         model.act_layout.q,
         false,
     );
-    matmul_q1_0(
+    dispatch_matmul_q1_0(
         model,
-        se,
+        uniforms,
+        pass,
         cfg.n_embd,
         cfg.kv_dim,
         m,
         WeightSet::Attn,
         lt.wk.0,
         lt.wk.1,
-        a_d_off,
-        a_qs_off,
+        a_d,
+        a_qs,
         model.act_layout.k_cur,
         false,
     );
-    matmul_q1_0(
+    dispatch_matmul_q1_0(
         model,
-        se,
+        uniforms,
+        pass,
         cfg.n_embd,
         cfg.kv_dim,
         m,
         WeightSet::Attn,
         lt.wv.0,
         lt.wv.1,
-        a_d_off,
-        a_qs_off,
+        a_d,
+        a_qs,
         model.act_layout.v_cur,
         false,
     );
 
-    // Fused: Q's rms_norm + *w_q_norm + NEOX-RoPE, written back into act.q.
-    q_norm_rope_fused(
+    // Q/K rms+rope (in-place) + KV writeback into kv_{k,v}.
+    dispatch_q_norm_rope_fused(
         model,
         cfg,
-        se,
+        uniforms,
+        pass,
         model.act_layout.q,
         lt.attn_q_norm_off,
         pos_base,
         m,
     );
-
-    // Fused: K (rms_norm + *w_k_norm + RoPE + Q8_0 quantize) and V (Q8_0
-    // quantize) → write both into kv_{k,v}. Replaces the previous
-    // rms_norm(K) + rope(K) + kv_writeback trio.
-    kv_writeback_fused(
+    dispatch_kv_writeback_fused(
         model,
         cfg,
-        se,
+        uniforms,
+        pass,
         model.act_layout.k_cur,
         model.act_layout.v_cur,
         lt.attn_k_norm_off,
         il,
-        /*pos_base=*/ 0,
+        pos_base,
         m,
     );
 
-    {
-        let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, il);
-        let p = AttnParams {
-            head_dim: cfg.head_dim,
-            n_head: cfg.n_head,
-            n_kv_head: cfg.n_kv_head,
-            pos: 0,
-            kv_stride: cfg.kv_dim,
-            q_offset: model.act_layout.q,
-            k_d_word_offset: d_word,
-            k_qs_byte_offset: qs_byte,
-            v_d_word_offset: d_word,
-            v_qs_byte_offset: qs_byte,
-            out_offset: model.act_layout.attn_out,
-            scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-            m_tokens: m,
-            is_prefill: 1,
-        };
-        let off = se.alloc_uniform(&p);
-        let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("attn"),
-            timestamp_writes: None,
-        });
-        cp.set_pipeline(&model.pipes.attention);
-        cp.set_bind_group(0, &model.cached.attn, &[off]);
-        cp.dispatch_workgroups(cfg.n_head, m, 1);
-    }
-
-    let (a_d2, a_qs2) = quantize_act(model, se, cfg.q_dim, m, model.act_layout.attn_out);
-    matmul_q1_0(
+    // Attention.
+    dispatch_attention(
         model,
-        se,
+        cfg,
+        uniforms,
+        pass,
+        il,
+        model.max_seq,
+        /*pos=*/ 0,
+        m,
+        /*is_prefill=*/ true,
+    );
+
+    // Wo (residual) + ffn_norm + gate/up + silu_mul + Wd (residual).
+    let (a_d2, a_qs2) = dispatch_quantize_act(
+        model,
+        uniforms,
+        pass,
+        cfg.q_dim,
+        m,
+        model.act_layout.attn_out,
+    );
+    dispatch_matmul_q1_0(
+        model,
+        uniforms,
+        pass,
         cfg.q_dim,
         cfg.n_embd,
         m,
@@ -1102,22 +1230,29 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         model.act_layout.x,
         true,
     );
-
-    rms_norm(
+    dispatch_rms_norm(
         model,
         cfg,
-        se,
+        uniforms,
+        pass,
         m,
         cfg.n_embd,
         model.act_layout.x,
         model.act_layout.x_norm,
         lt.ffn_norm_off,
     );
-
-    let (a_d3, a_qs3) = quantize_act(model, se, cfg.n_embd, m, model.act_layout.x_norm);
-    matmul_q1_0(
+    let (a_d3, a_qs3) = dispatch_quantize_act(
         model,
-        se,
+        uniforms,
+        pass,
+        cfg.n_embd,
+        m,
+        model.act_layout.x_norm,
+    );
+    dispatch_matmul_q1_0(
+        model,
+        uniforms,
+        pass,
         cfg.n_embd,
         cfg.n_ff,
         m,
@@ -1129,9 +1264,10 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         model.act_layout.gate,
         false,
     );
-    matmul_q1_0(
+    dispatch_matmul_q1_0(
         model,
-        se,
+        uniforms,
+        pass,
         cfg.n_embd,
         cfg.n_ff,
         m,
@@ -1143,21 +1279,22 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         model.act_layout.up,
         false,
     );
-
-    silu_mul(
+    dispatch_silu_mul(
         model,
-        se,
+        uniforms,
+        pass,
         cfg.n_ff,
         m,
         model.act_layout.gate,
         model.act_layout.up,
         model.act_layout.ffn_in,
     );
-
-    let (a_d4, a_qs4) = quantize_act(model, se, cfg.n_ff, m, model.act_layout.ffn_in);
-    matmul_q1_0(
+    let (a_d4, a_qs4) =
+        dispatch_quantize_act(model, uniforms, pass, cfg.n_ff, m, model.act_layout.ffn_in);
+    dispatch_matmul_q1_0(
         model,
-        se,
+        uniforms,
+        pass,
         cfg.n_ff,
         cfg.n_embd,
         m,
@@ -1237,38 +1374,6 @@ fn matvec_q1_0(
     cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
-fn quantize_act(
-    model: &Model,
-    se: &mut StepEncoder,
-    k: u32,
-    m: u32,
-    in_off_f32: u32,
-) -> (u32, u32) {
-    let nb_q8 = k / 32;
-    let d_off = 0u32;
-    let qs_off = m * nb_q8 * 4;
-    let total = m * nb_q8;
-    let dispatch_x = total.min(65535);
-    let dispatch_y = total.div_ceil(dispatch_x);
-    let p = QuantParams {
-        k,
-        m,
-        input_offset: in_off_f32,
-        d_offset: d_off,
-        qs_offset: qs_off,
-        dispatch_x_dim: dispatch_x,
-    };
-    let off = se.alloc_uniform(&p);
-    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("quantize"),
-        timestamp_writes: None,
-    });
-    cp.set_pipeline(&model.pipes.quantize);
-    cp.set_bind_group(0, &model.cached.quantize, &[off]);
-    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-    (d_off, qs_off)
-}
-
 fn kv_writeback_fused(
     model: &Model,
     cfg: &Config,
@@ -1329,72 +1434,6 @@ fn q_norm_rope_fused(
     cp.set_pipeline(&model.pipes.q_norm_rope_fused);
     cp.set_bind_group(0, &model.cached.q_norm_rope_fused, &[off]);
     cp.dispatch_workgroups(cfg.n_head, m_tokens, 1);
-}
-
-fn silu_mul(
-    model: &Model,
-    se: &mut StepEncoder,
-    n: u32,
-    m: u32,
-    gate_off: u32,
-    up_off: u32,
-    out_off: u32,
-) {
-    let total = n * m;
-    let groups = total.div_ceil(64);
-    let dispatch_x = groups.min(65535);
-    let dispatch_y = groups.div_ceil(dispatch_x);
-    let p = SiluMulParams {
-        n,
-        m,
-        gate_offset: gate_off,
-        up_offset: up_off,
-        out_offset: out_off,
-        dispatch_x_count: dispatch_x * 64,
-    };
-    let off = se.alloc_uniform(&p);
-    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("silu_mul"),
-        timestamp_writes: None,
-    });
-    cp.set_pipeline(&model.pipes.silu_mul);
-    cp.set_bind_group(0, &model.cached.silu_mul, &[off]);
-    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-}
-
-fn matmul_q1_0(
-    model: &Model,
-    se: &mut StepEncoder,
-    k: u32,
-    n: u32,
-    m: u32,
-    weights: WeightSet,
-    w_d: u32,
-    w_qs: u32,
-    a_d: u32,
-    a_qs: u32,
-    out_off: u32,
-    accumulate: bool,
-) {
-    let p = MatmulParams {
-        k,
-        n,
-        m,
-        w_d_offset: w_d,
-        w_qs_offset: w_qs,
-        a_d_offset: a_d,
-        a_qs_offset: a_qs,
-        out_offset: out_off,
-        accumulate: u32::from(accumulate),
-    };
-    let off = se.alloc_uniform(&p);
-    let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("matmul"),
-        timestamp_writes: None,
-    });
-    cp.set_pipeline(&model.pipes.matmul);
-    cp.set_bind_group(0, matmul_bg(model, weights), &[off]);
-    cp.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);
 }
 
 // =========================================================================
