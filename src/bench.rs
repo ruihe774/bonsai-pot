@@ -91,98 +91,120 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn microbench_tg(model: &Model, repeats: u32) -> Result<()> {
-    let cfg = &model.cfg;
-    eprintln!("--- microbench tg (repeats={repeats}) ---");
-
-    // warm up: one instrumented step
-    {
-        let tok: u32 = 1;
-        model
-            .queue
-            .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&tok));
-        let mut se = StepEncoder::new(model);
-        let mut marker = BenchMarker::new(model);
-        encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), 0, &mut marker);
-        se.copy_sample_to_readback(8);
-        model.queue.submit(Some(se.finish()));
-        wait_topk_readback(model, 1)?;
-        let _ = marker.resolve()?;
+/// Per-kernel breakdown of one tg step at sequence position `pos`.
+///
+/// `pos` controls the realism of the attention measurement: at `pos=0`,
+/// attention scans a single KV entry, which is unrepresentative. The KV cache
+/// is pre-filled with `pos` no-readback steps before measurement so attention
+/// sees `pos+1` cached tokens on each measured step.
+pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
+    if pos >= model.max_seq {
+        return Err(PotError::ContextOverflow {
+            pos,
+            n: 1,
+            max: model.max_seq,
+        });
     }
+    eprintln!("--- microbench tg (pos={pos}, repeats={repeats}) ---");
 
-    // Accumulate per-label duration in ns across repeats.
-    // HashMap<label, Vec<duration_ns_for_one_occurrence>>
-    // Each key appears n_layer times per step (for per-layer kernels) or 1× (global).
-    let mut accum: HashMap<&'static str, Vec<f32>> = HashMap::new();
-    let tok: u32 = 1;
-
-    for _ in 0..repeats {
-        model
-            .queue
-            .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&tok));
-        let mut se = StepEncoder::new(model);
-        let mut marker = BenchMarker::new(model);
-        encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), 0, &mut marker);
-        se.copy_sample_to_readback(8);
-        model.queue.submit(Some(se.finish()));
-        wait_topk_readback(model, 1)?;
-        let spans = marker.resolve()?;
-        for (label, ns) in spans {
-            accum.entry(label).or_default().push(ns);
+    // Pre-fill KV cache so attention scans `pos+1` cached tokens on each
+    // measured step. `step_matvec_no_sample` skips the topk readback, and we
+    // poll just once at the end.
+    if pos > 0 {
+        for p in 0..pos {
+            step_matvec_no_sample(model, 1, p);
+        }
+        if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+            model.check_device()?;
+            return Err(PotError::Poll(e));
         }
     }
 
-    // Compute per-call stats. Each label appears (repeats * calls_per_step) times in the Vec.
-    // Determine calls_per_step by counting unique occurrences in one step.
-    // Since each step produces n_layer occurrences of per-layer labels and 1 of globals,
-    // divide total count by repeats.
-    let mut rows: Vec<(&'static str, u32, f32)> = accum
+    // warm up: one instrumented step at the measurement pos
+    let _ = run_instrumented_step(model, pos)?;
+
+    // Per-label, per-repeat aggregate: sum of all occurrences in one step
+    // (i.e. n_layer for per-layer labels, 1 for globals). Storing per-step
+    // sums (not per-occurrence) lets us report variance across steps.
+    let mut per_step_label_ns: HashMap<&'static str, Vec<f32>> = HashMap::new();
+    let mut calls_per_step: HashMap<&'static str, u32> = HashMap::new();
+    let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
+
+    for _ in 0..repeats {
+        let spans = run_instrumented_step(model, pos)?;
+        let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
+        for (label, ns) in &spans {
+            let e = step_label_sum.entry(*label).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += ns;
+        }
+        step_totals_ns.push(spans.iter().map(|(_, ns)| ns).sum());
+        for (label, (calls, ns_sum)) in step_label_sum {
+            per_step_label_ns.entry(label).or_default().push(ns_sum);
+            calls_per_step.entry(label).or_insert(calls);
+        }
+    }
+
+    // Build rows: (label, calls/step, per-call us, per-step ms mean, per-step ms std).
+    let mut rows: Vec<(&'static str, u32, f32, f32, f32)> = per_step_label_ns
         .iter()
-        .map(|(label, ns_vec)| {
-            let calls_per_step = ns_vec.len() as u32 / repeats;
-            let per_call_us = ns_vec.iter().sum::<f32>() / ns_vec.len() as f32 / 1000.0;
-            (*label, calls_per_step, per_call_us)
+        .map(|(label, per_step_ns)| {
+            let calls = calls_per_step[label];
+            let (mean_ns, std_ns) = mean_std(per_step_ns);
+            let per_call_us = mean_ns / calls as f32 / 1000.0;
+            (*label, calls, per_call_us, mean_ns / 1e6, std_ns / 1e6)
         })
         .collect();
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
 
-    // Sort by total per-step us descending.
-    rows.sort_by(|a, b| {
-        let ma = a.1 as f32 * a.2;
-        let mb = b.1 as f32 * b.2;
-        mb.partial_cmp(&ma).unwrap_or(Ordering::Equal)
-    });
-
-    let total_per_step_ms: f32 = rows
-        .iter()
-        .map(|(_, calls, us)| *calls as f32 * us / 1000.0)
-        .sum();
+    let total_per_step_ms: f32 = rows.iter().map(|(_, _, _, ms, _)| ms).sum();
 
     println!();
     println!(
-        "| kernel                                        | calls/step | per-call us | per-step ms | %step |"
+        "| kernel                                        | calls/step | per-call us |   per-step ms ± std | %step |"
     );
     println!(
-        "|-----------------------------------------------|-----------:|------------:|------------:|------:|"
+        "|-----------------------------------------------|-----------:|------------:|--------------------:|------:|"
     );
-    for (label, calls, per_call_us) in &rows {
-        let per_step_ms = *calls as f32 * per_call_us / 1000.0;
+    for (label, calls, per_call_us, per_step_ms, per_step_std_ms) in &rows {
         let pct = 100.0 * per_step_ms / total_per_step_ms;
         println!(
-            "| {label:<45} | {calls:>10} | {per_call_us:>11.2} | {per_step_ms:>11.3} | {pct:>5.1} |"
+            "| {label:<45} | {calls:>10} | {per_call_us:>11.2} | {per_step_ms:>11.3} ± {per_step_std_ms:>5.3} | {pct:>5.1} |"
         );
     }
     println!(
-        "|-----------------------------------------------|-----------:|------------:|------------:|------:|"
+        "|-----------------------------------------------|-----------:|------------:|--------------------:|------:|"
     );
     println!(
-        "| TOTAL                                         |            |             | {total_per_step_ms:>11.3} |       |"
+        "| TOTAL (sum of means)                          |            |             | {total_per_step_ms:>19.3} |       |"
     );
+
+    let (step_mean_ns, step_std_ns) = mean_std(&step_totals_ns);
+    let step_min_ms = step_totals_ns.iter().copied().fold(f32::INFINITY, f32::min) / 1e6;
+    let step_max_ms = step_totals_ns.iter().copied().fold(0.0_f32, f32::max) / 1e6;
+    let step_mean_ms = step_mean_ns / 1e6;
+    let step_std_ms = step_std_ns / 1e6;
     println!();
     println!(
-        "gpu step time (sum of ts deltas): {total_per_step_ms:.3} ms  ({:.1} t/s)",
-        1000.0 / total_per_step_ms
+        "step time: {step_mean_ms:.3} ± {step_std_ms:.3} ms  (min {step_min_ms:.3}, max {step_max_ms:.3})  →  {:.1} t/s",
+        1000.0 / step_mean_ms
     );
     Ok(())
+}
+
+/// Run one instrumented matvec step at `pos`, returning per-span GPU durations.
+fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f32)>> {
+    let tok: u32 = 1;
+    model
+        .queue
+        .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&tok));
+    let mut se = StepEncoder::new(model);
+    let mut marker = BenchMarker::new(model);
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut marker);
+    se.copy_sample_to_readback(8);
+    model.queue.submit(Some(se.finish()));
+    wait_topk_readback(model, 1)?;
+    marker.resolve()
 }
 
 fn mean_std(xs: &[f32]) -> (f32, f32) {

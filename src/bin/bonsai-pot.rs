@@ -58,7 +58,9 @@ MODES:
     --mode bench           Print a pp/tg table with wall-clock and GPU t/s.
                            No stdin input required.
     --mode microbench      Per-kernel GPU-timestamp breakdown for a tg step.
-                           No stdin input required.
+                           No stdin input required. The KV cache is pre-filled
+                           up to --tg before measurement so attention is timed
+                           at a representative sequence length.
 
 GEN/PROMPT OPTIONS:
     --max-new-tokens <n>   Tokens to generate (incl. the first sampled token).
@@ -75,7 +77,8 @@ GEN/PROMPT OPTIONS:
 BENCH OPTIONS:
     --pp <n>               Prefill batch size for the pp{N} bench row.
                            [default: 512]
-    --tg <n>               Token-generation length for the tg{N} bench row.
+    --tg <n>               Token-generation length for the tg{N} bench row;
+                           also the measurement pos for --mode microbench.
                            [default: 128]
     --repeats <n>          Repeat count per bench row.
                            [default: 5]
@@ -218,7 +221,7 @@ fn main() {
                 });
             }
             "microbench" => {
-                __bench::microbench_tg(&model, args.repeats).unwrap_or_else(|e| {
+                __bench::microbench_tg(&model, args.tg_n, args.repeats).unwrap_or_else(|e| {
                     eprintln!("microbench error: {e}");
                     exit(3)
                 });
