@@ -265,15 +265,19 @@ pub struct TopKParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub struct KvWritebackParams {
-    pub(crate) k_cur_off: u32,          // f16 element offset in act
-    pub(crate) v_cur_off: u32,          // f16 element offset in act
-    pub(crate) dst_d_word_offset: u32, // u32-word offset into kv_{k,v} (FP32 d-section, layer base)
-    pub(crate) dst_qs_byte_offset: u32, // byte offset into kv_{k,v} (qs-section, layer base)
-    pub(crate) pos_base: u32,          // first absolute cache position to write into
-    pub(crate) nb_per_row: u32,        // kv_dim / 32
+pub struct KvWritebackFusedParams {
+    pub(crate) k_cur_off: u32,
+    pub(crate) v_cur_off: u32,
+    pub(crate) w_k_norm_off: u32,
+    pub(crate) rope_offset: u32,
+    pub(crate) dst_d_word_offset: u32,
+    pub(crate) dst_qs_byte_offset: u32,
+    pub(crate) pos_base: u32,
     pub(crate) kv_dim: u32,
-    pub(crate) dispatch_x_dim: u32,
+    pub(crate) nb_per_row: u32,
+    pub(crate) eps: f32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
 }
 
 // All of these <= 64 bytes; we pack each into a 256-byte uniform slot.
@@ -351,7 +355,7 @@ pub struct Pipelines {
     pub(crate) attention_merge: wgpu::ComputePipeline,
     pub(crate) silu_mul: wgpu::ComputePipeline,
     pub(crate) topk_reduce: wgpu::ComputePipeline,
-    pub(crate) kv_writeback: wgpu::ComputePipeline,
+    pub(crate) kv_writeback_fused: wgpu::ComputePipeline,
 }
 
 pub struct Buffers {
@@ -383,7 +387,7 @@ pub struct BindGroupLayouts {
     pub(crate) attn_merge: wgpu::BindGroupLayout,
     pub(crate) silu_mul: wgpu::BindGroupLayout,
     pub(crate) topk_reduce: wgpu::BindGroupLayout,
-    pub(crate) kv_writeback: wgpu::BindGroupLayout,
+    pub(crate) kv_writeback_fused: wgpu::BindGroupLayout,
 }
 
 /// Pre-built bind groups indexed by (BGL kind, weight buffer). The UBO binding
@@ -409,7 +413,7 @@ pub struct CachedBindGroups {
     pub(crate) attn_merge: wgpu::BindGroup, // (uniform, act, attn_partials)
     pub(crate) silu_mul: wgpu::BindGroup, // (uniform, act)
     pub(crate) topk_reduce: wgpu::BindGroup, // (uniform, act, sample)
-    pub(crate) kv_writeback: wgpu::BindGroup, // (uniform, act, kv_k, kv_v)
+    pub(crate) kv_writeback_fused: wgpu::BindGroup, // (uniform, act, w_norms, rope_cs, kv_k, kv_v)
 }
 
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
@@ -1158,6 +1162,11 @@ impl Model {
                 "kv_dim must be a multiple of 32 (Q8_0 block size)",
             ));
         }
+        if cfg.head_dim != 128 {
+            return Err(PotError::Config(
+                "kv_writeback_fused.wgsl assumes head_dim == 128",
+            ));
+        }
         let nb_per_row = u64::from(cfg.kv_dim / 32);
         let kv_d_total: u64 = u64::from(cfg.n_layer) * u64::from(opts.max_seq) * nb_per_row * 4;
         let kv_qs_total: u64 =
@@ -1314,7 +1323,7 @@ impl Model {
         let sh_attn_merge = load_shader!("attention_merge.wgsl");
         let sh_silu = load_shader!("silu_mul.wgsl");
         let sh_topk = load_shader!("topk_reduce.wgsl");
-        let sh_kv_writeback = load_shader!("kv_writeback.wgsl");
+        let sh_kv_writeback_fused = load_shader!("kv_writeback_fused.wgsl");
 
         let make_bgl =
             |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {
@@ -1340,7 +1349,7 @@ impl Model {
             attn_merge: make_bgl("attn_merge_bgl", 2, 0b01), // act rw, partials ro
             silu_mul: make_bgl("silu_mul_bgl", 1, 0b1), // act rw
             topk_reduce: make_bgl("topk_reduce_bgl", 2, 0b10), // logits ro, result rw
-            kv_writeback: make_bgl("kv_writeback_bgl", 3, 0b110), // act ro, kv_k rw, kv_v rw
+            kv_writeback_fused: make_bgl("kv_writeback_fused_bgl", 5, 0b11000), // act ro, w_norms ro, rope_cs ro, kv_k rw, kv_v rw
         };
 
         let mk_pipe = |layout: &wgpu::BindGroupLayout,
@@ -1381,7 +1390,11 @@ impl Model {
             attention_merge: mk_pipe(&bgls.attn_merge, &sh_attn_merge, "attention_merge"),
             silu_mul: mk_pipe(&bgls.silu_mul, &sh_silu, "silu_mul"),
             topk_reduce: mk_pipe(&bgls.topk_reduce, &sh_topk, "topk_reduce"),
-            kv_writeback: mk_pipe(&bgls.kv_writeback, &sh_kv_writeback, "kv_writeback"),
+            kv_writeback_fused: mk_pipe(
+                &bgls.kv_writeback_fused,
+                &sh_kv_writeback_fused,
+                "kv_writeback_fused",
+            ),
         };
 
         // ---- vocab ----------------------------------------------------------
@@ -1729,10 +1742,16 @@ fn build_cached_bind_groups(
             &bgls.topk_reduce,
             &[&buffers.act, &buffers.sample],
         ),
-        kv_writeback: mk(
-            "cached_kv_writeback",
-            &bgls.kv_writeback,
-            &[&buffers.act, &buffers.kv_k, &buffers.kv_v],
+        kv_writeback_fused: mk(
+            "cached_kv_writeback_fused",
+            &bgls.kv_writeback_fused,
+            &[
+                &buffers.act,
+                &buffers.w_norms,
+                &buffers.rope_table,
+                &buffers.kv_k,
+                &buffers.kv_v,
+            ],
         ),
     }
 }
@@ -1839,7 +1858,7 @@ mod tests {
         assert!(size_of::<AttnMergeParams>() <= limit);
         assert!(size_of::<SiluMulParams>() <= limit);
         assert!(size_of::<TopKParams>() <= limit);
-        assert!(size_of::<KvWritebackParams>() <= limit);
+        assert!(size_of::<KvWritebackFusedParams>() <= limit);
     }
 
     #[test]

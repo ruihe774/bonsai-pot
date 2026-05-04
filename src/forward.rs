@@ -27,7 +27,7 @@ use bytemuck::Pod;
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
-    KvWritebackParams, MatmulParams, MatvecFusedParams, MatvecParams, Model, QuantParams,
+    KvWritebackFusedParams, MatmulParams, MatvecFusedParams, MatvecParams, Model, QuantParams,
     RmsNormParams, RopeParams, SiluMulParams, TOPK_MAX, TopKParams, UNIFORM_POOL_SLOTS,
     UNIFORM_SLOT_SIZE, WeightSet,
 };
@@ -342,36 +342,41 @@ fn dispatch_topk_reduce(
     pass.dispatch_workgroups(1, 1, 1);
 }
 
-fn dispatch_kv_writeback(
+/// Fused: `rms_norm(K` head) → \*`w_k_norm` → NEOX-RoPE → `Q8_0` quantize → write
+/// `kv_k`. V runs in the same workgroup (just quantize + write `kv_v`). Replaces
+/// `rms_norm(K) + rope(K) + kv_writeback` with one dispatch.
+fn dispatch_kv_writeback_fused(
     model: &Model,
     cfg: &Config,
     uniforms: &mut UniformPool,
     pass: &mut wgpu::ComputePass<'_>,
     k_cur_off: u32,
     v_cur_off: u32,
+    w_k_norm_off: u32,
     layer_il: u32,
     pos_base: u32,
     m_tokens: u32,
 ) {
     let nb_per_row = cfg.kv_dim / 32;
-    let total_blocks = m_tokens * nb_per_row;
-    let dispatch_x = total_blocks.min(65535);
-    let dispatch_y = total_blocks.div_ceil(dispatch_x);
     let (dst_d_word_offset, dst_qs_byte_offset) = kv_layer_offsets(cfg, model.max_seq, layer_il);
-    let p = KvWritebackParams {
+    let p = KvWritebackFusedParams {
         k_cur_off,
         v_cur_off,
+        w_k_norm_off,
+        rope_offset: 0,
         dst_d_word_offset,
         dst_qs_byte_offset,
         pos_base,
-        nb_per_row,
         kv_dim: cfg.kv_dim,
-        dispatch_x_dim: dispatch_x,
+        nb_per_row,
+        eps: cfg.rms_eps,
+        _p0: 0,
+        _p1: 0,
     };
     let off = uniforms.alloc(&p);
-    pass.set_pipeline(&model.pipes.kv_writeback);
-    pass.set_bind_group(0, &model.cached.kv_writeback, &[off]);
-    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    pass.set_pipeline(&model.pipes.kv_writeback_fused);
+    pass.set_bind_group(0, &model.cached.kv_writeback_fused, &[off]);
+    pass.dispatch_workgroups(cfg.n_kv_head, m_tokens, 1);
 }
 
 // ---------- async readback helper -------------------------------------------
@@ -425,10 +430,10 @@ fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
 /// the LM-head/topk suffix is omitted (the `topk_out = None` path used by
 /// `prefill_matvec_loop_topk`'s non-last steps).
 fn encode_step_matvec_slots_no_suffix(cfg: &Config) -> u64 {
-    // 1 embed + 14 per layer (rms, qkv_fused, q_norm, k_norm, rope_q, rope_k,
-    // kv_writeback, attn_split, attn_merge, Wo, ffn_norm, gate_up_fused,
-    // silu_mul, Wd).
-    1 + 14 * u64::from(cfg.n_layer)
+    // 1 embed + 12 per layer (rms, qkv_fused, q_norm, rope_q,
+    // kv_writeback_fused, attn_split, attn_merge, Wo, ffn_norm,
+    // gate_up_fused, silu_mul, Wd).
+    1 + 12 * u64::from(cfg.n_layer)
 }
 
 /// Encode one tg step into the given encoder. The input token is read from
@@ -471,15 +476,18 @@ pub fn encode_step_matvec(
     }
     for il in 0..cfg.n_layer {
         layer_pre_kv_in_pass(m, cfg, uniforms, &mut pass, il, pos);
-        // Q8_0-quantize K/V and write into the cache (replaces the
-        // copy_buffer_to_buffer that used to break the pass).
-        dispatch_kv_writeback(
+        // Fused: K (rms_norm + *w_k_norm + RoPE + Q8_0 quantize) and V (Q8_0
+        // quantize) → write both into kv_{k,v}. Replaces the previous
+        // rms_norm(K) + rope(K) + kv_writeback trio (3 dispatches → 1).
+        let lt = &m.layer_tensors[il as usize];
+        dispatch_kv_writeback_fused(
             m,
             cfg,
             uniforms,
             &mut pass,
             m.act_layout.k_cur,
             m.act_layout.v_cur,
+            lt.attn_k_norm_off,
             il,
             pos,
             1,
@@ -610,17 +618,6 @@ fn layer_pre_kv_in_pass(
         model.act_layout.q,
         lt.attn_q_norm_off,
     );
-    dispatch_rms_norm(
-        model,
-        cfg,
-        uniforms,
-        pass,
-        cfg.n_kv_head,
-        cfg.head_dim,
-        model.act_layout.k_cur,
-        model.act_layout.k_cur,
-        lt.attn_k_norm_off,
-    );
 
     dispatch_rope(
         model,
@@ -632,16 +629,9 @@ fn layer_pre_kv_in_pass(
         cfg.n_head,
         pos,
     );
-    dispatch_rope(
-        model,
-        cfg,
-        uniforms,
-        pass,
-        model.act_layout.k_cur,
-        1,
-        cfg.n_kv_head,
-        pos,
-    );
+    // K's rms_norm + RoPE + Q8_0 quantize + writeback into kv_k, plus V's
+    // quantize + writeback into kv_v, all happen inside dispatch_kv_writeback_fused
+    // (called from encode_step_matvec).
 }
 
 /// Post-KV-copy block of one layer: attention → Wo (resid) → `ffn_norm`
@@ -1007,34 +997,19 @@ fn layer_step_matmul(model: &Model, cfg: &Config, se: &mut StepEncoder, il: u32,
         model.act_layout.q,
         lt.attn_q_norm_off,
     );
-    rms_norm(
-        model,
-        cfg,
-        se,
-        m * cfg.n_kv_head,
-        cfg.head_dim,
-        model.act_layout.k_cur,
-        model.act_layout.k_cur,
-        lt.attn_k_norm_off,
-    );
 
     rope(model, cfg, se, model.act_layout.q, m, cfg.n_head, pos_base);
-    rope(
-        model,
-        cfg,
-        se,
-        model.act_layout.k_cur,
-        m,
-        cfg.n_kv_head,
-        pos_base,
-    );
 
-    kv_writeback(
+    // Fused: K (rms_norm + *w_k_norm + RoPE + Q8_0 quantize) and V (Q8_0
+    // quantize) → write both into kv_{k,v}. Replaces the previous
+    // rms_norm(K) + rope(K) + kv_writeback trio.
+    kv_writeback_fused(
         model,
         cfg,
         se,
         model.act_layout.k_cur,
         model.act_layout.v_cur,
+        lt.attn_k_norm_off,
         il,
         /*pos_base=*/ 0,
         m,
@@ -1335,39 +1310,41 @@ fn quantize_act(
     (d_off, qs_off)
 }
 
-fn kv_writeback(
+fn kv_writeback_fused(
     model: &Model,
     cfg: &Config,
     se: &mut StepEncoder,
     k_cur_off: u32,
     v_cur_off: u32,
+    w_k_norm_off: u32,
     layer_il: u32,
     pos_base: u32,
     m_tokens: u32,
 ) {
     let nb_per_row = cfg.kv_dim / 32;
-    let total_blocks = m_tokens * nb_per_row;
-    let dispatch_x = total_blocks.min(65535);
-    let dispatch_y = total_blocks.div_ceil(dispatch_x);
     let (dst_d_word_offset, dst_qs_byte_offset) = kv_layer_offsets(cfg, model.max_seq, layer_il);
-    let p = KvWritebackParams {
+    let p = KvWritebackFusedParams {
         k_cur_off,
         v_cur_off,
+        w_k_norm_off,
+        rope_offset: 0,
         dst_d_word_offset,
         dst_qs_byte_offset,
         pos_base,
-        nb_per_row,
         kv_dim: cfg.kv_dim,
-        dispatch_x_dim: dispatch_x,
+        nb_per_row,
+        eps: cfg.rms_eps,
+        _p0: 0,
+        _p1: 0,
     };
     let off = se.alloc_uniform(&p);
     let mut cp = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("kv_writeback"),
+        label: Some("kv_writeback_fused"),
         timestamp_writes: None,
     });
-    cp.set_pipeline(&model.pipes.kv_writeback);
-    cp.set_bind_group(0, &model.cached.kv_writeback, &[off]);
-    cp.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    cp.set_pipeline(&model.pipes.kv_writeback_fused);
+    cp.set_bind_group(0, &model.cached.kv_writeback_fused, &[off]);
+    cp.dispatch_workgroups(cfg.n_kv_head, m_tokens, 1);
 }
 
 fn silu_mul(
@@ -1458,8 +1435,8 @@ pub mod bench_internals {
 
     use super::{
         AttnParams, Config, EmbedParams, Model, Result, StepEncoder, TopKParams, WeightSet,
-        kv_layer_offsets, kv_writeback, matvec_q1_0, matvec_q1_0_fused_pass, prefill_matmul_topk,
-        rms_norm, rope, silu_mul, step_matvec_no_sample, step_matvec_topk,
+        kv_layer_offsets, kv_writeback_fused, matvec_q1_0, matvec_q1_0_fused_pass,
+        prefill_matmul_topk, rms_norm, rope, silu_mul, step_matvec_no_sample, step_matvec_topk,
     };
     use crate::error::PotError;
 
@@ -1639,6 +1616,8 @@ pub mod bench_internals {
         ));
 
         // (label, n_groups, group_size, calls/step, norm_off)
+        // NOTE: per-K-head rms_norm and the K-side rope have been folded into
+        // kv_writeback_fused, so they no longer appear here.
         let rms_shapes: Vec<(String, u32, u32, u32, u32)> = vec![
             (
                 format!("rms_norm ng=1 gs={}", cfg.n_embd),
@@ -1653,13 +1632,6 @@ pub mod bench_internals {
                 cfg.head_dim,
                 n_layer,
                 lt0.attn_q_norm_off,
-            ),
-            (
-                format!("rms_norm ng={} gs={}", cfg.n_kv_head, cfg.head_dim),
-                cfg.n_kv_head,
-                cfg.head_dim,
-                n_layer,
-                lt0.attn_k_norm_off,
             ),
         ];
         for (label, ng, gs, calls, norm_off) in &rms_shapes {
@@ -1687,13 +1659,6 @@ pub mod bench_internals {
             n_layer,
             Box::new(move |model, cfg, se| {
                 rope(model, cfg, se, model.act_layout.q, 1, cfg.n_head, 0);
-            }),
-        ));
-        entries.push((
-            format!("rope n_heads={}", cfg.n_kv_head),
-            n_layer,
-            Box::new(move |model, cfg, se| {
-                rope(model, cfg, se, model.act_layout.k_cur, 1, cfg.n_kv_head, 0);
             }),
         ));
 
@@ -1797,12 +1762,13 @@ pub mod bench_internals {
             for (_l, _c, f) in &entries {
                 f(model, cfg, &mut se);
             }
-            kv_writeback(
+            kv_writeback_fused(
                 model,
                 cfg,
                 &mut se,
                 model.act_layout.k_cur,
                 model.act_layout.v_cur,
+                lt0.attn_k_norm_off,
                 /*layer_il=*/ 0,
                 /*pos_base=*/ 0,
                 /*m_tokens=*/ 1,
@@ -1843,12 +1809,13 @@ pub mod bench_internals {
                 let t = Instant::now();
                 let mut se = StepEncoder::new(model);
                 for _ in 0..n_per_cb {
-                    kv_writeback(
+                    kv_writeback_fused(
                         model,
                         cfg,
                         &mut se,
                         model.act_layout.k_cur,
                         model.act_layout.v_cur,
+                        lt0.attn_k_norm_off,
                         /*layer_il=*/ 0,
                         /*pos_base=*/ 0,
                         /*m_tokens=*/ 1,
@@ -1864,7 +1831,11 @@ pub mod bench_internals {
             }
             let mean = samples.iter().sum::<f32>() / samples.len() as f32;
             let per_pair_us = mean / n_per_cb as f32 * 1e6;
-            breakdown.push(("kv_writeback Q8_0 (K+V)".to_string(), n_layer, per_pair_us));
+            breakdown.push((
+                "kv_writeback_fused (K rms+rope+Q8_0 + V Q8_0)".to_string(),
+                n_layer,
+                per_pair_us,
+            ));
         }
 
         println!();
