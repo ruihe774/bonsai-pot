@@ -43,19 +43,20 @@ pub enum StopReason {
 }
 
 /// Options for [`Session::generate`] / [`Session::generate_streaming`].
-#[derive(Debug, Clone)]
-pub struct GenerateOptions {
+pub struct GenerateOptions<F: Fn(u32) -> bool = fn(u32) -> bool> {
     pub max_new_tokens: u32,
-    /// Token id that terminates generation. `None` ⇒ use the model's default EOS.
-    pub stop_token: Option<u32>,
+    /// Predicate run on each newly sampled token. Returning `true` ends
+    /// generation with [`StopReason::Eos`] before the token is delivered to
+    /// the streaming callback. `None` ⇒ stop on the model's default EOS token.
+    pub stop_pred: Option<F>,
     pub sampler: Sampler,
 }
 
-impl Default for GenerateOptions {
+impl Default for GenerateOptions<fn(u32) -> bool> {
     fn default() -> Self {
         Self {
             max_new_tokens: 32,
-            stop_token: None,
+            stop_pred: None,
             sampler: Sampler::default(),
         }
     }
@@ -217,10 +218,10 @@ impl<'m> Session<'m> {
     ///
     /// Returns an error if generation would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
-    pub fn generate(
+    pub fn generate<S: Fn(u32) -> bool>(
         &mut self,
         first_token: u32,
-        opts: &GenerateOptions,
+        opts: &GenerateOptions<S>,
     ) -> Result<(Vec<u32>, StopReason)> {
         let mut out = Vec::with_capacity(opts.max_new_tokens as usize);
         let stop = self.generate_streaming(first_token, opts, |id| out.push(id))?;
@@ -228,24 +229,22 @@ impl<'m> Session<'m> {
     }
 
     /// Streaming generation. `on_token` fires once per emitted token (NOT
-    /// including `first_token`). The stop token, when produced, terminates
-    /// generation **before** the callback is invoked — so the callback never
-    /// sees the stop id.
+    /// including `first_token`). The stop predicate, when it returns `true`,
+    /// terminates generation **before** the token is delivered to the callback.
     ///
     /// # Errors
     ///
     /// Returns an error if generation would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
-    pub fn generate_streaming<F: FnMut(u32)>(
+    pub fn generate_streaming<S: Fn(u32) -> bool, On: FnMut(u32)>(
         &mut self,
         first_token: u32,
-        opts: &GenerateOptions,
-        mut on_token: F,
+        opts: &GenerateOptions<S>,
+        mut on_token: On,
     ) -> Result<StopReason> {
         self.model.check_device()?;
-        let stop_id = opts
-            .stop_token
-            .unwrap_or_else(|| self.model.cfg.eos_token_id);
+        let default_eos = self.model.cfg.eos_token_id;
+        let is_stop = |t: u32| opts.stop_pred.as_ref().map_or(t == default_eos, |p| p(t));
         let mut next = first_token;
         for _ in 0..opts.max_new_tokens {
             if self.pos + 1 > self.model.max_seq {
@@ -259,7 +258,7 @@ impl<'m> Session<'m> {
             let (logits, indices) = forward::step_matvec_topk(self.model, next, self.pos, k)?;
             let chosen = sample_from_topk(&logits, &indices, &opts.sampler, self.pos);
             self.pos += 1;
-            if chosen == stop_id {
+            if is_stop(chosen) {
                 return Ok(StopReason::Eos);
             }
             on_token(chosen);
@@ -491,7 +490,7 @@ mod tests {
     fn generate_options_default() {
         let o = GenerateOptions::default();
         assert_eq!(o.max_new_tokens, 32);
-        assert_eq!(o.stop_token, None);
+        assert!(o.stop_pred.is_none());
         assert_eq!(o.sampler.temperature, 1.0);
     }
 }

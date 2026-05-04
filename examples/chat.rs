@@ -28,14 +28,14 @@
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
 use std::fmt::Display;
-use std::io::{Write as _, stdin, stdout};
+use std::io::{Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-use bonsai_pot::{KvSnapshot, LoadOptions, Model, PotError, Sampler};
+use bonsai_pot::{GenerateOptions, KvSnapshot, LoadOptions, Model, PotError, Sampler};
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -276,6 +276,33 @@ fn strip_thinking(tokens: &[u32], open: Option<u32>, close: Option<u32>) -> Vec<
     out
 }
 
+struct Emitter<'a> {
+    stdout: &'a mut dyn Write,
+    model: &'a Model,
+    think_open: Option<u32>,
+    think_close: Option<u32>,
+    out_tokens: &'a mut Vec<u32>,
+    pub in_think: bool,
+}
+
+impl Emitter<'_> {
+    fn emit(&mut self, id: u32) {
+        if self.think_open.is_some() {
+            if Some(id) == self.think_open {
+                self.in_think = true;
+                self.stdout.write_all(b"\x1b[2m").ok();
+            }
+            self.out_tokens.push(id);
+        }
+        self.stdout.write_all(&self.model.decode_token(id)).ok();
+        self.stdout.flush().ok();
+        if Some(id) == self.think_close {
+            self.in_think = false;
+            self.stdout.write_all(b"\x1b[0m").ok();
+        }
+    }
+}
+
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
@@ -384,7 +411,7 @@ fn main() {
             // All user-turn prefills use the matvec-loop path (pos > 0 after
             // the system prompt). The first sampled token is not yet in KV —
             // it is fed back via `step` in the streaming loop below.
-            let mut next = sess
+            let next = sess
                 .prefill_one_at_a_time(&tokens, &sampler)
                 .expect("prefill_one_at_a_time");
 
@@ -400,35 +427,44 @@ fn main() {
 
             write!(stdout, "Assistant: ").ok();
             stdout.flush().ok();
-            let mut hit_overflow = false;
+
+            let stop = |t: u32| t == im_end || t == endoftext;
+            let gen_opts = GenerateOptions {
+                max_new_tokens: args.max_new_tokens,
+                stop_pred: Some(stop),
+                sampler: sampler.clone(),
+            };
+
             let mut out_tokens: Vec<u32> = Vec::new();
-            let mut in_think = false;
-            for _ in 0..args.max_new_tokens {
-                if next == im_end || next == endoftext {
-                    break;
-                }
-                // Track thinking-block boundaries for display and stripping.
-                if thinking_supported {
-                    if Some(next) == think_open {
-                        in_think = true;
-                        stdout.write_all(b"\x1b[2m").ok(); // dim
+            let hit_overflow;
+            let in_think;
+            {
+                let mut emitter = Emitter {
+                    stdout: &mut stdout,
+                    model: &model,
+                    think_open: if thinking_supported { think_open } else { None },
+                    think_close,
+                    out_tokens: &mut out_tokens,
+                    in_think: false,
+                };
+                // `next` is the prefill-sampled token; generate_streaming feeds
+                // first_token as input without invoking the callback for it, so
+                // emit it manually first.
+                if stop(next) {
+                    hit_overflow = false;
+                } else {
+                    emitter.emit(next);
+                    match sess.generate_streaming(next, &gen_opts, |id| emitter.emit(id)) {
+                        Ok(_) => {
+                            hit_overflow = false;
+                        }
+                        Err(PotError::ContextOverflow { .. }) => {
+                            hit_overflow = true;
+                        }
+                        Err(e) => panic!("generate_streaming: {e}"),
                     }
-                    out_tokens.push(next);
                 }
-                stdout.write_all(&model.decode_token(next)).ok();
-                stdout.flush().ok();
-                if thinking_supported && Some(next) == think_close {
-                    in_think = false;
-                    stdout.write_all(b"\x1b[0m").ok(); // reset
-                }
-                match sess.step(next, &sampler) {
-                    Ok(t) => next = t,
-                    Err(PotError::ContextOverflow { .. }) => {
-                        hit_overflow = true;
-                        break;
-                    }
-                    Err(e) => panic!("step: {e}"),
-                }
+                in_think = emitter.in_think;
             }
             // Reset dim if we hit max_new_tokens or overflow mid-think.
             if in_think {

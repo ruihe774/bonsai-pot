@@ -29,11 +29,11 @@ fn short_prompt() -> Vec<u32> {
     vec![1u32, 2, 3, 4, 5, 6, 7, 8]
 }
 
-/// `GenerateOptions` for determinism tests: greedy, no stop token, bounded length.
+/// `GenerateOptions` for determinism tests: greedy, never-stop, bounded length.
 fn greedy_opts(max_new_tokens: u32) -> GenerateOptions {
     GenerateOptions {
         max_new_tokens,
-        stop_token: Some(u32::MAX), // won't match anything
+        stop_pred: Some((|_| false) as fn(u32) -> bool),
         sampler: greedy_sampler(),
     }
 }
@@ -147,16 +147,11 @@ fn seeded_sampler_reproducibility() {
         seed: 42,
         ..Sampler::default()
     };
-    let opts = GenerateOptions {
-        max_new_tokens: 8,
-        stop_token: Some(u32::MAX),
-        sampler: seeded.clone(),
-    };
-
     let run = |s: &Sampler| -> (u32, Vec<u32>) {
         let opts_local = GenerateOptions {
+            max_new_tokens: 8,
+            stop_pred: Some((|_| false) as fn(u32) -> bool),
             sampler: s.clone(),
-            ..opts.clone()
         };
         let mut sess = model.new_session();
         let first = sess.prefill(&prompt, s).unwrap();
@@ -187,7 +182,7 @@ fn generate_max_tokens_zero_returns_immediately() {
     let mut sess = model.new_session();
     let opts = GenerateOptions {
         max_new_tokens: 0,
-        stop_token: Some(u32::MAX),
+        stop_pred: Some((|_| false) as fn(u32) -> bool),
         sampler: greedy_sampler(),
     };
     let mut fired = false;
