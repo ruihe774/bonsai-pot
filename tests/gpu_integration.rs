@@ -51,7 +51,7 @@ fn model_load_succeeds_and_config_is_bonsai_family() {
     assert!(matches!(cfg.n_layer, 28 | 36 | 40));
     assert_ne!(cfg.eos_token_id, 0);
     assert!(cfg.n_vocab > 100_000);
-    // max_seq_len / max_prefill_tokens are ModelOptions-driven, not model-specific.
+    // max_seq_len / max_prefill_tokens are LoadOptions-driven, not model-specific.
     assert_eq!(model.max_seq_len(), 1024);
     assert_eq!(model.max_prefill_tokens(), 512);
 }

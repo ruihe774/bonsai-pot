@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
 
-use bonsai_pot::{__bench, GenerateOptions, Model, ModelOptions, Sampler};
+use bonsai_pot::{__bench, GenerateOptions, LoadOptions, Model, Sampler};
 
 struct Args {
     model_dir: PathBuf,
@@ -199,7 +199,7 @@ fn main() {
     pollster::block_on(async move {
         let model = Model::load_with_options(
             &args.model_dir,
-            ModelOptions {
+            LoadOptions {
                 max_seq: args.max_seq,
                 ..Default::default()
             },

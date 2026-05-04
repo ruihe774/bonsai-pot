@@ -35,7 +35,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-use bonsai_pot::{KvSnapshot, Model, ModelOptions, PotError, Sampler};
+use bonsai_pot::{KvSnapshot, LoadOptions, Model, PotError, Sampler};
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -289,7 +289,7 @@ fn main() {
         eprintln!("loading model from {}…", args.model_dir.display());
         let model = Model::load_with_options(
             &args.model_dir,
-            ModelOptions {
+            LoadOptions {
                 max_seq: args.max_seq,
                 ..Default::default()
             },

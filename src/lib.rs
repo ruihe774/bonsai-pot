@@ -32,7 +32,7 @@ mod session;
 
 pub use error::{PotError, Result};
 pub use kv_snapshot::KvSnapshot;
-pub use model::{GlobalPriority, Model, ModelConfig, ModelOptions};
+pub use model::{GlobalPriority, LoadOptions, Model, ModelConfig};
 pub use session::{GenerateOptions, Sampler, Session, StopReason};
 
 /// Bench / microbench helpers, exposed only with the `bench-internals` feature.

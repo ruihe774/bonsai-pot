@@ -84,7 +84,7 @@ Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step bat
 
 ### GPU memory layout
 
-Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v` and stored in **Q8_0** (~2.25 bytes/element); per-step K/V is quantized straight into the cache, with no f16 staging copy. Capacity is set at load via `ModelOptions::max_seq` (default 1024; `--max-seq` on both the bin and the chat example). Bonsai 4B uses **tied** embeddings (`token_embd.weight` serves as both embed table and LM head); Bonsai 8B ships a separate `output.weight` tensor for the LM head.
+Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v` and stored in **Q8_0** (~2.25 bytes/element); per-step K/V is quantized straight into the cache, with no f16 staging copy. Capacity is set at load via `LoadOptions::max_seq` (default 1024; `--max-seq` on both the bin and the chat example). Bonsai 4B uses **tied** embeddings (`token_embd.weight` serves as both embed table and LM head); Bonsai 8B ships a separate `output.weight` tensor for the LM head.
 
 There is exactly one `uniform` buffer; every dispatch's params struct is appended to a CPU-side pool with a dynamic offset, and the whole pool is uploaded in one `write_buffer` per step.
 
@@ -93,7 +93,7 @@ There is exactly one `uniform` buffer; every dispatch's params struct is appende
 | Path | What's in it |
 | --- | --- |
 | `src/lib.rs` | Public API surface, re-exports |
-| `src/model.rs` | Config / manifest loading, GPU device & buffer & pipeline & BGL setup, RoPE precompute, `ModelOptions` |
+| `src/model.rs` | Config / manifest loading, GPU device & buffer & pipeline & BGL setup, RoPE precompute, `LoadOptions` |
 | `src/session.rs` | `Session<'m>`, `Sampler`, `GenerateOptions`, `StopReason`, CPU sampler |
 | `src/kv_snapshot.rs` | Host-resident `KvSnapshot` of the GPU KV cache (used by `Session::snapshot` / `Session::restore`) |
 | `src/forward.rs` | Forward pass (both paths) and per-step encoder helpers |
@@ -108,4 +108,4 @@ There is exactly one `uniform` buffer; every dispatch's params struct is appende
 
 ## Public API
 
-`Model`, `ModelConfig`, `ModelOptions`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `KvSnapshot`, `PotError`, `Result`, `TOPK_MAX`. Anything not re-exported from `src/lib.rs` is internal.
+`Model`, `ModelConfig`, `LoadOptions`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `KvSnapshot`, `PotError`, `Result`, `TOPK_MAX`. Anything not re-exported from `src/lib.rs` is internal.

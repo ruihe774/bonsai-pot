@@ -598,7 +598,7 @@ impl GlobalPriority {
 /// These affect GPU buffer sizing (KV cache, `RoPE` table) and so cannot be
 /// changed per call — pick them once at load.
 #[derive(Debug, Clone)]
-pub struct ModelOptions {
+pub struct LoadOptions {
     /// Maximum sequence length (positions in the KV cache). Default: 1024.
     ///
     /// VRAM cost is linear: KV cache (`Q8_0` K and V combined) uses roughly
@@ -617,7 +617,7 @@ pub struct ModelOptions {
     pub priority: GlobalPriority,
 }
 
-impl Default for ModelOptions {
+impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
@@ -901,13 +901,13 @@ fn validate_cfg(cfg: &Config) -> Result<()> {
 
 impl Model {
     /// Load weights with default options. Equivalent to
-    /// [`Model::load_with_options`] with `ModelOptions::default()`.
+    /// [`Model::load_with_options`] with `LoadOptions::default()`.
     ///
     /// # Errors
     ///
     /// See [`Model::load_with_options`].
     pub async fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_with_options(model_dir, ModelOptions::default()).await
+        Self::load_with_options(model_dir, LoadOptions::default()).await
     }
 
     /// Load weights, build pipelines, allocate the KV cache. Reads
@@ -921,7 +921,7 @@ impl Model {
     /// or parsed, no suitable wgpu adapter is available, the adapter does not
     /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
     /// subgroup size is unsupported, or the vocab files are malformed.
-    pub async fn load_with_options(model_dir: &Path, opts: ModelOptions) -> Result<Self> {
+    pub async fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
         // Hoisted constants/items so we don't trip items-after-statements lints.
         const SAMPLE_BYTES: u64 = 4 * 1024;
         const fn ubo_dyn(binding: u32) -> wgpu::BindGroupLayoutEntry {
