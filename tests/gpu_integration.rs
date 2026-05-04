@@ -41,22 +41,6 @@ fn greedy_opts(max_new_tokens: u32) -> GenerateOptions {
 // ---- model loading -----------------------------------------------------------
 
 #[test]
-fn model_load_succeeds_and_config_is_bonsai_family() {
-    let model = load_model();
-    let cfg = model.config();
-    // Invariants that hold across the Bonsai/Qwen3 dense family.
-    assert_eq!(cfg.head_dim, 128);
-    assert_eq!(cfg.n_kv_head, 8);
-    assert_eq!(cfg.n_head, 32);
-    assert!(matches!(cfg.n_layer, 28 | 36 | 40));
-    assert_ne!(cfg.eos_token_id, 0);
-    assert!(cfg.n_vocab > 100_000);
-    // max_seq_len / max_prefill_tokens are LoadOptions-driven, not model-specific.
-    assert_eq!(model.max_seq_len(), 1024);
-    assert_eq!(model.max_prefill_tokens(), 512);
-}
-
-#[test]
 fn model_load_bad_path_is_io_error() {
     let result = pollster::block_on(Model::load(Path::new("./does-not-exist")));
     assert!(matches!(result, Err(PotError::Io { .. })));

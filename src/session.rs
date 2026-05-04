@@ -46,7 +46,7 @@ pub enum StopReason {
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
     pub max_new_tokens: u32,
-    /// Token id that terminates generation. `None` ⇒ use [`crate::ModelConfig::eos_token_id`].
+    /// Token id that terminates generation. `None` ⇒ use the model's default EOS.
     pub stop_token: Option<u32>,
     pub sampler: Sampler,
 }
@@ -245,7 +245,7 @@ impl<'m> Session<'m> {
         self.model.check_device()?;
         let stop_id = opts
             .stop_token
-            .unwrap_or_else(|| self.model.config().eos_token_id);
+            .unwrap_or_else(|| self.model.cfg.eos_token_id);
         let mut next = first_token;
         for _ in 0..opts.max_new_tokens {
             if self.pos + 1 > self.model.max_seq {

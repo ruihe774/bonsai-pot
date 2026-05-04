@@ -60,7 +60,7 @@ pub struct TensorEntry {
 
 /// Internal config: the full struct deserialized from `config.ini`.
 #[derive(Debug, Clone)]
-pub struct ConfigRaw {
+pub struct Config {
     pub(crate) n_layer: u32,
     pub(crate) n_embd: u32,
     pub(crate) n_ff: u32,
@@ -71,54 +71,13 @@ pub struct ConfigRaw {
     pub(crate) rms_eps: f32,
     pub(crate) n_vocab: u32,
     pub(crate) eos_token_id: u32,
-    pub(crate) padding_token_id: u32,
     pub(crate) add_bos: bool,
-    pub(crate) context_length: u32,
     pub(crate) rope_orig_context: u32,
     pub(crate) n_kv_groups: u32,
     pub(crate) q_dim: u32,
     pub(crate) kv_dim: u32,
     pub(crate) tied_embeddings: bool,
     pub(crate) manifest: HashMap<String, TensorEntry>,
-}
-
-// Internal alias for the full config — most code uses this name and reaches the
-// fields directly. Kept as `Config` so existing call sites are minimally
-// disturbed.
-pub type Config = ConfigRaw;
-
-/// Public, read-only view of the model's hyperparameters. Stable for the
-/// library API; does not expose the GGUF tensor manifest or any other internal
-/// fields.
-#[derive(Debug, Clone)]
-pub struct ModelConfig {
-    pub n_layer: u32,
-    pub n_embd: u32,
-    pub n_head: u32,
-    pub n_kv_head: u32,
-    pub head_dim: u32,
-    pub n_vocab: u32,
-    pub eos_token_id: u32,
-    pub padding_token_id: u32,
-    pub context_length: u32,
-    pub tied_embeddings: bool,
-}
-
-impl ModelConfig {
-    const fn from_raw(c: &ConfigRaw) -> Self {
-        Self {
-            n_layer: c.n_layer,
-            n_embd: c.n_embd,
-            n_head: c.n_head,
-            n_kv_head: c.n_kv_head,
-            head_dim: c.head_dim,
-            n_vocab: c.n_vocab,
-            eos_token_id: c.eos_token_id,
-            padding_token_id: c.padding_token_id,
-            context_length: c.context_length,
-            tied_embeddings: c.tied_embeddings,
-        }
-    }
 }
 
 // ----- uniform-param structs (WGSL-side struct layouts) ---------------------
@@ -529,7 +488,6 @@ pub struct Model {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) cfg: Config,
-    pub(crate) public_cfg: ModelConfig,
     pub(crate) act_layout: ActLayout,
     pub(crate) m_max: u32,
     pub(crate) max_seq: u32,
@@ -667,7 +625,7 @@ fn parse_config_ini(text: &str) -> Result<Config> {
     }
 
     let g = &globals;
-    Ok(ConfigRaw {
+    Ok(Config {
         n_layer: parse_field(g, "n_layer")?,
         n_embd: parse_field(g, "n_embd")?,
         n_ff: parse_field(g, "n_ff")?,
@@ -678,9 +636,7 @@ fn parse_config_ini(text: &str) -> Result<Config> {
         rms_eps: parse_field(g, "rms_eps")?,
         n_vocab: parse_field(g, "n_vocab")?,
         eos_token_id: parse_field(g, "eos_token_id")?,
-        padding_token_id: parse_field(g, "padding_token_id")?,
         add_bos: get(g, "add_bos")? == "true",
-        context_length: parse_field(g, "context_length")?,
         rope_orig_context: parse_field(g, "rope_orig_context")?,
         n_kv_groups: parse_field(g, "n_kv_groups")?,
         q_dim: parse_field(g, "q_dim")?,
@@ -931,7 +887,6 @@ impl Model {
         })?;
         let cfg = parse_config_ini(&cfg_text)?;
         validate_cfg(&cfg)?;
-        let public_cfg = ModelConfig::from_raw(&cfg);
 
         // ---- wgpu init ------------------------------------------------------
         let instance = wgpu::Instance::default();
@@ -1528,7 +1483,6 @@ impl Model {
             device,
             queue,
             cfg,
-            public_cfg,
             act_layout,
             m_max: M_MAX,
             max_seq: opts.max_seq,
@@ -1540,12 +1494,6 @@ impl Model {
             vocab,
             lost,
         })
-    }
-
-    /// Read-only view of the model's hyperparameters.
-    #[must_use]
-    pub const fn config(&self) -> &ModelConfig {
-        &self.public_cfg
     }
 
     /// Maximum sequence length supported by the allocated KV cache.
@@ -1819,8 +1767,8 @@ fn build_cached_bind_groups(
 mod tests {
     use super::*;
 
-    fn bonsai4b_cfg() -> ConfigRaw {
-        ConfigRaw {
+    fn bonsai4b_cfg() -> Config {
+        Config {
             n_layer: 36,
             n_embd: 2560,
             n_ff: 9728,
@@ -1831,9 +1779,7 @@ mod tests {
             rms_eps: 1e-6,
             n_vocab: 151_936,
             eos_token_id: 151_645,
-            padding_token_id: 151_654,
             add_bos: false,
-            context_length: 32_768,
             rope_orig_context: 4_096,
             n_kv_groups: 4,
             q_dim: 4_096,
@@ -1843,8 +1789,8 @@ mod tests {
         }
     }
 
-    fn rope_test_cfg() -> ConfigRaw {
-        ConfigRaw {
+    fn rope_test_cfg() -> Config {
+        Config {
             n_layer: 1,
             n_embd: 8,
             n_ff: 8,
@@ -1855,9 +1801,7 @@ mod tests {
             rms_eps: 1e-6,
             n_vocab: 10,
             eos_token_id: 1,
-            padding_token_id: 0,
             add_bos: false,
-            context_length: 4,
             rope_orig_context: 4,
             n_kv_groups: 1,
             q_dim: 8,
