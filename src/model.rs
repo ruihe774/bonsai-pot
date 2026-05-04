@@ -128,17 +128,6 @@ pub struct RmsNormParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub struct RopeParams {
-    pub(crate) head_dim: u32,
-    pub(crate) n_heads: u32,
-    pub(crate) n_tokens: u32,
-    pub(crate) pos_base: u32,
-    pub(crate) data_offset: u32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
-}
-#[repr(C)]
-#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct MatvecParams {
     pub(crate) k: u32,
     pub(crate) n: u32,
@@ -265,6 +254,18 @@ pub struct TopKParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct QNormRopeFusedParams {
+    pub(crate) q_off: u32,
+    pub(crate) w_q_norm_off: u32,
+    pub(crate) rope_offset: u32,
+    pub(crate) pos_base: u32,
+    pub(crate) q_dim: u32,
+    pub(crate) eps: f32,
+    pub(crate) _p0: u32,
+    pub(crate) _p1: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct KvWritebackFusedParams {
     pub(crate) k_cur_off: u32,
     pub(crate) v_cur_off: u32,
@@ -345,7 +346,6 @@ impl ActLayout {
 pub struct Pipelines {
     pub(crate) embed: wgpu::ComputePipeline,
     pub(crate) rms_norm: wgpu::ComputePipeline,
-    pub(crate) rope_neox: wgpu::ComputePipeline,
     pub(crate) matvec: wgpu::ComputePipeline,
     pub(crate) matvec_fused: wgpu::ComputePipeline,
     pub(crate) quantize: wgpu::ComputePipeline,
@@ -356,6 +356,7 @@ pub struct Pipelines {
     pub(crate) silu_mul: wgpu::ComputePipeline,
     pub(crate) topk_reduce: wgpu::ComputePipeline,
     pub(crate) kv_writeback_fused: wgpu::ComputePipeline,
+    pub(crate) q_norm_rope_fused: wgpu::ComputePipeline,
 }
 
 pub struct Buffers {
@@ -378,7 +379,6 @@ pub struct Buffers {
 pub struct BindGroupLayouts {
     pub(crate) embed: wgpu::BindGroupLayout,
     pub(crate) rms_norm: wgpu::BindGroupLayout,
-    pub(crate) rope: wgpu::BindGroupLayout,
     pub(crate) matvec: wgpu::BindGroupLayout,
     pub(crate) quantize: wgpu::BindGroupLayout,
     pub(crate) matmul: wgpu::BindGroupLayout,
@@ -388,6 +388,7 @@ pub struct BindGroupLayouts {
     pub(crate) silu_mul: wgpu::BindGroupLayout,
     pub(crate) topk_reduce: wgpu::BindGroupLayout,
     pub(crate) kv_writeback_fused: wgpu::BindGroupLayout,
+    pub(crate) q_norm_rope_fused: wgpu::BindGroupLayout,
 }
 
 /// Pre-built bind groups indexed by (BGL kind, weight buffer). The UBO binding
@@ -398,7 +399,6 @@ pub struct BindGroupLayouts {
 pub struct CachedBindGroups {
     pub(crate) embed: wgpu::BindGroup, // (uniform, w_embed, act, sample)
     pub(crate) rms_norm: wgpu::BindGroup, // (uniform, act, w_norms)
-    pub(crate) rope: wgpu::BindGroup,  // (uniform, rope_table, act)
     pub(crate) matvec_w_attn: wgpu::BindGroup, // (uniform, w_attn,   act)
     pub(crate) matvec_w_ffn_gu: wgpu::BindGroup, // (uniform, w_ffn_gu, act)
     pub(crate) matvec_w_ffn_d: wgpu::BindGroup, // (uniform, w_ffn_d,  act)
@@ -414,6 +414,7 @@ pub struct CachedBindGroups {
     pub(crate) silu_mul: wgpu::BindGroup, // (uniform, act)
     pub(crate) topk_reduce: wgpu::BindGroup, // (uniform, act, sample)
     pub(crate) kv_writeback_fused: wgpu::BindGroup, // (uniform, act, w_norms, rope_cs, kv_k, kv_v)
+    pub(crate) q_norm_rope_fused: wgpu::BindGroup, // (uniform, act, w_norms, rope_cs)
 }
 
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
@@ -1164,7 +1165,7 @@ impl Model {
         }
         if cfg.head_dim != 128 {
             return Err(PotError::Config(
-                "kv_writeback_fused.wgsl assumes head_dim == 128",
+                "kv_writeback_fused.wgsl / q_norm_rope_fused.wgsl assume head_dim == 128",
             ));
         }
         let nb_per_row = u64::from(cfg.kv_dim / 32);
@@ -1313,7 +1314,6 @@ impl Model {
         }
         let sh_embed = load_shader!("embed.wgsl");
         let sh_rms = load_shader!("rms_norm.wgsl");
-        let sh_rope = load_shader!("rope_neox.wgsl");
         let sh_matvec = load_shader!("matvec_q1_0.wgsl");
         let sh_matvec_fused = load_shader!("matvec_q1_0_fused.wgsl");
         let sh_quant = load_shader!("quantize_q8_0.wgsl");
@@ -1324,6 +1324,7 @@ impl Model {
         let sh_silu = load_shader!("silu_mul.wgsl");
         let sh_topk = load_shader!("topk_reduce.wgsl");
         let sh_kv_writeback_fused = load_shader!("kv_writeback_fused.wgsl");
+        let sh_q_norm_rope_fused = load_shader!("q_norm_rope_fused.wgsl");
 
         let make_bgl =
             |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {
@@ -1340,7 +1341,6 @@ impl Model {
         let bgls = BindGroupLayouts {
             embed: make_bgl("embed_bgl", 3, 0b010), // weights ro, act rw, sample ro
             rms_norm: make_bgl("rms_norm_bgl", 2, 0b01), // act rw, w ro
-            rope: make_bgl("rope_bgl", 2, 0b10),    // rope_cs ro, act rw
             matvec: make_bgl("matvec_bgl", 2, 0b10), // weights ro, act rw
             quantize: make_bgl("quantize_bgl", 2, 0b10), // act ro, outbuf rw
             matmul: make_bgl("matmul_bgl", 3, 0b100), // weights ro, acts ro, y rw
@@ -1350,6 +1350,7 @@ impl Model {
             silu_mul: make_bgl("silu_mul_bgl", 1, 0b1), // act rw
             topk_reduce: make_bgl("topk_reduce_bgl", 2, 0b10), // logits ro, result rw
             kv_writeback_fused: make_bgl("kv_writeback_fused_bgl", 5, 0b11000), // act ro, w_norms ro, rope_cs ro, kv_k rw, kv_v rw
+            q_norm_rope_fused: make_bgl("q_norm_rope_fused_bgl", 3, 0b001), // act rw, w_norms ro, rope_cs ro
         };
 
         let mk_pipe = |layout: &wgpu::BindGroupLayout,
@@ -1380,7 +1381,6 @@ impl Model {
         let pipes = Pipelines {
             embed: mk_pipe(&bgls.embed, &sh_embed, "embed"),
             rms_norm: mk_pipe(&bgls.rms_norm, &sh_rms, "rms_norm"),
-            rope_neox: mk_pipe(&bgls.rope, &sh_rope, "rope_neox"),
             matvec: mk_pipe(&bgls.matvec, &sh_matvec, "matvec"),
             matvec_fused: mk_pipe(&bgls.matvec, &sh_matvec_fused, "matvec_fused"),
             quantize: mk_pipe(&bgls.quantize, &sh_quant, "quantize"),
@@ -1394,6 +1394,11 @@ impl Model {
                 &bgls.kv_writeback_fused,
                 &sh_kv_writeback_fused,
                 "kv_writeback_fused",
+            ),
+            q_norm_rope_fused: mk_pipe(
+                &bgls.q_norm_rope_fused,
+                &sh_q_norm_rope_fused,
+                "q_norm_rope_fused",
             ),
         };
 
@@ -1666,11 +1671,6 @@ fn build_cached_bind_groups(
             &bgls.rms_norm,
             &[&buffers.act, &buffers.w_norms],
         ),
-        rope: mk(
-            "cached_rope",
-            &bgls.rope,
-            &[&buffers.rope_table, &buffers.act],
-        ),
         matvec_w_attn: mk(
             "cached_matvec_attn",
             &bgls.matvec,
@@ -1752,6 +1752,11 @@ fn build_cached_bind_groups(
                 &buffers.kv_k,
                 &buffers.kv_v,
             ],
+        ),
+        q_norm_rope_fused: mk(
+            "cached_q_norm_rope_fused",
+            &bgls.q_norm_rope_fused,
+            &[&buffers.act, &buffers.w_norms, &buffers.rope_table],
         ),
     }
 }
@@ -1848,7 +1853,6 @@ mod tests {
         let limit = UNIFORM_SLOT_SIZE as usize;
         assert!(size_of::<EmbedParams>() <= limit);
         assert!(size_of::<RmsNormParams>() <= limit);
-        assert!(size_of::<RopeParams>() <= limit);
         assert!(size_of::<MatvecParams>() <= limit);
         assert!(size_of::<MatvecFusedParams>() <= limit);
         assert!(size_of::<QuantParams>() <= limit);
@@ -1859,6 +1863,7 @@ mod tests {
         assert!(size_of::<SiluMulParams>() <= limit);
         assert!(size_of::<TopKParams>() <= limit);
         assert!(size_of::<KvWritebackFusedParams>() <= limit);
+        assert!(size_of::<QNormRopeFusedParams>() <= limit);
     }
 
     #[test]
