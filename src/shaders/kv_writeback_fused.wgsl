@@ -57,6 +57,7 @@ fn main(
   @builtin(subgroup_invocation_id) sg_inv_id: u32,
   @builtin(subgroup_id) sg_id: u32,
   @builtin(num_subgroups) num_subgroups: u32,
+  @builtin(subgroup_size) sg_size: u32,
 ) {
   let head = wg.x;
   let tok  = wg.y;
@@ -109,10 +110,12 @@ fn main(
 
   // ---- Per-32-block amax for K and V via subgroup butterfly ---------------
   // Replaces the 5-level shmem tree. Masks 1/2/4 are always safe
-  // (SUBGROUP_MIN_SIZE >= 8 is enforced at load time); 8/16 are gated on the
-  // baked SG_MIN_SIZE so the dead branches constant-fold away. After the
-  // butterfly each lane in a SG_MIN_SIZE-cluster holds that cluster's amax;
-  // when SG_MIN_SIZE < 32 a single shmem merge stitches per-32 results.
+  // (SUBGROUP_MIN_SIZE >= 8 is enforced at load time); 8/16 are gated by the
+  // larger of the baked min size and the runtime subgroup size, so AMD/NVIDIA
+  // (min >= 32) const-fold to the full 32-wide butterfly while Intel-class
+  // hardware (min=8) still picks up the wider butterfly when the actual size
+  // happens to be 16 or 32. The stitch path is taken only when no cluster
+  // covers a full 32-block; clusters there are sized by the runtime sg_size.
   var ak = abs(k_post);
   var av = abs(v_raw);
 
@@ -122,29 +125,30 @@ fn main(
   av = max(av, subgroupShuffleXor(av, 2u));
   ak = max(ak, subgroupShuffleXor(ak, 4u));
   av = max(av, subgroupShuffleXor(av, 4u));
-  if (SUBGROUP_MIN_SIZE >= 16u) {
+  if (SUBGROUP_MIN_SIZE >= 16u || sg_size >= 16u) {
     ak = max(ak, subgroupShuffleXor(ak, 8u));
     av = max(av, subgroupShuffleXor(av, 8u));
   }
-  if (SUBGROUP_MIN_SIZE >= 32u) {
+  if (SUBGROUP_MIN_SIZE >= 32u || sg_size >= 32u) {
     ak = max(ak, subgroupShuffleXor(ak, 16u));
     av = max(av, subgroupShuffleXor(av, 16u));
   }
-  if (SUBGROUP_MIN_SIZE < 32u) {
+  if (SUBGROUP_MIN_SIZE < 32u && sg_size < 32u) {
     // Stitch the in-subgroup partials into per-32 blocks. Each cluster of
-    // SG_MIN_SIZE lanes contributes one entry; a 32-block spans
-    // 32/SG_MIN_SIZE entries (2 for SG=16, 4 for SG=8).
-    let sg_lane = tid % SUBGROUP_MIN_SIZE;
-    let cluster_id = tid / SUBGROUP_MIN_SIZE;
+    // sg_size lanes contributes one entry; a 32-block spans 32/sg_size
+    // entries (2 for sg_size=16, 4 for sg_size=8).
+    let sg_lane = tid % sg_size;
+    let cluster_id = tid / sg_size;
     if (sg_lane == 0u) {
       sg_partial[cluster_id] = vec2<f32>(ak, av);
     }
     workgroupBarrier();
     let group_id = tid >> 5u;
-    let g_base = group_id * (32u / SUBGROUP_MIN_SIZE);
+    let per_group = 32u / sg_size;
+    let g_base = group_id * per_group;
     var mk: f32 = 0.0;
     var mv: f32 = 0.0;
-    for (var i: u32 = 0u; i < 32u / SUBGROUP_MIN_SIZE; i = i + 1u) {
+    for (var i: u32 = 0u; i < per_group; i = i + 1u) {
       let m = sg_partial[g_base + i];
       mk = max(mk, m.x);
       mv = max(mv, m.y);
