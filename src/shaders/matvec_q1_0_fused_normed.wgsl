@@ -16,11 +16,14 @@ enable f16;
 // collapse into 1 — saves 72 dispatches/step at n_layer=36 plus the global
 // x_norm round-trip.
 //
-// Per-WG layout matches matvec_q1_0_fused.wgsl: WG_X=8 threads cooperate per
-// row, ROWS_PER_WG=8 rows per workgroup. Range sizes (n_0, n_1, n_2) must all
-// be multiples of ROWS_PER_WG so no workgroup straddles a range boundary.
-// Activation `x` is staged into LDS in full (no tiling) so x_sh covers the
-// full row of normed-and-weighted x for the inner loop.
+// Per-WG layout: WG_X=8 threads cooperate per row, ROWS_PER_WG=16 rows per
+// workgroup (WG=128, i.e. 2 wave64 / 4 wave32). Tuned vs. the unfused
+// matvec_q1_0_fused.wgsl: amortizing the full-row x_sh load across more rows
+// pays for itself once the LDS stage absorbs the rms-norm reduction. Range
+// sizes (n_0, n_1, n_2) must all be multiples of ROWS_PER_WG so no workgroup
+// straddles a range boundary. Activation `x` is staged into LDS in full (no
+// tiling) so x_sh covers the full row of normed-and-weighted x for the inner
+// loop.
 
 struct Params {
   k: u32,
@@ -49,7 +52,7 @@ fn load_f16_at(b_offset: u32) -> f32 {
 }
 
 const WG_X: u32 = 8u;
-const WG_Y: u32 = 8u;
+const WG_Y: u32 = 16u;
 const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
 

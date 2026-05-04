@@ -307,7 +307,7 @@ fn dispatch_matvec_q1_0_silu(
     out_off: u32,
     accumulate: bool,
 ) {
-    const ROWS_PER_WG: u32 = 8;
+    const ROWS_PER_WG: u32 = 16;
     let n_wg = n.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
     let dispatch_y = n_wg.div_ceil(dispatch_x);
@@ -342,10 +342,10 @@ fn dispatch_matvec_q1_0_fused_normed(
     weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
-    const ROWS_PER_WG: u32 = 8;
+    const ROWS_PER_WG: u32 = 16;
     debug_assert!(ranges.len() == 2 || ranges.len() == 3);
     for (_, _, n, _) in ranges {
-        debug_assert!(n % 8 == 0);
+        debug_assert!(n % ROWS_PER_WG == 0);
     }
     let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
     let (d0, qs0, n0, o0) = r(0);

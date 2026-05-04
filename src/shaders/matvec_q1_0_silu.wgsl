@@ -37,7 +37,7 @@ fn load_f16_at(b_offset: u32) -> f32 {
 }
 
 const WG_X: u32 = 8u;
-const WG_Y: u32 = 8u;
+const WG_Y: u32 = 16u;
 const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
 
