@@ -2008,10 +2008,10 @@ pub mod bench_internals {
 
         println!();
         println!(
-            "| kernel                              | calls/step | raw us | adj us | raw ms | adj ms | %step |"
+            "| kernel                                        | calls/step | raw us | adj us | raw ms | adj ms | %step |"
         );
         println!(
-            "|-------------------------------------|-----------:|-------:|-------:|-------:|-------:|------:|"
+            "|-----------------------------------------------|-----------:|-------:|-------:|-------:|-------:|------:|"
         );
         for (label, calls, raw_us) in &sorted {
             let adj_us = raw_us * scale;
@@ -2019,14 +2019,14 @@ pub mod bench_internals {
             let adj_ms = (*calls as f32) * adj_us / 1000.0;
             let pct = 100.0 * adj_ms / adj_total_ms;
             println!(
-                "| {label:<35} | {calls:>10} | {raw_us:>6.2} | {adj_us:>6.2} | {raw_ms:>6.3} | {adj_ms:>6.3} | {pct:>5.1} |"
+                "| {label:<45} | {calls:>10} | {raw_us:>6.2} | {adj_us:>6.2} | {raw_ms:>6.3} | {adj_ms:>6.3} | {pct:>5.1} |"
             );
         }
         println!(
-            "|-------------------------------------|-----------:|-------:|-------:|-------:|-------:|------:|"
+            "|-----------------------------------------------|-----------:|-------:|-------:|-------:|-------:|------:|"
         );
         println!(
-            "| TOTAL (isolated)                    |            |        |        | {raw_total_ms:>6.3} | {adj_total_ms:>6.3} |       |"
+            "| TOTAL (isolated)                              |            |        |        | {raw_total_ms:>6.3} | {adj_total_ms:>6.3} |       |"
         );
         println!();
         println!("raw (isolated):           {:.1} t/s", 1000.0 / raw_total_ms);
