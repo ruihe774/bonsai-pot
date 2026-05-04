@@ -156,7 +156,8 @@ impl<'m> Session<'m> {
             });
         }
         let k = effective_k(sampler);
-        let (logits, indices) = forward::prefill_matmul_topk(self.model, tokens, self.pos, k)?;
+        let (logits, indices) =
+            forward::prefill_matmul_topk(self.model, tokens, self.pos, k, &mut forward::NoMarker)?;
         let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
         self.pos += n;
         Ok(chosen)

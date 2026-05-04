@@ -55,9 +55,9 @@ MODES:
                            Reads u32 prompt tokens from stdin.
     --mode prompt          Batched matmul prefill, then matvec generation.
                            Reads u32 prompt tokens from stdin.
-    --mode bench           Print an llama-bench-style pp/tg t/s table.
+    --mode bench           Print a pp/tg table with wall-clock and GPU t/s.
                            No stdin input required.
-    --mode microbench      Per-kernel us/call breakdown for a tg step.
+    --mode microbench      Per-kernel GPU-timestamp breakdown for a tg step.
                            No stdin input required.
 
 GEN/PROMPT OPTIONS:

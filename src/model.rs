@@ -370,6 +370,12 @@ pub struct Buffers {
     pub(crate) rope_table: wgpu::Buffer,
     pub(crate) sample: wgpu::Buffer, // u32 storage: input token id @ [0..M], topk output @ [0..2K]
     pub(crate) readback: wgpu::Buffer, // u32 readback (mappable)
+    #[cfg(feature = "bench-internals")]
+    pub(crate) bench_query_set: wgpu::QuerySet,
+    #[cfg(feature = "bench-internals")]
+    pub(crate) bench_resolve: wgpu::Buffer, // QUERY_RESOLVE | COPY_SRC
+    #[cfg(feature = "bench-internals")]
+    pub(crate) bench_readback: wgpu::Buffer, // COPY_DST | MAP_READ
 }
 
 pub struct BindGroupLayouts {
@@ -490,10 +496,16 @@ pub struct Model {
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
     pub(crate) lost: Arc<OnceLock<DeviceLostInfo>>,
+    #[cfg(feature = "bench-internals")]
+    pub(crate) bench_ts_period_ns: f32,
 }
 
 const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
+/// Number of timestamp query slots allocated for bench/microbench.
+/// Must be >= max marks per step (`n_layer` * 8 + 5 for the matvec path).
+#[cfg(feature = "bench-internals")]
+pub const BENCH_QS_SLOTS: u32 = 2048;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.wgsl`.
 pub const ATTN_CHUNK_SIZE: u32 = 32;
@@ -894,6 +906,19 @@ impl Model {
         if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
             return Err(PotError::FeatureUnsupported("IMMEDIATES"));
         }
+        #[cfg(feature = "bench-internals")]
+        if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return Err(PotError::FeatureUnsupported("TIMESTAMP_QUERY"));
+        }
+        #[cfg(feature = "bench-internals")]
+        if !adapter
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+        {
+            return Err(PotError::FeatureUnsupported(
+                "TIMESTAMP_QUERY_INSIDE_PASSES",
+            ));
+        }
 
         let info = adapter.get_info();
         log::info!(
@@ -917,11 +942,20 @@ impl Model {
         // (MatvecFusedNormedParams, 72 bytes) with generous headroom.
         limits.max_immediate_size = limits.max_immediate_size.max(128);
 
+        let required_features =
+            wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP | wgpu::Features::IMMEDIATES | {
+                #[cfg(feature = "bench-internals")]
+                {
+                    wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                }
+                #[cfg(not(feature = "bench-internals"))]
+                {
+                    wgpu::Features::empty()
+                }
+            };
         let desc = wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::SHADER_F16
-                | wgpu::Features::SUBGROUP
-                | wgpu::Features::IMMEDIATES,
+            required_features,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -1232,6 +1266,27 @@ impl Model {
             mapped_at_creation: false,
         });
 
+        #[cfg(feature = "bench-internals")]
+        let bench_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("bench_qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: BENCH_QS_SLOTS,
+        });
+        #[cfg(feature = "bench-internals")]
+        let bench_resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench_resolve"),
+            size: u64::from(BENCH_QS_SLOTS) * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        #[cfg(feature = "bench-internals")]
+        let bench_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bench_readback"),
+            size: u64::from(BENCH_QS_SLOTS) * 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
         let buffers = Buffers {
             w_attn,
             w_ffn_gu,
@@ -1246,6 +1301,12 @@ impl Model {
             rope_table: rope_buf,
             sample,
             readback,
+            #[cfg(feature = "bench-internals")]
+            bench_query_set,
+            #[cfg(feature = "bench-internals")]
+            bench_resolve,
+            #[cfg(feature = "bench-internals")]
+            bench_readback,
         };
 
         // ---- shaders & pipelines -------------------------------------------
@@ -1528,6 +1589,9 @@ impl Model {
         // this size is correct for every dispatch that reuses the cached BG.
         let cached = build_cached_bind_groups(&device, &bgls, &buffers);
 
+        #[cfg(feature = "bench-internals")]
+        let bench_ts_period_ns = queue.get_timestamp_period();
+
         Ok(Self {
             device,
             queue,
@@ -1542,6 +1606,8 @@ impl Model {
             output_tensors,
             vocab,
             lost,
+            #[cfg(feature = "bench-internals")]
+            bench_ts_period_ns,
         })
     }
 

@@ -50,6 +50,23 @@ const fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
     (d_word, qs_byte)
 }
 
+// ---------- step-encoder marker --------------------------------------------
+// Generic hook for instrumenting `encode_step_matvec` / `prefill_matmul_topk`
+// without forking them. Production passes `&mut NoMarker` (zero-cost: the
+// trait method is `#[inline(always)]` and the body is empty, so the compiler
+// drops the call entirely). Bench builds (`bench-internals`) provide a
+// `BenchMarker` impl that writes GPU timestamps; see further down.
+
+pub trait StepMarker {
+    fn mark(&mut self, pass: &mut wgpu::ComputePass<'_>, label: &'static str);
+}
+
+pub struct NoMarker;
+impl StepMarker for NoMarker {
+    #[inline(always)]
+    fn mark(&mut self, _pass: &mut wgpu::ComputePass<'_>, _label: &'static str) {}
+}
+
 // ---------- per-step encoder ------------------------------------------------
 
 pub struct StepEncoder<'a> {
@@ -574,12 +591,13 @@ pub fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)>
 /// indices land at `sample[base..base + 2*k]`. If `topk_out = None`, the
 /// suffix is skipped — useful for KV-fill-only steps (e.g. mid-prefill) where
 /// the sampled token isn't read.
-pub fn encode_step_matvec(
+pub fn encode_step_matvec<M: StepMarker>(
     se: &mut StepEncoder,
     cfg: &Config,
     sample_in: u32,
     topk_out: Option<(u32, u32)>,
     pos: u32,
+    marker: &mut M,
 ) {
     let StepEncoder { model: m, encoder } = se;
     let ot = &m.output_tensors;
@@ -587,6 +605,8 @@ pub fn encode_step_matvec(
         label: Some("step_matvec"),
         timestamp_writes: None,
     });
+    marker.mark(&mut pass, "start");
+
     // embed
     {
         let p = EmbedParams {
@@ -601,8 +621,10 @@ pub fn encode_step_matvec(
         pass.set_immediates(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(1, 1, 1);
     }
+    marker.mark(&mut pass, "embed");
+
     for il in 0..cfg.n_layer {
-        layer_pre_kv_in_pass(m, cfg, &mut pass, il, pos);
+        layer_pre_kv_in_pass(m, cfg, &mut pass, il, pos, marker);
         // Fused: K (rms_norm + *w_k_norm + RoPE + Q8_0 quantize) and V (Q8_0
         // quantize) → write both into kv_{k,v}. Replaces the previous
         // rms_norm(K) + rope(K) + kv_writeback trio (3 dispatches → 1).
@@ -618,7 +640,8 @@ pub fn encode_step_matvec(
             pos,
             1,
         );
-        layer_post_kv_in_pass(m, cfg, &mut pass, il, pos);
+        marker.mark(&mut pass, "kv_writeback");
+        layer_post_kv_in_pass(m, cfg, &mut pass, il, pos, marker);
     }
     if let Some((topk_out_u32_base, k)) = topk_out {
         // output suffix: rms_norm in-place on x, then LM head reads
@@ -633,6 +656,8 @@ pub fn encode_step_matvec(
             m.act_layout.x,
             ot.output_norm_off,
         );
+        marker.mark(&mut pass, "output_norm");
+
         dispatch_matvec_q1_0(
             m,
             &mut pass,
@@ -645,6 +670,8 @@ pub fn encode_step_matvec(
             m.act_layout.logits,
             false,
         );
+        marker.mark(&mut pass, "lm_head");
+
         dispatch_topk_reduce(
             m,
             &mut pass,
@@ -653,6 +680,7 @@ pub fn encode_step_matvec(
             m.act_layout.logits,
             topk_out_u32_base,
         );
+        marker.mark(&mut pass, "topk_reduce");
     }
     drop(pass);
 }
@@ -671,7 +699,7 @@ pub fn encode_step_matvec(
 pub fn build_step_matvec_topk_cb(model: &Model, pos: u32, k: u32) -> wgpu::CommandBuffer {
     let k = k.clamp(1, TOPK_MAX);
     let mut se = StepEncoder::new(model);
-    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos);
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos, &mut NoMarker);
     se.copy_sample_to_readback(u64::from(k) * 8);
     se.finish()
 }
@@ -705,18 +733,19 @@ pub fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     let mut se = StepEncoder::new(model);
     // We still encode the topk_reduce dispatch (with k=1, the single argmax case)
     // so the timing reflects real generation cost; we just skip the readback.
-    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos);
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut NoMarker);
     let cb = se.finish();
     model.queue.submit(Some(cb));
 }
 
 /// Pre-KV-copy block of one layer: `rms_norm` → QKV fused → q/k norms → rope.
-fn layer_pre_kv_in_pass(
+fn layer_pre_kv_in_pass<M: StepMarker>(
     model: &Model,
     cfg: &Config,
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     pos: u32,
+    marker: &mut M,
 ) {
     let lt = &model.layer_tensors[il as usize];
     // Fused: rms_norm(x) * w_attn_norm → matvec_q1_0_fused (QKV).
@@ -737,6 +766,7 @@ fn layer_pre_kv_in_pass(
             (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
         ],
     );
+    marker.mark(pass, "qkv_fused_normed");
 
     // Q's rms_norm + *w_q_norm + NEOX-RoPE, written back into act.q in place.
     // K's rms_norm + RoPE + Q8_0 quantize + writeback into kv_k, plus V's
@@ -751,16 +781,18 @@ fn layer_pre_kv_in_pass(
         pos,
         1,
     );
+    marker.mark(pass, "q_norm_rope");
 }
 
 /// Post-KV-copy block of one layer: attention → Wo (resid) → `ffn_norm`
 /// → gate-up fused → `silu_mul` → Wd (resid).
-fn layer_post_kv_in_pass(
+fn layer_post_kv_in_pass<M: StepMarker>(
     model: &Model,
     cfg: &Config,
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     pos: u32,
+    marker: &mut M,
 ) {
     let lt = &model.layer_tensors[il as usize];
 
@@ -788,6 +820,7 @@ fn layer_post_kv_in_pass(
         pass.set_bind_group(0, &model.cached.attn_split, &[]);
         pass.set_immediates(0, bytemuck::bytes_of(&ps));
         pass.dispatch_workgroups(cfg.n_kv_head, n_chunks_active, 1);
+        marker.mark(pass, "attn_split");
 
         let pm = AttnMergeParams {
             head_dim: cfg.head_dim,
@@ -799,6 +832,7 @@ fn layer_post_kv_in_pass(
         pass.set_bind_group(0, &model.cached.attn_merge, &[]);
         pass.set_immediates(0, bytemuck::bytes_of(&pm));
         pass.dispatch_workgroups(cfg.n_head, 1, 1);
+        marker.mark(pass, "attn_merge");
     }
 
     dispatch_matvec_q1_0(
@@ -813,6 +847,7 @@ fn layer_post_kv_in_pass(
         model.act_layout.x,
         true, /*accumulate*/
     );
+    marker.mark(pass, "wo");
 
     // Fused: rms_norm(x) * w_ffn_norm → matvec_q1_0_fused (gate+up).
     // Replaces a 2-dispatch sequence (rms_norm, matvec_q1_0_fused).
@@ -829,6 +864,7 @@ fn layer_post_kv_in_pass(
             (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
         ],
     );
+    marker.mark(pass, "gate_up_fused_normed");
 
     // Fused: silu(gate) * up on the input side of Wd, in one dispatch (no
     // ffn_in round-trip, no standalone silu_mul). The standalone silu_mul
@@ -847,6 +883,7 @@ fn layer_post_kv_in_pass(
         model.act_layout.x,
         true, /*accumulate*/
     );
+    marker.mark(pass, "wd_silu");
 }
 
 /// Run the matvec single-token path over every token in `prompt`, advancing
@@ -898,6 +935,7 @@ pub fn prefill_matvec_loop_topk(
                 /*sample_in=*/ i as u32,
                 /*topk_out=*/ None,
                 /*pos=*/ pos_base + t as u32,
+                &mut NoMarker,
             );
         }
         let cb = se.finish();
@@ -912,11 +950,12 @@ pub fn prefill_matvec_loop_topk(
 /// Advances pos from 0 to `prompt.len()`. Returns top-K candidates from the
 /// last token's logits. Requires `pos_base == 0` (the matmul attention shader
 /// assumes a fresh cache).
-pub fn prefill_matmul_topk(
+pub fn prefill_matmul_topk<M: StepMarker>(
     model: &Model,
     prompt: &[u32],
     pos_base: u32,
     k: u32,
+    marker: &mut M,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     if pos_base != 0 {
         // Caller must use prefill_matvec_loop_topk for incremental prefill.
@@ -949,6 +988,7 @@ pub fn prefill_matmul_topk(
             label: Some("prefill_matmul"),
             timestamp_writes: None,
         });
+        marker.mark(&mut pass, "start");
 
         // Phase 1: embed all M tokens (one dispatch).
         let p = EmbedParams {
@@ -993,6 +1033,7 @@ pub fn prefill_matmul_topk(
             false,
         );
         dispatch_topk_reduce(model, &mut pass, cfg.n_vocab, k, model.act_layout.logits, 0);
+        marker.mark(&mut pass, "prefill_pass_end");
     }
 
     // Phase 4: append readback copy so it ships with this same command buffer.
@@ -1190,6 +1231,122 @@ fn layer_step_matmul_in_pass(
 // stays a child module of `forward` so the helpers can reach private items
 // here via `super::`.
 // =========================================================================
+
+/// GPU timestamp marker for bench / microbench measurement.
+///
+/// Call [`BenchMarker::mark`] between dispatches inside a compute pass to write
+/// GPU-side timestamps. After the command buffer containing those dispatches has
+/// been submitted and fully polled (GPU done), call [`BenchMarker::resolve`] to
+/// read the per-span durations in nanoseconds.
+///
+/// Each `BenchMarker` reuses `model.buffers.bench_query_set` starting from slot 0,
+/// so only one `BenchMarker` may be live at a time (the previous one must be
+/// resolved before a new one is marked into the same query set).
+#[cfg(feature = "bench-internals")]
+pub struct BenchMarker<'m> {
+    model: &'m Model,
+    next_idx: u32,
+    labels: Vec<&'static str>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl<'m> BenchMarker<'m> {
+    pub const fn new(model: &'m Model) -> Self {
+        Self {
+            model,
+            next_idx: 0,
+            labels: Vec::new(),
+        }
+    }
+
+    /// After the step CB has been submitted and polled (GPU work done),
+    /// resolve all timestamps and return `(label, duration_ns)` spans.
+    /// Each span is the GPU time between the previous and current mark.
+    /// The "start" sentinel is consumed but not returned as a span.
+    pub fn resolve(self) -> Result<Vec<(&'static str, f32)>> {
+        use core::result::Result as StdResult;
+        use std::sync::{Arc, OnceLock};
+
+        use wgpu::{BufferAsyncError, MapMode, PollType};
+
+        type MapResult = StdResult<(), BufferAsyncError>;
+
+        let n = self.next_idx;
+        if n < 2 {
+            return Ok(vec![]);
+        }
+        let bytes = u64::from(n) * 8;
+
+        let mut enc = self
+            .model
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bench_resolve"),
+            });
+        enc.resolve_query_set(
+            &self.model.buffers.bench_query_set,
+            0..n,
+            &self.model.buffers.bench_resolve,
+            0,
+        );
+        enc.copy_buffer_to_buffer(
+            &self.model.buffers.bench_resolve,
+            0,
+            &self.model.buffers.bench_readback,
+            0,
+            bytes,
+        );
+        self.model.queue.submit(Some(enc.finish()));
+
+        let slice = self.model.buffers.bench_readback.slice(0..bytes);
+        let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
+        let slot2 = slot.clone();
+        slice.map_async(MapMode::Read, move |res| {
+            let _ = slot2.set(res);
+        });
+        if let Err(e) = self.model.device.poll(PollType::wait_indefinitely()) {
+            self.model.check_device()?;
+            return Err(PotError::Poll(e));
+        }
+        match slot.get() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                self.model.check_device()?;
+                return Err(PotError::BufferMap(e.clone()));
+            }
+            None => unreachable!("bench map_async callback did not fire before poll returned"),
+        }
+
+        let data = slice.get_mapped_range();
+        let ticks: &[u64] = bytemuck::cast_slice(&data[..bytes as usize]);
+        let period = self.model.bench_ts_period_ns;
+        let mut spans: Vec<(&'static str, f32)> = Vec::with_capacity((n - 1) as usize);
+        for i in 1..n as usize {
+            let dt_ns = ticks[i].saturating_sub(ticks[i - 1]) as f32 * period;
+            spans.push((self.labels[i], dt_ns));
+        }
+        drop(data);
+        self.model.buffers.bench_readback.unmap();
+        Ok(spans)
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl StepMarker for BenchMarker<'_> {
+    /// Write a GPU timestamp at the current slot and associate `label` with it.
+    /// The label conventionally names the kernel that just COMPLETED (the slot
+    /// before the first label is the pass start sentinel named "start").
+    fn mark(&mut self, pass: &mut wgpu::ComputePass<'_>, label: &'static str) {
+        use crate::model::BENCH_QS_SLOTS;
+        assert!(
+            self.next_idx < BENCH_QS_SLOTS,
+            "BenchMarker: exceeded BENCH_QS_SLOTS"
+        );
+        pass.write_timestamp(&self.model.buffers.bench_query_set, self.next_idx);
+        self.labels.push(label);
+        self.next_idx += 1;
+    }
+}
 
 #[cfg(feature = "bench-internals")]
 #[path = "bench.rs"]
