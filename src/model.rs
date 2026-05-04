@@ -122,8 +122,10 @@ pub struct RmsNormParams {
     pub(crate) output_offset: u32,
     pub(crate) weight_offset: u32,
     pub(crate) eps: f32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
+    pub(crate) input_offset_1: u32,
+    pub(crate) output_offset_1: u32,
+    pub(crate) weight_offset_1: u32,
+    pub(crate) n_groups_0: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -133,8 +135,8 @@ pub struct RopeParams {
     pub(crate) n_tokens: u32,
     pub(crate) pos_base: u32,
     pub(crate) data_offset: u32,
-    pub(crate) _p0: u32,
-    pub(crate) _p1: u32,
+    pub(crate) data_offset_1: u32,
+    pub(crate) n_heads_0: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
