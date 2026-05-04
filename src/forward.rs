@@ -859,36 +859,43 @@ pub fn prefill_matvec_loop_topk(
     pos_base: u32,
     k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
+    // Fill the KV cache for the (n - 1) non-last tokens by chunking them into
+    // separate command buffers + submits. Two reasons we don't pack the whole
+    // thing into one CB:
+    //   1. The `sample` buffer holds only 1024 u32 input slots, so a single
+    //      up-front write capped at `rest.len() == n - 1` would overflow on
+    //      long re-prefills (e.g. Qwen3 thinking strip-and-rewind in
+    //      examples/chat.rs, which can re-feed > 1k tokens at once).
+    //   2. A single command buffer that encodes hundreds of full
+    //      transformer-step passes can exceed the GPU's lockup-detection
+    //      timeout on wider models (8B), causing a context loss.
+    // CHUNK is chosen so each submit is well under both limits and the
+    // per-submit overhead (~tens of µs) is negligible vs. the in-CB work.
+    const CHUNK: usize = 256;
     let Some((&last, rest)) = prompt.split_last() else {
         return Err(PotError::PrefillTooLarge {
             n: 0,
             max: model.m_max,
         });
     };
-    // For the (n - 1) non-last tokens we just need to fill the KV cache; we
-    // can encode them all back-to-back into a SINGLE command buffer + submit,
-    // then run the final token through `step_matvec_topk` (which does the
-    // CPU readback for sampling).
-    if !rest.is_empty() {
-        // One up-front write covers every non-last token's input slot. The
-        // embed shader for step `i` reads `sample[i]`. We pass `topk_out=None`
-        // for these steps so the suffix (output_norm + LM head + topk_reduce)
-        // is skipped — those logits are thrown away anyway, and skipping the
-        // topk avoids it stomping on the prompt region of `sample` for prompts
-        // longer than the previous TOPK_SCRATCH_BASE (768) workaround allowed.
+    // We pass `topk_out=None` for these steps so the suffix
+    // (output_norm + LM head + topk_reduce) is skipped — those logits are
+    // thrown away anyway, and skipping the topk avoids it stomping on the
+    // prompt region of `sample`.
+    for chunk_start in (0..rest.len()).step_by(CHUNK) {
+        let chunk_end = (chunk_start + CHUNK).min(rest.len());
+        let chunk = &rest[chunk_start..chunk_end];
+        // Write this chunk's tokens to sample[0..chunk.len()]; the embed
+        // shader for step `i` reads `sample[i]`.
         model
             .queue
-            .write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(rest));
-        // With immediates there is no per-submit slot budget; all non-last steps
-        // go into a single command buffer. KV-cache writes from earlier layers
-        // are visible to later dispatches via wgpu's storage-buffer barriers
-        // at compute-pass boundaries.
+            .write_buffer(&model.buffers.sample, 0, bytemuck::cast_slice(chunk));
         let mut se = StepEncoder::new(model);
-        for t in 0..rest.len() {
+        for (i, t) in (chunk_start..chunk_end).enumerate() {
             encode_step_matvec(
                 &mut se,
                 &model.cfg,
-                /*sample_in=*/ t as u32,
+                /*sample_in=*/ i as u32,
                 /*topk_out=*/ None,
                 /*pos=*/ pos_base + t as u32,
             );
