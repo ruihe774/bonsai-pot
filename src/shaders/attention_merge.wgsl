@@ -26,27 +26,26 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> act: array<f16>;
 @group(0) @binding(2) var<storage, read> partials: array<f32>;
 
-const SG_SIZE: u32 = {{SG_SIZE}}u;
+const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 64u;
-const N_SG: u32 = WG / SG_SIZE;
+const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 const ELEMS_PER_THREAD: u32 = 2u;
 const PARTIAL_STRIDE: u32 = 130u;  // head_dim + 2
 // Cap on chunk count we keep weights for in shmem. n_chunks = ceil(pos/32).
-// Runtime-baked from opts.max_seq at shader-load time (like {{SG_SIZE}}).
+// Runtime-baked from opts.max_seq at shader-load time (like {{SUBGROUP_MIN_SIZE}}).
 const MAX_CHUNKS: u32 = {{MAX_CHUNKS}}u;
 
-var<workgroup> sg_partial: array<f32, N_SG>;
+var<workgroup> sg_partial: array<f32, SG_PARTIAL_MAX>;
 var<workgroup> weights_sh: array<f32, MAX_CHUNKS>;
 
-fn wg_max(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
+fn wg_max(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_m = subgroupMax(local);
-  if (N_SG == 1u) { return sg_m; }
-  let sg_id = tid / SG_SIZE;
+  if (num_subgroups == 1u) { return sg_m; }
   if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_m; }
   workgroupBarrier();
   if (sg_id == 0u) {
     var combined: f32 = -1e30;
-    if (sg_inv_id < N_SG) { combined = sg_partial[sg_inv_id]; }
+    if (sg_inv_id < num_subgroups) { combined = sg_partial[sg_inv_id]; }
     let final_m = subgroupMax(combined);
     if (sg_inv_id == 0u) { sg_partial[0] = final_m; }
   }
@@ -54,15 +53,14 @@ fn wg_max(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
   return sg_partial[0];
 }
 
-fn wg_sum(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
+fn wg_sum(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_s = subgroupAdd(local);
-  if (N_SG == 1u) { return sg_s; }
-  let sg_id = tid / SG_SIZE;
+  if (num_subgroups == 1u) { return sg_s; }
   if (sg_inv_id == 0u) { sg_partial[sg_id] = sg_s; }
   workgroupBarrier();
   if (sg_id == 0u) {
     var combined: f32;
-    if (sg_inv_id < N_SG) { combined = sg_partial[sg_inv_id]; }
+    if (sg_inv_id < num_subgroups) { combined = sg_partial[sg_inv_id]; }
     let final_s = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial[0] = final_s; }
   }
@@ -75,6 +73,8 @@ fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_inv_id: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(num_subgroups) num_subgroups: u32,
 ) {
   let h = wg.x;
   if (h >= p.n_head) { return; }
@@ -88,7 +88,7 @@ fn main(
   for (var c: u32 = tid; c < n; c += WG) {
     m_local = max(m_local, partials[head_base + c * PARTIAL_STRIDE + hd]);
   }
-  let m_global = wg_max(m_local, tid, sg_inv_id);
+  let m_global = wg_max(m_local, sg_id, sg_inv_id, num_subgroups);
 
   // Phase B: parallel weight precompute + parallel l_global reduction.
   var l_local: f32;
@@ -100,7 +100,7 @@ fn main(
     weights_sh[c] = w;
     l_local = l_local + l_c * w;
   }
-  let l_global = wg_sum(l_local, tid, sg_inv_id);
+  let l_global = wg_sum(l_local, sg_id, sg_inv_id, num_subgroups);
 
   // Phase C: per-thread o accumulation using precomputed weights. The per-d
   // loops below assume head_dim == ELEMS_PER_THREAD * WG (true for the Bonsai

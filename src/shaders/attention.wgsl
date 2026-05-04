@@ -6,10 +6,10 @@ enable f16;
 //
 // The outer scan over the K/V cache is unrolled by UNROLL=4: each iteration
 // loads four cache positions worth of K, computes four Q·K dots packed into
-// one vec4<f32> reduced via a single subgroupAdd (with a templated cross-
-// subgroup merge for SG_SIZE < WG), and then runs four sequential online-
-// softmax updates / V accumulations per reduction. This amortizes the
-// per-iteration reduction cost and keeps multiple K/V loads in flight.
+// one vec4<f32> reduced via a single subgroupAdd (with a runtime cross-subgroup
+// merge when num_subgroups > 1), and then runs four sequential online-softmax
+// updates / V accumulations per reduction. This amortizes the per-iteration
+// reduction cost and keeps multiple K/V loads in flight.
 //
 // K/V cache is Q8_0: per 32 contiguous elements of the kv-row we have one
 // FP32 scale (in the d-section) and 32 packed i8 values (in the qs-section).
@@ -47,27 +47,26 @@ struct Params {
 @group(0) @binding(2) var<storage, read> k_cache: array<u32>;
 @group(0) @binding(3) var<storage, read> v_cache: array<u32>;
 
-const SG_SIZE: u32 = {{SG_SIZE}}u;
+const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 64u;
-const N_SG: u32 = WG / SG_SIZE;
+const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
 const UNROLL: u32 = 4u;
 
-// Cross-subgroup partial slots; unused (and dead-coded out) when N_SG == 1.
-var<workgroup> sg_partial4: array<vec4<f32>, N_SG>;
-var<workgroup> sg_partial1: array<f32, N_SG>;
+// Cross-subgroup partial slots; unused (fast-path taken) when num_subgroups == 1.
+var<workgroup> sg_partial4: array<vec4<f32>, SG_PARTIAL_MAX>;
+var<workgroup> sg_partial1: array<f32, SG_PARTIAL_MAX>;
 
-fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
+fn wg_sum_v4(local: vec4<f32>, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> vec4<f32> {
   let sg_sum = subgroupAdd(local);
-  if (N_SG == 1u) {
+  if (num_subgroups == 1u) {
     return sg_sum;
   }
-  let sg_id = tid / SG_SIZE;
   if (sg_inv_id == 0u) { sg_partial4[sg_id] = sg_sum; }
   workgroupBarrier();
   if (sg_id == 0u) {
     var combined = vec4<f32>(0.0);
-    if (sg_inv_id < N_SG) { combined = sg_partial4[sg_inv_id]; }
+    if (sg_inv_id < num_subgroups) { combined = sg_partial4[sg_inv_id]; }
     let final_sum = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial4[0] = final_sum; }
   }
@@ -75,17 +74,16 @@ fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
   return sg_partial4[0];
 }
 
-fn wg_sum_f32(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
+fn wg_sum_f32(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_sum = subgroupAdd(local);
-  if (N_SG == 1u) {
+  if (num_subgroups == 1u) {
     return sg_sum;
   }
-  let sg_id = tid / SG_SIZE;
   if (sg_inv_id == 0u) { sg_partial1[sg_id] = sg_sum; }
   workgroupBarrier();
   if (sg_id == 0u) {
     var combined: f32;
-    if (sg_inv_id < N_SG) { combined = sg_partial1[sg_inv_id]; }
+    if (sg_inv_id < num_subgroups) { combined = sg_partial1[sg_inv_id]; }
     let final_sum = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial1[0] = final_sum; }
   }
@@ -123,6 +121,8 @@ fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_inv_id: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(num_subgroups) num_subgroups: u32,
 ) {
   let h = wg.x;
   let m_tok = wg.y;
@@ -158,8 +158,8 @@ fn main(
       let k3 = load_k(t + 3u, e_local);
       local = local + q * vec4<f32>(k0, k1, k2, k3);
     }
-    // Workgroup-wide reduction (one subgroupAdd if SG covers WG, else two-step).
-    let dots = wg_sum_v4(local, tid, sg_inv_id);
+    // Workgroup-wide reduction (one subgroupAdd if num_subgroups==1, else two-step).
+    let dots = wg_sum_v4(local, sg_id, sg_inv_id, num_subgroups);
 
     // 2) Sequential online-softmax + V accumulation for the four positions.
     let scores = dots * p.scale;
@@ -187,7 +187,7 @@ fn main(
     for (var d: u32 = tid; d < hd; d += WG) {
       local_dot = local_dot + f32(act[q_base + d]) * load_k(t, g_off + d);
     }
-    let dot = wg_sum_f32(local_dot, tid, sg_inv_id);
+    let dot = wg_sum_f32(local_dot, sg_id, sg_inv_id, num_subgroups);
 
     let score = dot * p.scale;
     let m_new = max(m_run, score);

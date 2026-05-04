@@ -9,9 +9,10 @@ enable f16;
 // (m, l, o) state for all Q_PER_GROUP=4 Q heads that share this KV head. K and
 // V are loaded once per cache position and reused across the four Q heads.
 // The four Q·K dots are computed in parallel via vec4<f32> packing and reduced
-// through wg_sum_v4 — a subgroupAdd that const-folds to a single instruction
-// when SG_SIZE == WG (e.g. RDNA wave64) and runs a templated cross-subgroup
-// merge otherwise. No workgroup barriers in the inner loop on the fast path.
+// through wg_sum_v4 — a subgroupAdd that takes a single instruction when
+// num_subgroups == 1 (e.g. RDNA wave64 with WG=64) and runs a runtime
+// cross-subgroup merge otherwise. No workgroup barriers in the inner loop on
+// the fast path.
 //
 // K/V cache is Q8_0: per 32 contiguous elements of the kv-row we have one
 // FP32 scale (in the d-section) and 32 packed i8 values (in the qs-section).
@@ -47,28 +48,28 @@ struct Params {
 @group(0) @binding(3) var<storage, read> v_cache: array<u32>;
 @group(0) @binding(4) var<storage, read_write> partials: array<f32>;
 
-const SG_SIZE: u32 = {{SG_SIZE}}u;
+const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 64u;
-const N_SG: u32 = WG / SG_SIZE;
+const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 const Q_PER_GROUP: u32 = 4u;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
 const CHUNK_SIZE: u32 = 32u;
 const PARTIAL_STRIDE: u32 = 130u;  // head_dim + 2
 
-// Cross-subgroup partial slots; unused (and dead-coded out) when N_SG == 1.
-var<workgroup> sg_partial4: array<vec4<f32>, N_SG>;
+// Cross-subgroup partial slots; fast-path (return sg_sum directly) taken when
+// num_subgroups == 1.
+var<workgroup> sg_partial4: array<vec4<f32>, SG_PARTIAL_MAX>;
 
-fn wg_sum_v4(local: vec4<f32>, tid: u32, sg_inv_id: u32) -> vec4<f32> {
+fn wg_sum_v4(local: vec4<f32>, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> vec4<f32> {
   let sg_sum = subgroupAdd(local);
-  if (N_SG == 1u) {
+  if (num_subgroups == 1u) {
     return sg_sum;
   }
-  let sg_id = tid / SG_SIZE;
   if (sg_inv_id == 0u) { sg_partial4[sg_id] = sg_sum; }
   workgroupBarrier();
   if (sg_id == 0u) {
     var combined: vec4<f32>;
-    if (sg_inv_id < N_SG) { combined = sg_partial4[sg_inv_id]; }
+    if (sg_inv_id < num_subgroups) { combined = sg_partial4[sg_inv_id]; }
     let final_sum = subgroupAdd(combined);
     if (sg_inv_id == 0u) { sg_partial4[0] = final_sum; }
   }
@@ -112,6 +113,8 @@ fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_inv_id: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(num_subgroups) num_subgroups: u32,
 ) {
   let g = wg.x;
   let chunk = wg.y;
@@ -146,8 +149,8 @@ fn main(
       let q3 = f32(act[q_base3 + d]);
       local = local + k * vec4<f32>(q0, q1, q2, q3);
     }
-    // Workgroup-wide reduction (one subgroupAdd if SG covers WG, else two-step).
-    let dots = wg_sum_v4(local, tid, sg_inv_id);
+    // Workgroup-wide reduction (one subgroupAdd if num_subgroups==1, else two-step).
+    let dots = wg_sum_v4(local, sg_id, sg_inv_id, num_subgroups);
     let scores = dots * p.scale;
 
     let m_new = max(m, scores);

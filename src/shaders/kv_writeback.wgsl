@@ -30,25 +30,24 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> kv_k: array<u32>;
 @group(0) @binding(3) var<storage, read_write> kv_v: array<u32>;
 
-const SG_SIZE: u32 = {{SG_SIZE}}u;
+const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 32u;
-// Ceiling division so that for SG_SIZE > WG we still get N_SG = 1 (the WG
-// occupies only part of one subgroup, but the subgroup op still reduces
-// over the active lanes correctly).
-const N_SG: u32 = (WG + SG_SIZE - 1u) / SG_SIZE;
+// Ceiling division: if SUBGROUP_MIN_SIZE > WG (WG occupies only part of one
+// subgroup), num_subgroups == 1 and the fast path is taken.
+const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
 // Per-thread quantized bytes (one for K, one for V), packed by tid 0..7.
 var<workgroup> qk_sh: array<u32, 32>;
 var<workgroup> qv_sh: array<u32, 32>;
-// Cross-subgroup partials for the amax reduction; dead-coded when N_SG == 1.
-var<workgroup> sg_amax_k: array<f32, N_SG>;
-var<workgroup> sg_amax_v: array<f32, N_SG>;
+// Cross-subgroup partials for the amax reduction; fast-path taken when
+// num_subgroups == 1.
+var<workgroup> sg_amax_k: array<f32, SG_PARTIAL_MAX>;
+var<workgroup> sg_amax_v: array<f32, SG_PARTIAL_MAX>;
 
-fn wg_max2(a: f32, b: f32, tid: u32, sg_inv_id: u32) -> vec2<f32> {
+fn wg_max2(a: f32, b: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> vec2<f32> {
   let sa = subgroupMax(a);
   let sb = subgroupMax(b);
-  if (N_SG == 1u) { return vec2<f32>(sa, sb); }
-  let sg_id = tid / SG_SIZE;
+  if (num_subgroups == 1u) { return vec2<f32>(sa, sb); }
   if (sg_inv_id == 0u) {
     sg_amax_k[sg_id] = sa;
     sg_amax_v[sg_id] = sb;
@@ -57,7 +56,7 @@ fn wg_max2(a: f32, b: f32, tid: u32, sg_inv_id: u32) -> vec2<f32> {
   if (sg_id == 0u) {
     var ca: f32;
     var cb: f32;
-    if (sg_inv_id < N_SG) {
+    if (sg_inv_id < num_subgroups) {
       ca = sg_amax_k[sg_inv_id];
       cb = sg_amax_v[sg_inv_id];
     }
@@ -77,6 +76,8 @@ fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_inv_id: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(num_subgroups) num_subgroups: u32,
 ) {
   let block_global = wg.y * p.dispatch_x_dim + wg.x;
   let tok = block_global / p.nb_per_row;
@@ -89,7 +90,7 @@ fn main(
   let vv = f32(act[p.v_cur_off + src_off]);
 
   // amax (32 → 1) via subgroup reduction (with cross-subgroup merge if needed).
-  let amax = wg_max2(abs(kv), abs(vv), tid, sg_inv_id);
+  let amax = wg_max2(abs(kv), abs(vv), sg_id, sg_inv_id, num_subgroups);
   let dk = amax.x / 127.0;
   let dv = amax.y / 127.0;
   let id_inv_k = select(0.0, 1.0 / dk, dk > 0.0);

@@ -1094,26 +1094,29 @@ impl Model {
             }));
         }
 
-        // ---- probe actual runtime subgroup size ----------------------------
-        // The adapter exposes the device's subgroup_min..max range, not the
-        // size the driver picks for any given pipeline. RADV in particular
-        // can be flipped to wave32 via `RADV_PERFTEST=cswave32` or kept at
-        // wave64 (default), and either choice is opaque to the API. We dispatch
-        // a tiny `subgroup_size`-builtin readback to learn the real value, then
-        // bake that into every other shader at compile time.
-        let sg_size = probe_subgroup_size(&device, &queue, &lost)?;
-        if !(8..=64).contains(&sg_size) || (sg_size & (sg_size - 1)) != 0 {
+        // ---- validate adapter subgroup range ----------------------------------
+        // wgpu-hal sets ALLOW_VARYING_SUBGROUP_SIZE on every compute pipeline
+        // when SUBGROUP is enabled, so the subgroup_size / subgroup_id /
+        // num_subgroups builtins are always correct. We do NOT probe the runtime
+        // size; instead shaders use these builtins at runtime and size their
+        // cross-subgroup shmem arrays for the worst case (WG / subgroup_min_size).
+        // The only hard requirement: subgroup_min_size >= 8, needed by the
+        // matvec subgroupShuffleXor(_, 1|2|4) butterfly.
+        let sg_min = info.subgroup_min_size;
+        let sg_max = info.subgroup_max_size;
+        if sg_min < 8 || sg_min & (sg_min - 1) != 0 {
             return Err(PotError::Config(
-                "unsupported runtime subgroup size (need power-of-2 in [8, 64])",
+                "adapter subgroup_min_size must be a power-of-2 >= 8 (required by Q1_0 matvec butterfly)",
             ));
         }
+        let subgroup_min_size = sg_min;
         log::info!(
-            "adapter={} backend={:?} subgroup_runtime={} (adapter range={}..={})",
+            "adapter={} backend={:?} subgroup range={}..={} (shmem worst-case N_SG={})",
             info.name,
             info.backend,
-            sg_size,
-            info.subgroup_min_size,
-            info.subgroup_max_size,
+            sg_min,
+            sg_max,
+            64u32.div_ceil(sg_min),
         );
 
         // ---- load weight buffers from disk ---------------------------------
@@ -1267,15 +1270,20 @@ impl Model {
         };
 
         // ---- shaders & pipelines -------------------------------------------
-        // `{{SG_SIZE}}` and `{{MAX_CHUNKS}}` are substituted with runtime values
-        // at load time; shaders that don't reference them get pass-through `replace`.
-        let sg_size_str = sg_size.to_string();
+        // `{{SUBGROUP_MIN_SIZE}}` and `{{MAX_CHUNKS}}` are substituted with
+        // runtime values at load time; shaders that don't reference them get a
+        // pass-through `replace`. SUBGROUP_MIN_SIZE is used as a compile-time
+        // worst-case for cross-subgroup shmem sizing; actual subgroup counts
+        // are read from @builtin(num_subgroups) at runtime.
+        let subgroup_min_size_str = subgroup_min_size.to_string();
         let max_chunks = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
         let max_chunks_str = max_chunks.to_string();
 
         // Pre-flight: check the attention_merge LDS budget before shader compile.
-        // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs N_SG f32 slots.
-        let merge_lds_bytes = 4 * u64::from(max_chunks) + 4 * (64 / u64::from(sg_size));
+        // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs SG_PARTIAL_MAX
+        // f32 slots = ceil(WG=64 / subgroup_min_size) in the worst case.
+        let merge_lds_bytes =
+            4 * u64::from(max_chunks) + 4 * u64::from(64u32.div_ceil(subgroup_min_size));
         if merge_lds_bytes > u64::from(device.limits().max_compute_workgroup_storage_size) {
             return Err(PotError::Config(
                 "max_seq exceeds attention_merge LDS budget; reduce --max-seq",
@@ -1286,7 +1294,7 @@ impl Model {
             ($file:expr) => {{
                 let src: &str = include_str!(concat!("shaders/", $file));
                 let templated = src
-                    .replace("{{SG_SIZE}}", &sg_size_str)
+                    .replace("{{SUBGROUP_MIN_SIZE}}", &subgroup_min_size_str)
                     .replace("{{MAX_CHUNKS}}", &max_chunks_str);
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some($file),
@@ -1580,112 +1588,6 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
         }
     }
     out
-}
-
-// Dispatch a one-thread-writes-the-builtin probe shader to find out what
-// subgroup size the driver actually picks for our compute pipelines.
-fn probe_subgroup_size(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    lost: &OnceLock<DeviceLostInfo>,
-) -> Result<u32> {
-    use core::result::Result as StdResult;
-    type MapResult = StdResult<(), wgpu::BufferAsyncError>;
-    let result = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("probe_result"),
-        size: 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("probe_readback"),
-        size: 4,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("probe_subgroup.wgsl"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/probe_subgroup.wgsl").into()),
-    });
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("probe_bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("probe_pl"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
-    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("probe_pipe"),
-        layout: Some(&pl),
-        module: &module,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    });
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("probe_bg"),
-        layout: &bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: result.as_entire_binding(),
-        }],
-    });
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("probe_enc"),
-    });
-    {
-        let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("probe_cp"),
-            timestamp_writes: None,
-        });
-        cp.set_pipeline(&pipe);
-        cp.set_bind_group(0, &bg, &[]);
-        cp.dispatch_workgroups(1, 1, 1);
-    }
-    enc.copy_buffer_to_buffer(&result, 0, &readback, 0, 4);
-    queue.submit(Some(enc.finish()));
-
-    let slice = readback.slice(..);
-    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
-    let slot2 = slot.clone();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = slot2.set(r);
-    });
-    if let Err(e) = device.poll(wgpu::PollType::wait_indefinitely()) {
-        if let Some(d) = lost.get() {
-            return Err(PotError::DeviceLost {
-                reason: d.reason,
-                message: d.message.clone(),
-            });
-        }
-        return Err(PotError::Poll(e));
-    }
-    slot.get()
-        .ok_or(PotError::Config("probe map_async failed"))?
-        .as_ref()
-        .map_err(|_| PotError::Config("probe map_async errored"))?;
-    let sg = {
-        let data = slice.get_mapped_range();
-        #[allow(
-            clippy::unwrap_used,
-            reason = "data[..4] is always 4 bytes, so try_into to [u8; 4] is infallible"
-        )]
-        let bytes: [u8; 4] = data[..4].try_into().unwrap();
-        u32::from_le_bytes(bytes)
-    };
-    readback.unmap();
-    Ok(sg)
 }
 
 // ----- public(crate) helpers used by forward.rs -----------------------------

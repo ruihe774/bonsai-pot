@@ -21,25 +21,24 @@ struct Params {
 @group(0) @binding(1) var<storage, read> x: array<f16>;
 @group(0) @binding(2) var<storage, read_write> outbuf: array<u32>;
 
-const SG_SIZE: u32 = {{SG_SIZE}}u;
+const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const WG: u32 = 32u;
-// Ceiling division so that SG_SIZE > WG still yields N_SG = 1 (the WG
-// occupies only part of one subgroup; subgroup ops still reduce correctly
-// over the active lanes).
-const N_SG: u32 = (WG + SG_SIZE - 1u) / SG_SIZE;
+// Ceiling division: if SUBGROUP_MIN_SIZE > WG (WG occupies only part of one
+// subgroup), num_subgroups == 1 and the fast path is taken; the extra slot is
+// never written. If SUBGROUP_MIN_SIZE <= WG, this gives the exact worst case.
+const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
 var<workgroup> q_sh: array<u32, 32>;
-var<workgroup> sg_amax: array<f32, N_SG>;
+var<workgroup> sg_amax: array<f32, SG_PARTIAL_MAX>;
 
-fn wg_max(local: f32, tid: u32, sg_inv_id: u32) -> f32 {
+fn wg_max(local: f32, sg_id: u32, sg_inv_id: u32, num_subgroups: u32) -> f32 {
   let sg_m = subgroupMax(local);
-  if (N_SG == 1u) { return sg_m; }
-  let sg_id = tid / SG_SIZE;
+  if (num_subgroups == 1u) { return sg_m; }
   if (sg_inv_id == 0u) { sg_amax[sg_id] = sg_m; }
   workgroupBarrier();
   if (sg_id == 0u) {
     var combined: f32;
-    if (sg_inv_id < N_SG) { combined = sg_amax[sg_inv_id]; }
+    if (sg_inv_id < num_subgroups) { combined = sg_amax[sg_inv_id]; }
     let final_m = subgroupMax(combined);
     if (sg_inv_id == 0u) { sg_amax[0] = final_m; }
   }
@@ -52,6 +51,8 @@ fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
   @builtin(subgroup_invocation_id) sg_inv_id: u32,
+  @builtin(subgroup_id) sg_id: u32,
+  @builtin(num_subgroups) num_subgroups: u32,
 ) {
   let block_global = wg.y * p.dispatch_x_dim + wg.x;
   let nb_q8 = p.k / 32u;
@@ -63,7 +64,7 @@ fn main(
   let in_base = p.input_offset + m_idx * p.k + b_idx * 32u;
   let v = f32(x[in_base + tid]);
 
-  let amax = wg_max(abs(v), tid, sg_inv_id);
+  let amax = wg_max(abs(v), sg_id, sg_inv_id, num_subgroups);
   let d = amax / 127.0;
   let id_inv = select(0.0, 1.0 / d, d > 0.0);
   let qv = u32(i32(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
