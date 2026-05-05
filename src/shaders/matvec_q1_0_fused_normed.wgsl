@@ -82,7 +82,13 @@ const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 // a_qs_sh, but WGSL has no union/alias mechanism and the saved LDS isn't
 // worth the indirection complexity here.
 var<workgroup> x_sh: array<vec4<f16>, K_V4>;
-// Q8_0 staged activation: K bytes of i8 packed 4 per u32.
+// Q8_0 staged activation: K bytes of i8 packed 4 per u32. Layout is
+// **transposed** vs. block-major (`[i_off * NB_Q8 + block_idx]` instead of
+// `[block_idx * 8 + i_off]`) to dodge LDS bank conflicts: the matvec inner
+// has WG_X=8 lanes-per-row reading the same `i_off` but different
+// `block_idx` (= different `b_local`); block-major strides those 8 reads
+// by 32 u32s → all 8 lanes map to one bank → 8-way serialization.
+// Transposed, the 8 lanes' addresses differ by 4 → 8 unique banks.
 var<workgroup> a_qs_sh: array<u32, A_QS_LEN>;
 // Q8_0 per-block scales (FP32, with inv_rms folded in).
 var<workgroup> a_d_sh: array<f32, NB_Q8>;
@@ -158,7 +164,6 @@ fn main(
     let d = max_abs * inv_rms * (1.0 / 127.0);
     a_d_sh[tid] = d;
     let inv_max = 127.0 / max(max_abs, 1.0e-30);
-    let qs_base = tid * 8u;
     for (var i: u32 = 0u; i < 8u; i++) {
       let v = vec4<f32>(x_sh[block_v4_base + i]);
       let q = clamp(round(v * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
@@ -166,7 +171,8 @@ fn main(
       let q1 = u32(i32(q.y)) & 0xFFu;
       let q2 = u32(i32(q.z)) & 0xFFu;
       let q3 = u32(i32(q.w)) & 0xFFu;
-      a_qs_sh[qs_base + i] = q0 | (q1 << 8u) | (q2 << 16u) | (q3 << 24u);
+      // Transposed layout: i is the outer stride, block (= tid) the inner.
+      a_qs_sh[i * NB_Q8 + tid] = q0 | (q1 << 8u) | (q2 << 16u) | (q3 << 24u);
     }
   }
   workgroupBarrier();
@@ -206,13 +212,13 @@ fn main(
       for (var s: u32 = 0u; s < 4u; s++) {
         let qword = weights[qs_word_base + s];
         let a_d = a_d_sh[a_block_base + s];
-        let qs_l_base = (a_block_base + s) * 8u;
+        let block_l = a_block_base + s;
         var sumi: i32 = 0;
         // 8 dot4s × 4 weights = 32 weights = one Q8_0 sub-block.
         for (var i: u32 = 0u; i < 8u; i++) {
           let bits = (qword >> (i * 4u)) & 0xFu;
           let w_packed = expand_4_bits(bits);
-          let a_packed = a_qs_sh[qs_l_base + i];
+          let a_packed = a_qs_sh[i * NB_Q8 + block_l];
           sumi = dot4I8Packed(w_packed, a_packed) + sumi;
         }
         sub_acc = sub_acc + a_d * f32(sumi);

@@ -61,7 +61,13 @@ const TILE_K: u32 = 4096u;
 const TILE_NB_Q8: u32 = TILE_K / 32u;   // = 128, matches WG
 const TILE_QS_LEN: u32 = TILE_K >> 2u;  // u32 slots packing the i8 activation
 
-// Q8_0 staged activation for the current tile.
+// Q8_0 staged activation for the current tile. Layout is **transposed**
+// vs. block-major (`[i_off * TILE_NB_Q8 + block_idx]` instead of
+// `[block_idx * 8 + i_off]`) to dodge LDS bank conflicts: the matvec inner
+// has WG_X=8 lanes-per-row reading the same `i_off` but different
+// `block_idx` (= different `b_local`); block-major would stride those
+// 8 reads by 32 u32s → all 8 lanes map to one bank → 8-way serialization.
+// Transposed, the 8 lanes' addresses differ by 4 → 8 unique banks.
 var<workgroup> a_qs_sh: array<u32, TILE_QS_LEN>;
 var<workgroup> a_d_sh: array<f32, TILE_NB_Q8>;
 
@@ -188,24 +194,23 @@ fn main(
       let d = max_abs * (1.0 / 127.0);
       a_d_sh[tid] = d;
       let inv_max = 127.0 / max(max_abs, 1.0e-30);
-      let qs_base = tid * 8u;
-      // Helper closure not allowed; manually pack each vec4<f16> -> u32.
+      // Transposed layout: i is the outer stride, block (= tid) the inner.
       let q0v = clamp(round(vec4<f32>(v0) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 0u] = (u32(i32(q0v.x)) & 0xFFu) | ((u32(i32(q0v.y)) & 0xFFu) << 8u) | ((u32(i32(q0v.z)) & 0xFFu) << 16u) | ((u32(i32(q0v.w)) & 0xFFu) << 24u);
+      a_qs_sh[0u * TILE_NB_Q8 + tid] = (u32(i32(q0v.x)) & 0xFFu) | ((u32(i32(q0v.y)) & 0xFFu) << 8u) | ((u32(i32(q0v.z)) & 0xFFu) << 16u) | ((u32(i32(q0v.w)) & 0xFFu) << 24u);
       let q1v = clamp(round(vec4<f32>(v1) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 1u] = (u32(i32(q1v.x)) & 0xFFu) | ((u32(i32(q1v.y)) & 0xFFu) << 8u) | ((u32(i32(q1v.z)) & 0xFFu) << 16u) | ((u32(i32(q1v.w)) & 0xFFu) << 24u);
+      a_qs_sh[1u * TILE_NB_Q8 + tid] = (u32(i32(q1v.x)) & 0xFFu) | ((u32(i32(q1v.y)) & 0xFFu) << 8u) | ((u32(i32(q1v.z)) & 0xFFu) << 16u) | ((u32(i32(q1v.w)) & 0xFFu) << 24u);
       let q2v = clamp(round(vec4<f32>(v2) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 2u] = (u32(i32(q2v.x)) & 0xFFu) | ((u32(i32(q2v.y)) & 0xFFu) << 8u) | ((u32(i32(q2v.z)) & 0xFFu) << 16u) | ((u32(i32(q2v.w)) & 0xFFu) << 24u);
+      a_qs_sh[2u * TILE_NB_Q8 + tid] = (u32(i32(q2v.x)) & 0xFFu) | ((u32(i32(q2v.y)) & 0xFFu) << 8u) | ((u32(i32(q2v.z)) & 0xFFu) << 16u) | ((u32(i32(q2v.w)) & 0xFFu) << 24u);
       let q3v = clamp(round(vec4<f32>(v3) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 3u] = (u32(i32(q3v.x)) & 0xFFu) | ((u32(i32(q3v.y)) & 0xFFu) << 8u) | ((u32(i32(q3v.z)) & 0xFFu) << 16u) | ((u32(i32(q3v.w)) & 0xFFu) << 24u);
+      a_qs_sh[3u * TILE_NB_Q8 + tid] = (u32(i32(q3v.x)) & 0xFFu) | ((u32(i32(q3v.y)) & 0xFFu) << 8u) | ((u32(i32(q3v.z)) & 0xFFu) << 16u) | ((u32(i32(q3v.w)) & 0xFFu) << 24u);
       let q4v = clamp(round(vec4<f32>(v4) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 4u] = (u32(i32(q4v.x)) & 0xFFu) | ((u32(i32(q4v.y)) & 0xFFu) << 8u) | ((u32(i32(q4v.z)) & 0xFFu) << 16u) | ((u32(i32(q4v.w)) & 0xFFu) << 24u);
+      a_qs_sh[4u * TILE_NB_Q8 + tid] = (u32(i32(q4v.x)) & 0xFFu) | ((u32(i32(q4v.y)) & 0xFFu) << 8u) | ((u32(i32(q4v.z)) & 0xFFu) << 16u) | ((u32(i32(q4v.w)) & 0xFFu) << 24u);
       let q5v = clamp(round(vec4<f32>(v5) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 5u] = (u32(i32(q5v.x)) & 0xFFu) | ((u32(i32(q5v.y)) & 0xFFu) << 8u) | ((u32(i32(q5v.z)) & 0xFFu) << 16u) | ((u32(i32(q5v.w)) & 0xFFu) << 24u);
+      a_qs_sh[5u * TILE_NB_Q8 + tid] = (u32(i32(q5v.x)) & 0xFFu) | ((u32(i32(q5v.y)) & 0xFFu) << 8u) | ((u32(i32(q5v.z)) & 0xFFu) << 16u) | ((u32(i32(q5v.w)) & 0xFFu) << 24u);
       let q6v = clamp(round(vec4<f32>(v6) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 6u] = (u32(i32(q6v.x)) & 0xFFu) | ((u32(i32(q6v.y)) & 0xFFu) << 8u) | ((u32(i32(q6v.z)) & 0xFFu) << 16u) | ((u32(i32(q6v.w)) & 0xFFu) << 24u);
+      a_qs_sh[6u * TILE_NB_Q8 + tid] = (u32(i32(q6v.x)) & 0xFFu) | ((u32(i32(q6v.y)) & 0xFFu) << 8u) | ((u32(i32(q6v.z)) & 0xFFu) << 16u) | ((u32(i32(q6v.w)) & 0xFFu) << 24u);
       let q7v = clamp(round(vec4<f32>(v7) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
-      a_qs_sh[qs_base + 7u] = (u32(i32(q7v.x)) & 0xFFu) | ((u32(i32(q7v.y)) & 0xFFu) << 8u) | ((u32(i32(q7v.z)) & 0xFFu) << 16u) | ((u32(i32(q7v.w)) & 0xFFu) << 24u);
+      a_qs_sh[7u * TILE_NB_Q8 + tid] = (u32(i32(q7v.x)) & 0xFFu) | ((u32(i32(q7v.y)) & 0xFFu) << 8u) | ((u32(i32(q7v.z)) & 0xFFu) << 16u) | ((u32(i32(q7v.w)) & 0xFFu) << 24u);
     }
     workgroupBarrier();
 
@@ -223,12 +228,12 @@ fn main(
         for (var s: u32 = 0u; s < 4u; s++) {
           let qword = weights[qs_word_base + s];
           let a_d = a_d_sh[a_block_local_base + s];
-          let qs_l_base = (a_block_local_base + s) * 8u;
+          let block_l = a_block_local_base + s;
           var sumi: i32 = 0;
           for (var i: u32 = 0u; i < 8u; i++) {
             let bits = (qword >> (i * 4u)) & 0xFu;
             let w_packed = expand_4_bits(bits);
-            let a_packed = a_qs_sh[qs_l_base + i];
+            let a_packed = a_qs_sh[i * TILE_NB_Q8 + block_l];
             sumi = dot4I8Packed(w_packed, a_packed) + sumi;
           }
           sub_acc = sub_acc + a_d * f32(sumi);
