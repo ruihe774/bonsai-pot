@@ -207,6 +207,7 @@ pub struct AttnParams {
     pub(crate) scale: f32,
     pub(crate) m_tokens: u32,
     pub(crate) is_prefill: u32,
+    pub(crate) pos_base: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]

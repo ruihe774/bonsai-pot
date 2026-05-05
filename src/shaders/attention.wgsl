@@ -40,6 +40,10 @@ struct Params {
   scale: f32,
   m_tokens: u32,
   is_prefill: u32,
+  // Number of KV positions already in the cache before this batch. For tg
+  // (`is_prefill == 0`) this is unused (`pos` already encodes the full length).
+  // For prefill, token `m_tok` attends to cache positions [0, pos_base + m_tok].
+  pos_base: u32,
 };
 
 var<immediate> p: Params;
@@ -130,7 +134,7 @@ fn main(
   let g = h / (p.n_head / p.n_kv_head);
   let tid = lid.x;
   let hd = p.head_dim;
-  let cur_pos = select(p.pos, m_tok + 1u, p.is_prefill != 0u);
+  let cur_pos = select(p.pos, p.pos_base + m_tok + 1u, p.is_prefill != 0u);
   let q_stride = p.n_head * hd;
   let q_base = p.q_offset + m_tok * q_stride + h * hd;
   let g_off = g * hd;

@@ -135,14 +135,14 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     // warmup — also establishes e2e_tg_n from the actual output length
     let e2e_tg_n = {
         let mut sess = model.new_session();
-        let first = sess.prefill_one_at_a_time(E2E_PROMPT, &e2e_sampler)?;
+        let first = sess.prefill(E2E_PROMPT, &e2e_sampler)?;
         let (generated, _) = sess.generate(first, &opts)?;
         1 + generated.len() as u32
     };
 
     for _ in 0..repeats {
         let mut sess = model.new_session();
-        let first = sess.prefill_one_at_a_time(E2E_PROMPT, &e2e_sampler)?;
+        let first = sess.prefill(E2E_PROMPT, &e2e_sampler)?;
         let t = Instant::now();
         let (generated, _) = sess.generate(first, &opts)?;
         let actual_n = 1 + generated.len() as u32;

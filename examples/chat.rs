@@ -408,12 +408,11 @@ fn main() {
                 .get_ids()
                 .to_vec();
 
-            // All user-turn prefills use the matvec-loop path (pos > 0 after
-            // the system prompt). The first sampled token is not yet in KV —
-            // it is fed back via `step` in the streaming loop below.
-            let next = sess
-                .prefill_one_at_a_time(&tokens, &sampler)
-                .expect("prefill_one_at_a_time");
+            // Batched matmul prefill (chunks internally for turns longer than
+            // `model.max_prefill_tokens()`). The first sampled token is not
+            // yet in KV — it is fed back via `step` in the streaming loop
+            // below.
+            let next = sess.prefill(&tokens, &sampler).expect("prefill");
 
             // Snapshot here: the first sampled token hasn't been `step`-fed
             // yet, so this captures KV state just after `<|im_start|>assistant\n`.
@@ -491,7 +490,7 @@ fn main() {
                     if stripped.is_empty() {
                         writeln!(stdout, "(no response after thinking)").ok();
                     } else {
-                        sess.prefill_one_at_a_time(&stripped, &sampler)
+                        sess.prefill(&stripped, &sampler)
                             .expect("re-prefill stripped response");
                     }
                 }

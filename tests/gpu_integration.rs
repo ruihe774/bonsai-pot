@@ -74,27 +74,38 @@ fn decode_tokens_round_trip_specials() {
 // ---- prefill error guards ----------------------------------------------------
 
 #[test]
-fn prefill_pos_nonzero_rejected() {
+fn batched_prefill_pos_nonzero_matches_matvec_loop() {
+    // Batched matmul prefill at pos > 0 must yield the same first-sampled token
+    // as the matvec-loop variant under greedy sampling.
     let model = load_model();
-    let mut sess = model.new_session();
     let prompt = short_prompt();
-    let _ = sess.prefill(&prompt, &greedy_sampler()).unwrap();
-    // pos is now 8; calling prefill again must fail.
-    let err = sess.prefill(&prompt, &greedy_sampler()).unwrap_err();
-    assert!(matches!(err, PotError::Config(_)));
+    let greedy = greedy_sampler();
+
+    let mut sess_matmul = model.new_session();
+    let _ = sess_matmul.prefill(&prompt, &greedy).unwrap();
+    let first_matmul = sess_matmul.prefill(&prompt, &greedy).unwrap();
+
+    let mut sess_matvec = model.new_session();
+    let _ = sess_matvec.prefill_one_at_a_time(&prompt, &greedy).unwrap();
+    let first_matvec = sess_matvec.prefill_one_at_a_time(&prompt, &greedy).unwrap();
+
+    assert_eq!(
+        first_matmul, first_matvec,
+        "batched prefill at pos>0 ({first_matmul}) != matvec-loop ({first_matvec})"
+    );
+    assert_eq!(sess_matmul.pos(), 2 * prompt.len() as u32);
 }
 
 #[test]
-fn prefill_too_large_rejected() {
+fn prefill_context_overflow_rejected() {
     let model = load_model();
     let mut sess = model.new_session();
-    let too_many: Vec<u32> = vec![1u32; 513]; // > M_MAX=512
+    // Prompts longer than max_seq must be rejected up front (chunking can't
+    // help since the KV cache itself isn't large enough).
+    let too_many: Vec<u32> = vec![1u32; (model.max_seq_len() + 1) as usize];
     let err = sess.prefill(&too_many, &greedy_sampler()).unwrap_err();
     assert!(
-        matches!(
-            err,
-            PotError::PrefillTooLarge { .. } | PotError::ContextOverflow { .. }
-        ),
+        matches!(err, PotError::ContextOverflow { .. }),
         "unexpected error: {err}"
     );
 }

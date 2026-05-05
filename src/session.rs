@@ -130,9 +130,8 @@ impl<'m> Session<'m> {
     ///
     /// Validates `snap` against the model (matching `n_layer` / `kv_dim`;
     /// `snap.pos() ≤ model.max_seq_len()`). After a successful restore,
-    /// the next call should be [`prefill_one_at_a_time`](Self::prefill_one_at_a_time)
-    /// or [`step`](Self::step) if `snap.pos() > 0`, or [`prefill`](Self::prefill)
-    /// if `snap.pos() == 0`.
+    /// the next call is typically [`prefill`](Self::prefill) (works at any
+    /// `pos`) or [`step`](Self::step) if `snap.pos() > 0`.
     ///
     /// Cost: one staging-belt-backed upload (all layers in one encoder),
     /// serialized against subsequent dispatches by queue ordering.
@@ -151,22 +150,23 @@ impl<'m> Session<'m> {
     /// Batched matmul prefill. Advances `pos` by `tokens.len()` and returns
     /// the first sampled token (drawn from the last logits via `sampler`).
     ///
-    /// Requires `self.pos() == 0` because the matmul attention shader assumes
-    /// a fresh KV cache. For incremental prefill into an existing context, use
-    /// [`prefill_one_at_a_time`](Self::prefill_one_at_a_time).
+    /// Works at any `self.pos()` (including incremental prefill into an
+    /// existing context). Prompts longer than `model.max_prefill_tokens()`
+    /// are chunked transparently into batched dispatches; intermediate
+    /// chunks' logits are discarded (only the final chunk's top-K is sampled).
     ///
     /// # Errors
     ///
-    /// Returns an error if `self.pos() != 0`, if the prompt would overflow the
-    /// KV cache, or if the underlying GPU dispatch fails.
+    /// Returns an error if the prompt would overflow the KV cache, or if the
+    /// underlying GPU dispatch fails.
     pub fn prefill(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         self.model.check_device()?;
-        if self.pos != 0 {
+        let n = tokens.len() as u32;
+        if n == 0 {
             return Err(PotError::Config(
-                "Session::prefill requires pos == 0; use prefill_one_at_a_time for incremental prefill",
+                "Session::prefill requires non-empty input",
             ));
         }
-        let n = tokens.len() as u32;
         if self.pos + n > self.model.max_seq {
             return Err(PotError::ContextOverflow {
                 pos: self.pos,
@@ -175,21 +175,33 @@ impl<'m> Session<'m> {
             });
         }
         let k = effective_k(sampler);
-        let (logits, indices) =
-            forward::prefill_matmul_topk(self.model, tokens, self.pos, k, &mut forward::NoMarker)?;
-        let chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
-        self.pos += n;
+        let chunk = self.model.max_prefill_tokens() as usize;
+        let mut chosen = 0u32;
+        for slice in tokens.chunks(chunk) {
+            let (logits, indices) = forward::prefill_matmul_topk(
+                self.model,
+                slice,
+                self.pos,
+                k,
+                &mut forward::NoMarker,
+            )?;
+            chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
+            self.pos += slice.len() as u32;
+        }
         Ok(chosen)
     }
 
-    /// Single-token-at-a-time matvec prefill. Slower than
-    /// [`Session::prefill`] for long prompts, but supports any `pos`
-    /// (incremental prefill into an existing context).
+    /// Single-token-at-a-time matvec-loop prefill. Strictly dominated by
+    /// [`Session::prefill`] for end-users (slower, same result); kept as an
+    /// independent implementation for the matvec-vs-matmul parity tests and
+    /// for the CLI's `--mode gen` (which exercises the matvec prefill path
+    /// end-to-end).
     ///
     /// # Errors
     ///
     /// Returns an error if the prompt would overflow the KV cache, or if the
     /// underlying GPU dispatch fails.
+    #[doc(hidden)]
     pub fn prefill_one_at_a_time(&mut self, tokens: &[u32], sampler: &Sampler) -> Result<u32> {
         self.model.check_device()?;
         let n = tokens.len() as u32;

@@ -7,8 +7,8 @@
 //!     existing KV cache prefix).
 //!   - **matmul batched prefill** (`prefill_matmul_topk`): processes the prompt
 //!     as one batch using `dot4I8Packed` matmul with a `Q8_0` quantize-activation
-//!     pre-pass. Faster on long prompts, but assumes the KV cache is empty
-//!     (`pos_base == 0`).
+//!     pre-pass. Faster on long prompts; works at any `pos_base` (the matmul
+//!     attention kernel scans `[0, pos_base + m_tok]` per query).
 //!
 //! Sampling lives outside this module: each entry point ends with a
 //! topk multi-WG dispatch that writes the top-K logit values + indices to
@@ -531,6 +531,7 @@ fn dispatch_attention(
     pos: u32,
     m_tokens: u32,
     is_prefill: bool,
+    pos_base: u32,
 ) {
     let (d_word, qs_byte) = kv_layer_offsets(cfg, max_seq, layer_il);
     let p = AttnParams {
@@ -548,6 +549,7 @@ fn dispatch_attention(
         scale: 1.0 / (cfg.head_dim as f32).sqrt(),
         m_tokens,
         is_prefill: u32::from(is_prefill),
+        pos_base,
     };
     pass.set_pipeline(&model.pipes.attention);
     pass.set_bind_group(0, &model.cached.attn, &[]);
@@ -992,10 +994,9 @@ pub fn prefill_matvec_loop_topk(
 
 // ---------- matmul (batched prefill) ---------------------------------------
 
-/// Batched matmul prefill of `prompt` starting from KV-cache position 0.
-/// Advances pos from 0 to `prompt.len()`. Returns top-K candidates from the
-/// last token's logits. Requires `pos_base == 0` (the matmul attention shader
-/// assumes a fresh cache).
+/// Batched matmul prefill of `prompt` starting from KV-cache position
+/// `pos_base`. Advances pos from `pos_base` to `pos_base + prompt.len()`.
+/// Returns top-K candidates from the last token's logits.
 pub fn prefill_matmul_topk<M: StepMarker>(
     model: &Model,
     prompt: &[u32],
@@ -1003,12 +1004,6 @@ pub fn prefill_matmul_topk<M: StepMarker>(
     k: u32,
     marker: &mut M,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
-    if pos_base != 0 {
-        // Caller must use prefill_matvec_loop_topk for incremental prefill.
-        return Err(PotError::Config(
-            "prefill_matmul_topk requires pos_base == 0; use prefill_one_at_a_time for incremental prefill",
-        ));
-    }
     let m = prompt.len() as u32;
     if m == 0 || m > model.m_max {
         return Err(PotError::PrefillTooLarge {
@@ -1054,7 +1049,7 @@ pub fn prefill_matmul_topk<M: StepMarker>(
 
         // Phase 2: per-layer transformer.
         for il in 0..cfg.n_layer {
-            layer_step_matmul_in_pass(model, cfg, &mut pass, il, m, marker);
+            layer_step_matmul_in_pass(model, cfg, &mut pass, il, m, pos_base, marker);
         }
 
         // Phase 3: output_norm (last token, in-place) + LM head + topk_reduce.
@@ -1106,9 +1101,9 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     m: u32,
+    pos_base: u32,
     marker: &mut M,
 ) {
-    let pos_base = 0u32;
     let lt = &model.layer_tensors[il as usize];
 
     // attn_norm + quantize + Q/K/V matmul.
@@ -1205,6 +1200,7 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
         /*pos=*/ 0,
         m,
         /*is_prefill=*/ true,
+        pos_base,
     );
     marker.mark(pass, "attention");
 
