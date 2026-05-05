@@ -30,8 +30,15 @@ var<immediate> p: Params;
 const WG: u32 = 128u;
 const K_MAX: u32 = 32u;
 
-var<workgroup> sh_val: array<f32, 4096u>;   // WG * K_MAX
+// Logits are originally f16 (LM-head matvec writes `f16(acc)`), so storing the
+// per-thread heap values in f16 is lossless and halves LDS use (16 KiB → 8 KiB).
+var<workgroup> sh_val: array<f16, 4096u>;   // WG * K_MAX
 var<workgroup> sh_idx: array<u32, 4096u>;
+
+// Most-negative finite f16 — sentinel for "empty heap slot". `-1e30` (used as
+// the f32 sentinel) is out of f16 range; -65504 still compares less than every
+// real logit in practice (per-token logit magnitudes are O(10) post-softmax-norm).
+const NEG_INF_H: f16 = -65504.0h;
 
 fn sift_down(base: u32) {
   var i: u32 = 0u;
@@ -67,21 +74,23 @@ fn main(
 
   // ---- Phase 1: build per-thread top-K min-heap.
   for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
-    sh_val[base + i] = -1e30;
+    sh_val[base + i] = NEG_INF_H;
     sh_idx[base + i] = 0u;
   }
   for (var w: u32 = w_lo + tid; w < w_hi; w = w + WG) {
-    let pair = unpack2x16float(logits[in_word_off + w]);
+    // unpack2x16float widens the f16 pair to vec2<f32>; cast back to f16 for
+    // the shmem heap (lossless — f16→f32 is exact).
+    let pair_f32 = unpack2x16float(logits[in_word_off + w]);
     let i0 = w << 1u;
     let i1 = i0 + 1u;
-    let v0 = pair.x;
+    let v0 = f16(pair_f32.x);
     if (i0 < i_hi && v0 > sh_val[base]) {
       sh_val[base] = v0;
       sh_idx[base] = i0;
       sift_down(base);
     }
     if (i1 < i_hi) {
-      let v1 = pair.y;
+      let v1 = f16(pair_f32.y);
       if (v1 > sh_val[base]) {
         sh_val[base] = v1;
         sh_idx[base] = i1;
@@ -162,7 +171,9 @@ fn main(
   // result[partials_off + wg.x * 2*K_MAX].
   let slot_base = p.partials_off + wg.x * (2u * K_MAX);
   if (tid < K_MAX) {
-    result[slot_base + tid]         = bitcast<u32>(sh_val[tid]);
+    // Inter-pass storage stays f32 (untouched layout); widen the f16 LDS value
+    // for free at the boundary.
+    result[slot_base + tid]         = bitcast<u32>(f32(sh_val[tid]));
     result[slot_base + K_MAX + tid] = sh_idx[tid];
   }
 }

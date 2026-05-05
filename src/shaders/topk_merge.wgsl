@@ -1,3 +1,5 @@
+enable f16;
+
 // Pass-2 of the multi-WG top-K reduction. Reads `num_partials * K_MAX` already-
 // sorted-descending (f32 value, u32 index) pairs that pass-1 (`topk_partial`)
 // wrote into a scratch region of `result`, and produces the global top-K.
@@ -27,8 +29,12 @@ var<immediate> p: Params;
 const WG: u32 = 64u;
 const K_MAX: u32 = 32u;
 
-var<workgroup> sh_val: array<f32, 2048u>;   // WG * K_MAX
+// Logits are originally f16 — pass-1 widened them to f32 only at the inter-pass
+// boundary. Demote back to f16 in shmem (lossless; halves LDS: 8 KiB → 4 KiB).
+var<workgroup> sh_val: array<f16, 2048u>;   // WG * K_MAX
 var<workgroup> sh_idx: array<u32, 2048u>;
+
+const NEG_INF_H: f16 = -65504.0h;
 
 @compute @workgroup_size(WG)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
@@ -42,12 +48,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   if (tid < p.num_partials) {
     let slot_base = p.partials_off + tid * (2u * K_MAX);
     for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
-      sh_val[base + i] = bitcast<f32>(result[slot_base + i]);
+      // Inter-pass values are f32; demote to f16 (the original logit precision).
+      sh_val[base + i] = f16(bitcast<f32>(result[slot_base + i]));
       sh_idx[base + i] = result[slot_base + K_MAX + i];
     }
   } else {
     for (var i: u32 = 0u; i < K_MAX; i = i + 1u) {
-      sh_val[base + i] = -1e30;
+      sh_val[base + i] = NEG_INF_H;
       sh_idx[base + i] = 0u;
     }
   }
@@ -104,7 +111,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   if (tid == 0u) {
     let kk = min(p.k, K_MAX);
     for (var i: u32 = 0u; i < kk; i = i + 1u) {
-      result[p.out_offset + i]      = bitcast<u32>(sh_val[i]);
+      // CPU sampler reads f32; widen at the boundary.
+      result[p.out_offset + i]      = bitcast<u32>(f32(sh_val[i]));
       result[p.out_offset + kk + i] = sh_idx[i];
     }
   }

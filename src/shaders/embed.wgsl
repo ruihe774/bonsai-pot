@@ -21,10 +21,12 @@ var<immediate> p: Params;
 @group(0) @binding(1) var<storage, read_write> x: array<f16>;
 @group(0) @binding(2) var<storage, read> sample: array<u32>;
 
-fn load_f16_at(b_offset: u32) -> f32 {
+// Load the raw 16-bit pattern of the FP16 scale into the low half of a u32
+// (high half zero). The dequant output is `±d`, and on a sign-magnitude FP16
+// flipping the sign is a single XOR with 0x8000 — no FP unit involvement.
+fn load_half_bits(b_offset: u32) -> u32 {
   let word = weights[b_offset >> 2u];
-  let half = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
-  return unpack2x16float(half).x;
+  return (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
 }
 
 fn load_byte_at(b_offset: u32) -> u32 {
@@ -40,13 +42,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let tid = lid.x;
   if (tid >= nb) { return; }
   let b = tid;
-  let d = load_f16_at(p.d_offset + (row * nb + b) * 2u);
+  let d_bits = load_half_bits(p.d_offset + (row * nb + b) * 2u);
   let qs_b = p.qs_offset + (row * nb + b) * 16u;
   let out_base = p.output_offset + wg.x * p.k + b * 128u;
   for (var k: u32 = 0u; k < 16u; k++) {
     let qb = load_byte_at(qs_b + k);
     for (var bit: u32 = 0u; bit < 8u; bit++) {
-      x[out_base + k * 8u + bit] = f16(select(-d, d, ((qb >> bit) & 1u) != 0u));
+      // bit==1 → +d; bit==0 → -d (XOR sign).
+      let signed_bits = d_bits ^ select(0x8000u, 0u, ((qb >> bit) & 1u) != 0u);
+      // unpack2x16float reinterprets the low 16 bits as an f16 (returned as f32);
+      // the high 16 bits are zero so .x is exactly ±d. The f32→f16 cast is
+      // bit-exact since f16→f32 widens losslessly.
+      x[out_base + k * 8u + bit] = f16(unpack2x16float(signed_bits).x);
     }
   }
 }
