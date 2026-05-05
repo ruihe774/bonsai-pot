@@ -244,9 +244,17 @@ pub struct SiluMulParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub struct TopKParams {
+pub struct TopKPartialParams {
     pub(crate) n: u32,
     pub(crate) in_offset: u32,
+    pub(crate) partials_off: u32,
+    pub(crate) n_per_wg: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct TopKMergeParams {
+    pub(crate) partials_off: u32,
+    pub(crate) num_partials: u32,
     pub(crate) out_offset: u32,
     pub(crate) k: u32,
 }
@@ -275,8 +283,15 @@ pub struct KvWritebackFusedParams {
     pub(crate) eps: f32,
 }
 
-/// Maximum K supported by the `topk_reduce` shader (matches `K_MAX` in the WGSL).
+/// Maximum K supported by the topk shaders (matches `K_MAX` in the WGSL).
 pub const TOPK_MAX: u32 = 32;
+
+/// Number of pass-1 workgroups in the multi-WG top-K reduction. Each WG
+/// produces its own top-K_MAX over a `n / TOPK_NUM_PARTIAL_WG` slice; pass-2
+/// merges the resulting `TOPK_NUM_PARTIAL_WG * K_MAX` candidates into the
+/// final top-K. Picked to spread enough CUs to saturate VRAM bandwidth on
+/// the LM-head logits scan without bloating the merge step.
+pub const TOPK_NUM_PARTIAL_WG: u32 = 32;
 
 // ----- activation layout ----------------------------------------------------
 
@@ -349,7 +364,8 @@ pub struct Pipelines {
     pub(crate) attention_split: wgpu::ComputePipeline,
     pub(crate) attention_merge: wgpu::ComputePipeline,
     pub(crate) silu_mul: wgpu::ComputePipeline,
-    pub(crate) topk_reduce: wgpu::ComputePipeline,
+    pub(crate) topk_partial: wgpu::ComputePipeline,
+    pub(crate) topk_merge: wgpu::ComputePipeline,
     pub(crate) kv_writeback_fused: wgpu::ComputePipeline,
     pub(crate) q_norm_rope_fused: wgpu::ComputePipeline,
 }
@@ -387,7 +403,8 @@ pub struct BindGroupLayouts {
     pub(crate) attn_split: wgpu::BindGroupLayout,
     pub(crate) attn_merge: wgpu::BindGroupLayout,
     pub(crate) silu_mul: wgpu::BindGroupLayout,
-    pub(crate) topk_reduce: wgpu::BindGroupLayout,
+    pub(crate) topk_partial: wgpu::BindGroupLayout,
+    pub(crate) topk_merge: wgpu::BindGroupLayout,
     pub(crate) kv_writeback_fused: wgpu::BindGroupLayout,
     pub(crate) q_norm_rope_fused: wgpu::BindGroupLayout,
 }
@@ -408,11 +425,12 @@ pub struct CachedBindGroups {
     pub(crate) matmul_w_ffn_gu: wgpu::BindGroup,
     pub(crate) matmul_w_ffn_d: wgpu::BindGroup,
     pub(crate) matmul_w_embed: wgpu::BindGroup,
-    pub(crate) attn: wgpu::BindGroup,        // (act, kv_k, kv_v)
-    pub(crate) attn_split: wgpu::BindGroup,  // (act, kv_k, kv_v, attn_partials)
-    pub(crate) attn_merge: wgpu::BindGroup,  // (act, attn_partials)
-    pub(crate) silu_mul: wgpu::BindGroup,    // (act)
-    pub(crate) topk_reduce: wgpu::BindGroup, // (act, sample)
+    pub(crate) attn: wgpu::BindGroup,         // (act, kv_k, kv_v)
+    pub(crate) attn_split: wgpu::BindGroup,   // (act, kv_k, kv_v, attn_partials)
+    pub(crate) attn_merge: wgpu::BindGroup,   // (act, attn_partials)
+    pub(crate) silu_mul: wgpu::BindGroup,     // (act)
+    pub(crate) topk_partial: wgpu::BindGroup, // (act, sample)
+    pub(crate) topk_merge: wgpu::BindGroup,   // (sample)
     pub(crate) kv_writeback_fused: wgpu::BindGroup, // (act, w_norms, rope_cs, kv_k, kv_v)
     pub(crate) q_norm_rope_fused: wgpu::BindGroup, // (act, w_norms, rope_cs)
 }
@@ -860,7 +878,7 @@ impl Model {
     /// subgroup size is unsupported, or the vocab files are malformed.
     pub async fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
         // Hoisted constants/items so we don't trip items-after-statements lints.
-        const SAMPLE_BYTES: u64 = 4 * 1024;
+        const SAMPLE_BYTES: u64 = 32 * 1024;
         const fn ssbo(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             wgpu::BindGroupLayoutEntry {
                 binding,
@@ -1247,10 +1265,14 @@ impl Model {
             mapped_at_creation: false,
         });
 
-        // Sample storage + readback. Sized for: M_MAX prompt token ids during
-        // matmul prefill (M_MAX * 4 = 2048 bytes), or 2*TOPK_MAX u32 entries
-        // for the topk_reduce output (K floats + K indices = 2*64*4 = 512 bytes).
-        // 4 KB is comfortable.
+        // Sample storage + readback. Roles:
+        //   - input: M_MAX prompt token ids during matmul prefill (M_MAX*4 = 2048 B);
+        //   - intermediate: pass-1 partial top-K scratch at u32 offset 2*TOPK_MAX
+        //     (TOPK_NUM_PARTIAL_WG * 2 * TOPK_MAX u32s = 4096 B at the default
+        //     16 partials × 32 K_MAX);
+        //   - output: 2*TOPK_MAX u32 entries (K f32 logits + K u32 indices,
+        //     written by topk_merge at offset 0).
+        // 8 KiB fits all three with margin.
         let sample = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sample"),
             size: SAMPLE_BYTES,
@@ -1371,7 +1393,8 @@ impl Model {
         let sh_attn_split = load_shader!("attention_split.wgsl");
         let sh_attn_merge = load_shader!("attention_merge.wgsl");
         let sh_silu = load_shader!("silu_mul.wgsl");
-        let sh_topk = load_shader!("topk_reduce.wgsl");
+        let sh_topk_partial = load_shader!("topk_partial.wgsl");
+        let sh_topk_merge = load_shader!("topk_merge.wgsl");
         let sh_kv_writeback_fused = load_shader!("kv_writeback_fused.wgsl");
         let sh_q_norm_rope_fused = load_shader!("q_norm_rope_fused.wgsl");
 
@@ -1398,7 +1421,8 @@ impl Model {
             attn_split: make_bgl("attn_split_bgl", 4, 0b1000), // act ro, k ro, v ro, partials rw
             attn_merge: make_bgl("attn_merge_bgl", 2, 0b01), // act rw, partials ro
             silu_mul: make_bgl("silu_mul_bgl", 1, 0b1), // act rw
-            topk_reduce: make_bgl("topk_reduce_bgl", 2, 0b10), // logits ro, result rw
+            topk_partial: make_bgl("topk_partial_bgl", 2, 0b10), // logits ro, result rw
+            topk_merge: make_bgl("topk_merge_bgl", 1, 0b1), // result rw
             kv_writeback_fused: make_bgl("kv_writeback_fused_bgl", 5, 0b11000), // act ro, w_norms ro, rope_cs ro, kv_k rw, kv_v rw
             q_norm_rope_fused: make_bgl("q_norm_rope_fused_bgl", 3, 0b001), // act rw, w_norms ro, rope_cs ro
         };
@@ -1496,11 +1520,17 @@ impl Model {
                 "silu_mul",
                 size_of::<SiluMulParams>() as u32,
             ),
-            topk_reduce: mk_pipe(
-                &bgls.topk_reduce,
-                &sh_topk,
-                "topk_reduce",
-                size_of::<TopKParams>() as u32,
+            topk_partial: mk_pipe(
+                &bgls.topk_partial,
+                &sh_topk_partial,
+                "topk_partial",
+                size_of::<TopKPartialParams>() as u32,
+            ),
+            topk_merge: mk_pipe(
+                &bgls.topk_merge,
+                &sh_topk_merge,
+                "topk_merge",
+                size_of::<TopKMergeParams>() as u32,
             ),
             kv_writeback_fused: mk_pipe(
                 &bgls.kv_writeback_fused,
@@ -1889,11 +1919,12 @@ fn build_cached_bind_groups(
             &[&buffers.act, &buffers.attn_partials],
         ),
         silu_mul: mk("cached_silu_mul", &bgls.silu_mul, &[&buffers.act]),
-        topk_reduce: mk(
-            "cached_topk_reduce",
-            &bgls.topk_reduce,
+        topk_partial: mk(
+            "cached_topk_partial",
+            &bgls.topk_partial,
             &[&buffers.act, &buffers.sample],
         ),
+        topk_merge: mk("cached_topk_merge", &bgls.topk_merge, &[&buffers.sample]),
         kv_writeback_fused: mk(
             "cached_kv_writeback_fused",
             &bgls.kv_writeback_fused,
@@ -2013,7 +2044,8 @@ mod tests {
         assert!(size_of::<AttnSplitParams>() <= LIMIT);
         assert!(size_of::<AttnMergeParams>() <= LIMIT);
         assert!(size_of::<SiluMulParams>() <= LIMIT);
-        assert!(size_of::<TopKParams>() <= LIMIT);
+        assert!(size_of::<TopKPartialParams>() <= LIMIT);
+        assert!(size_of::<TopKMergeParams>() <= LIMIT);
         assert!(size_of::<KvWritebackFusedParams>() <= LIMIT);
         assert!(size_of::<QNormRopeFusedParams>() <= LIMIT);
     }

@@ -11,7 +11,7 @@
 //!     (`pos_base == 0`).
 //!
 //! Sampling lives outside this module: each entry point ends with a
-//! `topk_reduce` GPU dispatch that writes the top-K logit values + indices to
+//! topk multi-WG dispatch that writes the top-K logit values + indices to
 //! the `sample` buffer. The caller reads them back and applies its own
 //! temperature / top-p / multinomial logic on CPU.
 //!
@@ -31,8 +31,8 @@ use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
     KvWritebackFusedParams, MatmulParams, MatvecFusedNormedParams, MatvecParams, MatvecSiluParams,
-    Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams, TOPK_MAX, TopKParams,
-    WeightSet,
+    Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams, TOPK_MAX,
+    TOPK_NUM_PARTIAL_WG, TopKMergeParams, TopKPartialParams, WeightSet,
 };
 
 type MapSlot = Arc<OnceLock<StdResult<(), wgpu::BufferAsyncError>>>;
@@ -333,6 +333,14 @@ fn dispatch_matvec_q1_0_fused_normed(
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
+/// Two-pass top-K over `n` f16 logits at `in_off` (f16 elements). Pass-1
+/// (`topk_partial`) launches `TOPK_NUM_PARTIAL_WG` WGs, each producing the
+/// top-K_MAX of its `n / TOPK_NUM_PARTIAL_WG` slice into a scratch region of
+/// the `sample` buffer at u32 offset `2*TOPK_MAX`. Pass-2 (`topk_merge`)
+/// runs a single WG that merges the partial slots and writes the final top-K
+/// to `sample[out_off_u32 .. out_off_u32 + 2*k]`. The two dispatches share
+/// the same compute pass — wgpu inserts the implicit storage barrier
+/// between them.
 fn dispatch_topk_reduce(
     model: &Model,
     pass: &mut wgpu::ComputePass<'_>,
@@ -341,15 +349,31 @@ fn dispatch_topk_reduce(
     in_off: u32,
     out_off_u32: u32,
 ) {
-    let p = TopKParams {
+    // n_per_wg: ceil(n / NUM_PARTIAL_WG), rounded up to a multiple of 2 so each
+    // WG starts at an even f16 boundary (= u32 word boundary in `logits`).
+    let n_per_wg = (n.div_ceil(TOPK_NUM_PARTIAL_WG) + 1) & !1;
+    let partials_off = 2 * TOPK_MAX;
+
+    let p1 = TopKPartialParams {
         n,
         in_offset: in_off,
+        partials_off,
+        n_per_wg,
+    };
+    pass.set_pipeline(&model.pipes.topk_partial);
+    pass.set_bind_group(0, &model.cached.topk_partial, &[]);
+    pass.set_immediates(0, bytemuck::bytes_of(&p1));
+    pass.dispatch_workgroups(TOPK_NUM_PARTIAL_WG, 1, 1);
+
+    let p2 = TopKMergeParams {
+        partials_off,
+        num_partials: TOPK_NUM_PARTIAL_WG,
         out_offset: out_off_u32,
         k,
     };
-    pass.set_pipeline(&model.pipes.topk_reduce);
-    pass.set_bind_group(0, &model.cached.topk_reduce, &[]);
-    pass.set_immediates(0, bytemuck::bytes_of(&p));
+    pass.set_pipeline(&model.pipes.topk_merge);
+    pass.set_bind_group(0, &model.cached.topk_merge, &[]);
+    pass.set_immediates(0, bytemuck::bytes_of(&p2));
     pass.dispatch_workgroups(1, 1, 1);
 }
 
