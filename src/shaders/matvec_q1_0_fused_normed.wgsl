@@ -156,11 +156,14 @@ fn main(
   // so we never multiply by inv_rms here — it's baked into a_d only.
   if (tid < NB_Q8) {
     let block_v4_base = tid * 8u;
-    var max_abs: f32 = 0.0;
+    // amax over f16 staged values in f16 (V_PK_MAX_F16 on AMD); widen for the
+    // f32 inverse / round chain, which still needs full precision near ±127.
+    var max_abs_h: f16 = 0.0h;
     for (var i: u32 = 0u; i < 8u; i++) {
-      let af = abs(vec4<f32>(x_sh[block_v4_base + i]));
-      max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      let af = abs(x_sh[block_v4_base + i]);
+      max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
     }
+    let max_abs = f32(max_abs_h);
     let d = max_abs * inv_rms * (1.0 / 127.0);
     a_d_sh[tid] = d;
     let inv_max = 127.0 / max(max_abs, 1.0e-30);

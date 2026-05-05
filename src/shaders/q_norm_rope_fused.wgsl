@@ -30,7 +30,9 @@ const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 // q_sh holds normed-and-weighted Q so RoPE can fetch each thread's pair partner
 // across the head-half boundary (partners always cross a subgroup boundary at
 // WG=128). After RoPE the rotated value lives in a register; q_sh is dead.
-var<workgroup> q_sh: array<f32, 128>;
+// f16 (halved from f32): values are normed, |q| is O(1); the rotation is one
+// fma per output. Final store is f16 anyway.
+var<workgroup> q_sh: array<f16, 128>;
 // Cross-subgroup merge slot for the RMS reduction (used only when num_subgroups > 1).
 var<workgroup> sg_partial: array<f32, SG_PARTIAL_MAX>;
 
@@ -70,7 +72,7 @@ fn main(
   let inv_h = inverseSqrt(total / f32(HEAD_DIM) + p.eps);
 
   // ---- norm * weight, stash to shmem so RoPE can swap pairs ---------------
-  q_sh[tid] = q_raw * inv_h * f32(w_norms[p.w_q_norm_off + tid]);
+  q_sh[tid] = f16(q_raw * inv_h) * w_norms[p.w_q_norm_off + tid];
   workgroupBarrier();
 
   // ---- NEOX RoPE: each lane computes its own output ------------------------
@@ -80,17 +82,17 @@ fn main(
   // lane writes only its own slot and the read happened before the barrier.
   let pos_abs = p.pos_base + tok;
   let cs_base = p.rope_offset + pos_abs * HEAD_DIM;
-  var q_post: f32;
+  var q_post: f16;
   if (tid < HALF_DIM) {
-    let c = f32(rope_cs[cs_base + tid * 2u]);
-    let s = f32(rope_cs[cs_base + tid * 2u + 1u]);
+    let c = rope_cs[cs_base + tid * 2u];
+    let s = rope_cs[cs_base + tid * 2u + 1u];
     q_post = q_sh[tid] * c - q_sh[tid + HALF_DIM] * s;
   } else {
     let j = tid - HALF_DIM;
-    let c = f32(rope_cs[cs_base + j * 2u]);
-    let s = f32(rope_cs[cs_base + j * 2u + 1u]);
+    let c = rope_cs[cs_base + j * 2u];
+    let s = rope_cs[cs_base + j * 2u + 1u];
     q_post = q_sh[j] * s + q_sh[tid] * c;
   }
 
-  act[q_idx] = f16(q_post);
+  act[q_idx] = q_post;
 }

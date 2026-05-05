@@ -43,7 +43,10 @@ const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 // can fetch each thread's pair partner across the head-half boundary
 // (partners always cross a subgroup boundary at WG=128). After RoPE the
 // rotated value lives in a register; k_sh is dead and not reused.
-var<workgroup> k_sh: array<f32, 128>;
+// f16 (halved from f32): values are normed, |k| is O(1); rotation in f16.
+// Result widens to f32 only for the Q8_0 quantize step, where round-near-
+// 127 needs full precision.
+var<workgroup> k_sh: array<f16, 128>;
 // Used by the RMS cross-subgroup merge (slot 0..num_subgroups; only .x), and
 // when SUBGROUP_MIN_SIZE < 32 also by the amax cross-cluster merge that
 // finishes the per-32 reduction (writes both .x=K, .y=V).
@@ -86,7 +89,7 @@ fn main(
   let inv_h = inverseSqrt(total / f32(HEAD_DIM) + p.eps);
 
   // ---- norm * weight, stash to shmem so RoPE can swap pairs ---------------
-  k_sh[tid] = k_raw * inv_h * f32(w_norms[p.w_k_norm_off + tid]);
+  k_sh[tid] = f16(k_raw * inv_h) * w_norms[p.w_k_norm_off + tid];
   workgroupBarrier();
 
   // ---- NEOX RoPE: each lane computes its own output, kept in a register ---
@@ -95,17 +98,19 @@ fn main(
   // No second shmem round-trip / barrier; k_sh is dead from here on.
   let pos_abs = p.pos_base + tok;
   let cs_base = p.rope_offset + pos_abs * HEAD_DIM;
-  var k_post: f32;
+  var k_post_h: f16;
   if (tid < HALF_DIM) {
-    let c = f32(rope_cs[cs_base + tid * 2u]);
-    let s = f32(rope_cs[cs_base + tid * 2u + 1u]);
-    k_post = k_sh[tid] * c - k_sh[tid + HALF_DIM] * s;
+    let c = rope_cs[cs_base + tid * 2u];
+    let s = rope_cs[cs_base + tid * 2u + 1u];
+    k_post_h = k_sh[tid] * c - k_sh[tid + HALF_DIM] * s;
   } else {
     let j = tid - HALF_DIM;
-    let c = f32(rope_cs[cs_base + j * 2u]);
-    let s = f32(rope_cs[cs_base + j * 2u + 1u]);
-    k_post = k_sh[j] * s + k_sh[tid] * c;
+    let c = rope_cs[cs_base + j * 2u];
+    let s = rope_cs[cs_base + j * 2u + 1u];
+    k_post_h = k_sh[j] * s + k_sh[tid] * c;
   }
+  // Widen for Q8_0 quantize (round-near-±127 wants f32 precision).
+  let k_post = f32(k_post_h);
 
   // ---- Per-32-block amax for K and V via subgroup butterfly ---------------
   // Replaces the 5-level shmem tree. Masks 1/2/4 are always safe

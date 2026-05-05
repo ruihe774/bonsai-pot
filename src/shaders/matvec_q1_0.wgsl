@@ -96,59 +96,63 @@ fn main(
 
       var v0: vec4<f16>; var v1: vec4<f16>; var v2: vec4<f16>; var v3: vec4<f16>;
       var v4: vec4<f16>; var v5: vec4<f16>; var v6: vec4<f16>; var v7: vec4<f16>;
-      var max_abs: f32 = 0.0;
+      // amax over f16 inputs in f16 (V_PK_MAX_F16 on AMD). Bit-exact vs the
+      // f32 path because f16→f32 widens losslessly. The downstream
+      // `1/max_abs` and the round-to-int still happen in f32.
+      var max_abs_h: f16 = 0.0h;
 
       // Inline-unrolled to keep the f16 vec4 reads in named scalars (so the
       // WGSL→SPIR-V→AMD-LLVM pipeline keeps them in registers, not LDS).
       {
         let b = (in_v4_off + 0u) << 2u;
         v0 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v0));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v0);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 1u) << 2u;
         v1 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v1));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v1);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 2u) << 2u;
         v2 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v2));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v2);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 3u) << 2u;
         v3 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v3));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v3);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 4u) << 2u;
         v4 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v4));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v4);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 5u) << 2u;
         v5 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v5));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v5);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 6u) << 2u;
         v6 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v6));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v6);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
       {
         let b = (in_v4_off + 7u) << 2u;
         v7 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
-        let af = abs(vec4<f32>(v7));
-        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+        let af = abs(v7);
+        max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
       }
 
+      let max_abs = f32(max_abs_h);
       let d = max_abs * (1.0 / 127.0);
       a_d_sh[tid] = d;
       let inv_max = 127.0 / max(max_abs, 1.0e-30);
