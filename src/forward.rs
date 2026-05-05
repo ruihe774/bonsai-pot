@@ -1260,10 +1260,10 @@ impl<'m> BenchMarker<'m> {
     }
 
     /// After the step CB has been submitted and polled (GPU work done),
-    /// resolve all timestamps and return `(label, duration_ns)` spans.
-    /// Each span is the GPU time between the previous and current mark.
-    /// The "start" sentinel is consumed but not returned as a span.
-    pub fn resolve(self) -> Result<Vec<(&'static str, f32)>> {
+    /// resolve all timestamps. Returns raw ticks plus their labels; callers
+    /// pick what they need via [`BenchTimings::total_ns`] (cheap) or
+    /// [`BenchTimings::spans`] (per-mark deltas).
+    pub fn resolve(self) -> Result<BenchTimings> {
         use core::result::Result as StdResult;
         use std::sync::{Arc, OnceLock};
 
@@ -1273,7 +1273,11 @@ impl<'m> BenchMarker<'m> {
 
         let n = self.next_idx;
         if n < 2 {
-            return Ok(vec![]);
+            return Ok(BenchTimings {
+                period_ns: self.model.bench_ts_period_ns,
+                labels: self.labels,
+                ticks: Vec::new(),
+            });
         }
         let bytes = u64::from(n) * 8;
 
@@ -1318,16 +1322,49 @@ impl<'m> BenchMarker<'m> {
         }
 
         let data = slice.get_mapped_range();
-        let ticks: &[u64] = bytemuck::cast_slice(&data[..bytes as usize]);
-        let period = self.model.bench_ts_period_ns;
-        let mut spans: Vec<(&'static str, f32)> = Vec::with_capacity((n - 1) as usize);
-        for i in 1..n as usize {
-            let dt_ns = ticks[i].saturating_sub(ticks[i - 1]) as f32 * period;
-            spans.push((self.labels[i], dt_ns));
-        }
+        let ticks: Vec<u64> = bytemuck::cast_slice::<_, u64>(&data[..bytes as usize]).to_vec();
         drop(data);
         self.model.buffers.bench_readback.unmap();
-        Ok(spans)
+        Ok(BenchTimings {
+            period_ns: self.model.bench_ts_period_ns,
+            labels: self.labels,
+            ticks,
+        })
+    }
+}
+
+/// Resolved GPU timestamps from a [`BenchMarker`].
+///
+/// `labels[i]` is the label of the mark at `ticks[i]`; `labels[0]` is the
+/// "start" sentinel. Empty `ticks` means fewer than two marks were written.
+#[cfg(feature = "bench-internals")]
+pub struct BenchTimings {
+    period_ns: f32,
+    labels: Vec<&'static str>,
+    ticks: Vec<u64>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl BenchTimings {
+    /// Total GPU time from the first mark to the last, in nanoseconds.
+    pub fn total_ns(&self) -> f32 {
+        let (Some(first), Some(last)) = (self.ticks.first(), self.ticks.last()) else {
+            return 0.0;
+        };
+        if self.ticks.len() < 2 {
+            return 0.0;
+        }
+        last.saturating_sub(*first) as f32 * self.period_ns
+    }
+
+    /// Per-span `(label, duration_ns)` iterator. Each span is the GPU time
+    /// between the previous and current mark; the "start" sentinel is skipped.
+    pub fn spans(&self) -> impl Iterator<Item = (&'static str, f32)> + '_ {
+        let p = self.period_ns;
+        self.ticks
+            .windows(2)
+            .enumerate()
+            .map(move |(i, w)| (self.labels[i + 1], w[1].saturating_sub(w[0]) as f32 * p))
     }
 }
 
