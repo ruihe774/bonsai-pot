@@ -1,17 +1,21 @@
 enable f16;
+requires packed_4x8_integer_dot_product;
 
-// Multiply-free Q1_0 matvec.
-// Multi-row workgroup: WG_X threads cooperate per row, ROWS_PER_WG rows per WG.
-// Each thread accumulates ±xv per weight via select(), then scales by d.
-// Layout: weights_buf has [d-array][qs-array]; per row r:
-//   d[r, 0..nb] : 2·nb bytes starting at d_offset + r*nb*2
-//   qs[r, 0..nb, 0..16]: nb*16 bytes starting at qs_offset + r*nb*16
-//   (qs region is u32-aligned by extract.py's pad4)
+// Q1_0 matvec with an in-LDS Q8_0 activation quantize, so the inner loop runs
+// as `expand_4_bits(sign_nibble) · dot4I8Packed(...)` against the staged i8
+// activation. Used by the matvec-path Wo and lm_head dispatches.
 //
-// Activation `x` is staged into an LDS tile so the 16 ty-rows in each WG share
-// loads instead of redundantly fetching from global per-row, and so the inner
-// body can issue vec4<f16> reads to halve instruction count vs. scalar
-// f16-per-bit.
+// Per tile: each thread takes ownership of one Q8_0 block (32 elements = 8
+// vec4<f16>), loads them from global, finds max-abs in registers, quantizes
+// and writes to `a_qs_sh` + `a_d_sh`. After a workgroup barrier, the matvec
+// inner over the tile runs the dot4I8Packed loop. No f16 activation staging
+// in LDS — the loaded values stay in per-thread registers long enough to
+// compute max-abs and quantize, freeing LDS for a wider tile.
+//
+// TILE_K=4096 with WG=128 gives 1 Q8_0 block per thread on a full tile.
+// Wo (K=4096) fits in one tile; lm_head (K=2560) likewise (with 80/128
+// threads active in the quantize phase). The trailing partial tile is
+// handled by the `tid < nb_q8_tile` guard.
 
 struct Params {
   k: u32,
@@ -34,22 +38,25 @@ fn load_f16_at(b_offset: u32) -> f32 {
   return unpack2x16float(half).x;
 }
 
+fn expand_4_bits(bits: u32) -> u32 {
+  let spread = (bits & 1u)
+             | ((bits & 2u) <<  7u)
+             | ((bits & 4u) << 14u)
+             | ((bits & 8u) << 21u);
+  return ~(spread * 0xFEu);
+}
+
 const WG_X: u32 = 8u;
 const WG_Y: u32 = 16u;
 const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
 
-// LDS tile size for the staged input activations. K values used by
-// matvec_q1_0 dispatches (n_embd=2560, q_dim=4096) aren't all multiples of
-// TILE_K, so the loop handles a partial trailing tile (K and all tile
-// boundaries are multiples of 128 = the q1_0 block size).
-// 2048 was empirically the sweet spot at 128 threads/WG on RDNA4 — 4 KiB of
-// LDS keeps occupancy high while still amortizing redundant per-row reads.
-// (TILE_K=4096 hurts wo's 11.6→13.6us; TILE_K=1024 is a wash.)
-const TILE_K: u32 = 2048u;
-const TILE_VEC4: u32 = TILE_K / 4u;
+const TILE_K: u32 = 4096u;
+const TILE_NB_Q8: u32 = TILE_K / 32u;   // = 128, matches WG
+const TILE_QS_LEN: u32 = TILE_K >> 2u;  // u32 slots packing the i8 activation
 
-var<workgroup> x_sh: array<vec4<f16>, TILE_VEC4>;
+var<workgroup> a_qs_sh: array<u32, TILE_QS_LEN>;
+var<workgroup> a_d_sh: array<f32, TILE_NB_Q8>;
 
 @compute @workgroup_size(WG_X, WG_Y)
 fn main(
@@ -62,65 +69,132 @@ fn main(
   let ty = lid.y;
   let tid = ty * WG_X + tx;
   let valid = row < p.n;
-  let nb = p.k / 128u;
+  let nb_q1 = p.k / 128u;
 
-  let row_d_byte  = p.d_offset  + row * nb * 2u;
-  let row_qs_byte = p.qs_offset + row * nb * 16u;
+  let row_d_byte  = p.d_offset  + row * nb_q1 * 2u;
+  let row_qs_byte = p.qs_offset + row * nb_q1 * 16u;
 
-  var acc: f32;
+  var acc: f32 = 0.0;
 
   for (var tile_start: u32 = 0u; tile_start < p.k; tile_start += TILE_K) {
     let tile_size = min(TILE_K, p.k - tile_start);
-    let tile_v4 = tile_size >> 2u;
-    let nb_tile = tile_size / 128u;
+    let nb_q8_tile = tile_size / 32u;
+    let nb_q1_tile = tile_size / 128u;
 
-    // Cooperative vec4<f16> load of the activation tile into LDS.
-    let in_v4_off = (p.input_offset + tile_start) >> 2u;
-    for (var v: u32 = tid; v < tile_v4; v += WG) {
-      let base = (in_v4_off + v) << 2u;
-      x_sh[v] = vec4<f16>(
-        act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u],
-      );
+    // ---- Stage 1+2: each thread handles one Q8_0 block of the tile ----
+    // Load 32 elements; find max-abs in registers; quantize; store to
+    // a_qs_sh + a_d_sh.
+    if (tid < nb_q8_tile) {
+      let elem_base = tile_start + tid * 32u;
+      let in_v4_off = (p.input_offset + elem_base) >> 2u;
+
+      var v0: vec4<f16>; var v1: vec4<f16>; var v2: vec4<f16>; var v3: vec4<f16>;
+      var v4: vec4<f16>; var v5: vec4<f16>; var v6: vec4<f16>; var v7: vec4<f16>;
+      var max_abs: f32 = 0.0;
+
+      // Inline-unrolled to keep the f16 vec4 reads in named scalars (so the
+      // WGSL→SPIR-V→AMD-LLVM pipeline keeps them in registers, not LDS).
+      {
+        let b = (in_v4_off + 0u) << 2u;
+        v0 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v0));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 1u) << 2u;
+        v1 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v1));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 2u) << 2u;
+        v2 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v2));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 3u) << 2u;
+        v3 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v3));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 4u) << 2u;
+        v4 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v4));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 5u) << 2u;
+        v5 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v5));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 6u) << 2u;
+        v6 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v6));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+      {
+        let b = (in_v4_off + 7u) << 2u;
+        v7 = vec4<f16>(act[b], act[b+1u], act[b+2u], act[b+3u]);
+        let af = abs(vec4<f32>(v7));
+        max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+      }
+
+      let d = max_abs * (1.0 / 127.0);
+      a_d_sh[tid] = d;
+      let inv_max = 127.0 / max(max_abs, 1.0e-30);
+      let qs_base = tid * 8u;
+      let q0v = clamp(round(vec4<f32>(v0) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 0u] = (u32(i32(q0v.x)) & 0xFFu) | ((u32(i32(q0v.y)) & 0xFFu) << 8u) | ((u32(i32(q0v.z)) & 0xFFu) << 16u) | ((u32(i32(q0v.w)) & 0xFFu) << 24u);
+      let q1v = clamp(round(vec4<f32>(v1) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 1u] = (u32(i32(q1v.x)) & 0xFFu) | ((u32(i32(q1v.y)) & 0xFFu) << 8u) | ((u32(i32(q1v.z)) & 0xFFu) << 16u) | ((u32(i32(q1v.w)) & 0xFFu) << 24u);
+      let q2v = clamp(round(vec4<f32>(v2) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 2u] = (u32(i32(q2v.x)) & 0xFFu) | ((u32(i32(q2v.y)) & 0xFFu) << 8u) | ((u32(i32(q2v.z)) & 0xFFu) << 16u) | ((u32(i32(q2v.w)) & 0xFFu) << 24u);
+      let q3v = clamp(round(vec4<f32>(v3) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 3u] = (u32(i32(q3v.x)) & 0xFFu) | ((u32(i32(q3v.y)) & 0xFFu) << 8u) | ((u32(i32(q3v.z)) & 0xFFu) << 16u) | ((u32(i32(q3v.w)) & 0xFFu) << 24u);
+      let q4v = clamp(round(vec4<f32>(v4) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 4u] = (u32(i32(q4v.x)) & 0xFFu) | ((u32(i32(q4v.y)) & 0xFFu) << 8u) | ((u32(i32(q4v.z)) & 0xFFu) << 16u) | ((u32(i32(q4v.w)) & 0xFFu) << 24u);
+      let q5v = clamp(round(vec4<f32>(v5) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 5u] = (u32(i32(q5v.x)) & 0xFFu) | ((u32(i32(q5v.y)) & 0xFFu) << 8u) | ((u32(i32(q5v.z)) & 0xFFu) << 16u) | ((u32(i32(q5v.w)) & 0xFFu) << 24u);
+      let q6v = clamp(round(vec4<f32>(v6) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 6u] = (u32(i32(q6v.x)) & 0xFFu) | ((u32(i32(q6v.y)) & 0xFFu) << 8u) | ((u32(i32(q6v.z)) & 0xFFu) << 16u) | ((u32(i32(q6v.w)) & 0xFFu) << 24u);
+      let q7v = clamp(round(vec4<f32>(v7) * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      a_qs_sh[qs_base + 7u] = (u32(i32(q7v.x)) & 0xFFu) | ((u32(i32(q7v.y)) & 0xFFu) << 8u) | ((u32(i32(q7v.z)) & 0xFFu) << 16u) | ((u32(i32(q7v.w)) & 0xFFu) << 24u);
     }
     workgroupBarrier();
 
+    // ---- Stage 3: matvec inner over this tile, dot4I8Packed style ----
     if (valid) {
-      let b_base = tile_start / 128u;
-      for (var b_local: u32 = tx; b_local < nb_tile; b_local += WG_X) {
-        let b = b_base + b_local;
-        let d = load_f16_at(row_d_byte + b * 2u);
+      let b_q1_base_global = tile_start / 128u;
+      for (var b_local: u32 = tx; b_local < nb_q1_tile; b_local += WG_X) {
+        let b = b_q1_base_global + b_local;
+        let d_w = load_f16_at(row_d_byte + b * 2u);
         let qs_word_base = (row_qs_byte + b * 16u) >> 2u;
-        let x_v4_base = b_local * 32u;  // 128 elements / 4 = 32 vec4s per block
-        // Accumulate in f16 across the block (max 128 ±xv values, well under
-        // the f16 representable range for typical post-norm activations) so the
-        // 32 inner adds stay packed and avoid the f16→f32 widening per step.
-        var block_acc: vec4<f16> = vec4<f16>(0.0);
-        for (var w: u32 = 0u; w < 4u; w++) {
-          let qword = weights[qs_word_base + w];
-          // Process 32 sign bits in 8 groups of 4, one vec4<f16> per group.
+        let a_block_local_base = b_local * 4u;
+        var sub_acc: f32 = 0.0;
+        for (var s: u32 = 0u; s < 4u; s++) {
+          let qword = weights[qs_word_base + s];
+          let a_d = a_d_sh[a_block_local_base + s];
+          let qs_l_base = (a_block_local_base + s) * 8u;
+          var sumi: i32 = 0;
           for (var i: u32 = 0u; i < 8u; i++) {
             let bits = (qword >> (i * 4u)) & 0xFu;
-            let mask4 = vec4<bool>(
-              (bits & 1u) != 0u,
-              (bits & 2u) != 0u,
-              (bits & 4u) != 0u,
-              (bits & 8u) != 0u,
-            );
-            let xv4 = x_sh[x_v4_base + w * 8u + i];
-            block_acc += select(-xv4, xv4, mask4);
+            let w_packed = expand_4_bits(bits);
+            let a_packed = a_qs_sh[qs_l_base + i];
+            sumi = dot4I8Packed(w_packed, a_packed) + sumi;
           }
+          sub_acc = sub_acc + a_d * f32(sumi);
         }
-        let lane_sum = f32(block_acc.x + block_acc.y + block_acc.z + block_acc.w);
-        acc = acc + d * lane_sum;
+        acc = acc + d_w * sub_acc;
       }
     }
     workgroupBarrier();
   }
 
-  // 8-lane row-wise reduction via subgroup-shuffle butterfly. Local invocation
-  // index is `tx + ty*8`, so masks 1/2/4 stay within the current row's tx
-  // bits. Requires SG_SIZE >= 8 and the row-major lid → subgroup_invocation_id
-  // mapping (universal on AMD/NVIDIA/Intel/Apple); not specific to wave64.
+  // 8-lane row-wise reduction via subgroup-shuffle butterfly.
   acc = acc + subgroupShuffleXor(acc, 1u);
   acc = acc + subgroupShuffleXor(acc, 2u);
   acc = acc + subgroupShuffleXor(acc, 4u);

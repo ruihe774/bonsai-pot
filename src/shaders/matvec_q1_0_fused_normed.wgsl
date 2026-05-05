@@ -1,29 +1,31 @@
 enable f16;
+requires packed_4x8_integer_dot_product;
 
 // Multi-range Q1_0 matvec **fused with the preceding RMS-norm + scale**:
 // one dispatch produces output rows for 2 or 3 separate weight tensors that
 // share the same K dimension and the same input activation. Used for the
 // matvec single-token (tg) path's fused QKV (3 ranges) and gate+up (2 ranges)
-// projections, where the activation `x` is preceded by an `rms_norm(x) * w`
-// step. This kernel folds that step in by:
-//   1. loading `x[i] * w_norm[i]` into shmem and accumulating Σ x[i]² in f32;
-//   2. reducing the sum and computing `inv_rms = 1 / sqrt(mean(x²) + eps)`;
-//   3. running the matvec inner loop with per-block scale `d * inv_rms` —
-//      so Σ sign[i] · (x[i]·w_norm[i]) · (d·inv_rms) computes the same
-//      output as `matvec(rms_norm(x) * w_norm)` would, with one global LDS
-//      pass over x_sh and a single FMA bake of inv_rms into d.
-// The 2 dispatches per layer that this replaces (rms_norm + matvec_q1_0_fused)
-// collapse into 1 — saves 72 dispatches/step at n_layer=36 plus the global
-// x_norm round-trip.
+// projections.
 //
-// Per-WG layout: WG_X=8 threads cooperate per row, ROWS_PER_WG=16 rows per
-// workgroup (WG=128, i.e. 2 wave64 / 4 wave32). Tuned vs. the unfused
-// matvec_q1_0_fused.wgsl: amortizing the full-row x_sh load across more rows
-// pays for itself once the LDS stage absorbs the rms-norm reduction. Range
-// sizes (n_0, n_1, n_2) must all be multiples of ROWS_PER_WG so no workgroup
-// straddles a range boundary. Activation `x` is staged into LDS in full (no
-// tiling) so x_sh covers the full row of normed-and-weighted x for the inner
-// loop.
+// Inner matmul uses dot4I8Packed: stage 1 stages `x*w_norm` to f16 LDS while
+// accumulating ssq; after the cross-WG ssq reduce gives `inv_rms`, stage 2
+// quantizes the staged values to Q8_0 (32-element blocks, FP32 d + 4 i8 per
+// u32 packed); stage 3 runs the matmul as expand_4_bits(sign_nibble) ·
+// dot4I8Packed against the staged Q8_0 activation, scaled by per-Q1_0-block
+// d × per-Q8_0-block d. This replaces the previous `select(-xv, xv, mask) +
+// vec4<f16> add` inner loop with one dot4 per 4 weights — same instruction
+// count per nibble, but each nibble issues a single V_DOT4_I32_I8 instead of
+// 4 cndmask + 2 v_pk_add, plus halves the per-block LDS-load bandwidth (i8
+// activation reads as ds_read_b32 vs vec4<f16> as ds_read_b64).
+//
+// The Q1_0 d carries `inv_rms` baked in via `a_d = max_abs * inv_rms / 127`,
+// so the matvec output equals `matvec(rms_norm(x) * w_norm)` exactly, modulo
+// Q8_0 round-off (max relative error ~1/254 per element, well within the
+// noise floor of the Q1_0 weights).
+//
+// Per-WG layout: WG_X=8 threads per row, ROWS_PER_WG=16 rows per WG (WG=128).
+// Range sizes (n_0, n_1, n_2) must all be multiples of ROWS_PER_WG so no
+// workgroup straddles a range boundary.
 
 struct Params {
   k: u32,
@@ -51,32 +53,42 @@ fn load_f16_at(b_offset: u32) -> f32 {
   return unpack2x16float(half).x;
 }
 
+// Expand 4 sign bits to packed-i8 ±1 (0x01 if bit set, 0xFF if clear).
+fn expand_4_bits(bits: u32) -> u32 {
+  let spread = (bits & 1u)
+             | ((bits & 2u) <<  7u)
+             | ((bits & 4u) << 14u)
+             | ((bits & 8u) << 21u);
+  return ~(spread * 0xFEu);
+}
+
 const WG_X: u32 = 8u;
 const WG_Y: u32 = 16u;
 const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
 
-// `K_V4` = n_embd / 4, baked at load time per model so x_sh fits the actual
-// row exactly (5 KiB at 4B; 8 KiB at 8B). AMD RDNA allocates LDS in 1 KiB
-// granularity per WG, so right-sizing matters for occupancy.
+// `K_V4` = n_embd / 4, baked at load time per model so the LDS arrays fit
+// the actual row exactly.
 const K_V4: u32 = {{N_EMBD_V4}}u;
+const K: u32 = K_V4 << 2u;
+const NB_Q8: u32 = K / 32u;          // # Q8_0 blocks across K
+const A_QS_LEN: u32 = K >> 2u;        // K bytes packed as u32 (= K_V4)
 
-// SUBGROUP_MIN_SIZE is baked from adapter.subgroup_min_size at load time.
-// SG_PARTIAL_MAX is the worst-case number of subgroups per workgroup.
 const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
 const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
+// f16 staging for `x * w_norm`. Used by stage 1 (load + ssq) and consumed by
+// stage 2 (quantize). Dead after stage 2 — could in principle alias with
+// a_qs_sh, but WGSL has no union/alias mechanism and the saved LDS isn't
+// worth the indirection complexity here.
 var<workgroup> x_sh: array<vec4<f16>, K_V4>;
+// Q8_0 staged activation: K bytes of i8 packed 4 per u32.
+var<workgroup> a_qs_sh: array<u32, A_QS_LEN>;
+// Q8_0 per-block scales (FP32, with inv_rms folded in).
+var<workgroup> a_d_sh: array<f32, NB_Q8>;
 // Cross-subgroup merge slot for the RMS reduction (only used when num_subgroups > 1).
 var<workgroup> sg_partial: array<f32, SG_PARTIAL_MAX>;
 
-// 1-D workgroup so we can use `@builtin(subgroup_id)` /
-// `@builtin(subgroup_invocation_id)` — naga rejects subgroup builtins on
-// multi-dimensional workgroups. The (tx, ty) of the matvec_q1_0_fused 2-D
-// layout is reconstructed from `local_invocation_index` below: `ty = tid /
-// WG_X`, `tx = tid % WG_X`. Since `subgroup_invocation_id` increases linearly
-// with `local_invocation_index` (true on AMD/NVIDIA/Intel/Apple), the per-row
-// 8-lane subgroupShuffleXor butterfly used at the end still holds.
 @compute @workgroup_size(WG)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
@@ -90,23 +102,13 @@ fn main(
   let tx = tid % WG_X;
   let global_row = wg_idx * ROWS_PER_WG + ty;
   let valid = global_row < p.n_total;
-  // K is fixed = n_embd (baked via K_V4); the matvec single-token path's
-  // fused QKV / gate+up callers always pass `k = n_embd`. We assert the
-  // uniform `p.k` matches on the host side.
-  let nb = (K_V4 << 2u) / 128u;
-  let k_v4 = K_V4;
+  let nb_q1 = K / 128u;
 
-  // ---- Stage 1: load x into shmem PRE-MULTIPLIED BY w_norm, accumulate ssq.
-  // We bake w_norm into x_sh during the load, then bake inv_rms into the
-  // matvec's per-block `d` scale once below — so the multiply-free inner
-  // loop only sees `(x * w_norm)` in shmem and a single `d_eff = d * inv_rms`
-  // per block. This avoids a second pass through x_sh (which would add
-  // ~k_v4/WG worth of LDS round-trip per WG; with 2432 gate_up WGs that's
-  // measurable). ssq is computed from the raw x (before w_norm scale).
+  // ---- Stage 1: load x and w_norm; stage `x * w_norm` into x_sh; accumulate ssq.
   let in_v4_off = p.input_offset >> 2u;
   let w_v4_off = p.w_norm_off >> 2u;
   var ssq: f32 = 0.0;
-  for (var v: u32 = tid; v < k_v4; v += WG) {
+  for (var v: u32 = tid; v < K_V4; v += WG) {
     let base = (in_v4_off + v) << 2u;
     let xv4 = vec4<f16>(
       act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u],
@@ -121,7 +123,7 @@ fn main(
     x_sh[v] = xv4 * wv4;
   }
 
-  // ---- Stage 2: workgroup-wide sum (subgroupAdd + cross-subgroup merge) ----
+  // ---- Stage 1.5: workgroup-wide ssq sum (subgroupAdd + cross-subgroup merge) ----
   let sg_sum = subgroupAdd(ssq);
   var total: f32;
   if (num_subgroups == 1u) {
@@ -138,10 +140,38 @@ fn main(
     workgroupBarrier();
     total = sg_partial[0];
   }
-  let inv_rms = inverseSqrt(total / f32(K_V4 << 2u) + p.eps);
+  let inv_rms = inverseSqrt(total / f32(K) + p.eps);
   workgroupBarrier();
 
-  // ---- Stage 3: matvec inner loop (full-row, no tiling — x_sh covers k) ----
+  // ---- Stage 2: quantize each Q8_0 block (32 elements = 8 vec4<f16>) of
+  // `x * w_norm * inv_rms` to i8 (`a_qs_sh`) + FP32 d with inv_rms folded
+  // (`a_d_sh`). Each thread owns one block; threads with tid >= NB_Q8 idle.
+  // q[i] = round(127 * (x * w_norm) / max_abs_block) is invariant to inv_rms,
+  // so we never multiply by inv_rms here — it's baked into a_d only.
+  if (tid < NB_Q8) {
+    let block_v4_base = tid * 8u;
+    var max_abs: f32 = 0.0;
+    for (var i: u32 = 0u; i < 8u; i++) {
+      let af = abs(vec4<f32>(x_sh[block_v4_base + i]));
+      max_abs = max(max_abs, max(max(af.x, af.y), max(af.z, af.w)));
+    }
+    let d = max_abs * inv_rms * (1.0 / 127.0);
+    a_d_sh[tid] = d;
+    let inv_max = 127.0 / max(max_abs, 1.0e-30);
+    let qs_base = tid * 8u;
+    for (var i: u32 = 0u; i < 8u; i++) {
+      let v = vec4<f32>(x_sh[block_v4_base + i]);
+      let q = clamp(round(v * inv_max), vec4<f32>(-128.0), vec4<f32>(127.0));
+      let q0 = u32(i32(q.x)) & 0xFFu;
+      let q1 = u32(i32(q.y)) & 0xFFu;
+      let q2 = u32(i32(q.z)) & 0xFFu;
+      let q3 = u32(i32(q.w)) & 0xFFu;
+      a_qs_sh[qs_base + i] = q0 | (q1 << 8u) | (q2 << 16u) | (q3 << 24u);
+    }
+  }
+  workgroupBarrier();
+
+  // ---- Stage 3: matvec inner loop (full-row, no tiling — a_qs_sh covers k) ----
   // Resolve which range this row belongs to. Range sizes are guaranteed to be
   // multiples of ROWS_PER_WG, so the entire WG falls in a single range and the
   // branches below are uniform across the workgroup.
@@ -162,43 +192,36 @@ fn main(
     }
   }
 
-  let row_d_byte  = d_off  + local_row * nb * 2u;
-  let row_qs_byte = qs_off + local_row * nb * 16u;
+  let row_d_byte  = d_off  + local_row * nb_q1 * 2u;
+  let row_qs_byte = qs_off + local_row * nb_q1 * 16u;
 
-  var acc: f32;
+  var acc: f32 = 0.0;
   if (valid) {
-    for (var b: u32 = tx; b < nb; b += WG_X) {
-      // d_eff = d * inv_rms — folds the RMS-norm scale into the per-block
-      // weight scale. Combined with `x_sh` already containing `x * w_norm`,
-      // the inner accumulator computes Σ sign[i] * (x*w_norm)[i] * (d*inv_rms)
-      //   = Σ sign[i] * x[i] * inv_rms * w_norm[i] * d
-      //   = ⟨normed_x, q1_0_row⟩, exactly the rms_norm + matvec composition.
-      let d_eff = load_f16_at(row_d_byte + b * 2u) * inv_rms;
+    for (var b: u32 = tx; b < nb_q1; b += WG_X) {
+      let d_w = load_f16_at(row_d_byte + b * 2u);
       let qs_word_base = (row_qs_byte + b * 16u) >> 2u;
-      let x_v4_base = b * 32u;
-      // f16 accumulator across the 128-weight block — see matvec_q1_0.wgsl.
-      var block_acc: vec4<f16> = vec4<f16>(0.0);
-      for (var w: u32 = 0u; w < 4u; w++) {
-        let qword = weights[qs_word_base + w];
+      // Each Q1_0 block (128 weights) covers 4 Q8_0 sub-blocks.
+      let a_block_base = b * 4u;
+      var sub_acc: f32 = 0.0;
+      for (var s: u32 = 0u; s < 4u; s++) {
+        let qword = weights[qs_word_base + s];
+        let a_d = a_d_sh[a_block_base + s];
+        let qs_l_base = (a_block_base + s) * 8u;
+        var sumi: i32 = 0;
+        // 8 dot4s × 4 weights = 32 weights = one Q8_0 sub-block.
         for (var i: u32 = 0u; i < 8u; i++) {
           let bits = (qword >> (i * 4u)) & 0xFu;
-          let mask4 = vec4<bool>(
-            (bits & 1u) != 0u,
-            (bits & 2u) != 0u,
-            (bits & 4u) != 0u,
-            (bits & 8u) != 0u,
-          );
-          let xv4 = x_sh[x_v4_base + w * 8u + i];
-          block_acc += select(-xv4, xv4, mask4);
+          let w_packed = expand_4_bits(bits);
+          let a_packed = a_qs_sh[qs_l_base + i];
+          sumi = dot4I8Packed(w_packed, a_packed) + sumi;
         }
+        sub_acc = sub_acc + a_d * f32(sumi);
       }
-      let lane_sum = f32(block_acc.x + block_acc.y + block_acc.z + block_acc.w);
-      acc = acc + d_eff * lane_sum;
+      acc = acc + d_w * sub_acc;
     }
   }
 
-  // 8-lane row-wise reduction via subgroup-shuffle butterfly (see matvec_q1_0
-  // for the SG_SIZE / lid-mapping assumptions).
+  // 8-lane row-wise reduction via subgroup-shuffle butterfly (see matvec_q1_0).
   acc = acc + subgroupShuffleXor(acc, 1u);
   acc = acc + subgroupShuffleXor(acc, 2u);
   acc = acc + subgroupShuffleXor(acc, 4u);
