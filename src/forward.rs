@@ -22,6 +22,9 @@
 //! of a given (kind, weight buffer) pair, since the dynamic uniform offset is
 //! the only per-dispatch variation.
 
+use std::result::Result as StdResult;
+use std::sync::{Arc, OnceLock};
+
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
@@ -29,6 +32,8 @@ use crate::model::{
     Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams, TOPK_MAX, TopKParams,
     WeightSet,
 };
+
+type MapSlot = Arc<OnceLock<StdResult<(), wgpu::BufferAsyncError>>>;
 
 // ---------- Q8_0 KV cache layout helpers ------------------------------------
 // Each kv_{k,v} buffer carries:
@@ -95,6 +100,23 @@ impl<'a> StepEncoder<'a> {
             0,
             bytes,
         );
+    }
+
+    /// Schedule a `MAP_READ` mapping of the readback buffer on submission.
+    /// Must be called after [`copy_sample_to_readback`] and before [`finish`].
+    /// Returns the slot that [`wait_topk_readback`] will drain.
+    pub fn schedule_topk_map(&self, bytes: u64) -> MapSlot {
+        let slot: MapSlot = Arc::new(OnceLock::new());
+        let slot2 = slot.clone();
+        self.encoder.map_buffer_on_submit(
+            &self.model.buffers.readback,
+            wgpu::MapMode::Read,
+            0..bytes,
+            move |res| {
+                let _ = slot2.set(res);
+            },
+        );
+        slot
     }
 
     pub fn finish(self) -> wgpu::CommandBuffer {
@@ -490,25 +512,16 @@ fn dispatch_attention(
 
 // ---------- async readback helper -------------------------------------------
 
-/// Wait the `sample → readback` copy that was already encoded into the
-/// step's command buffer (via [`StepEncoder::copy_sample_to_readback`]) and
-/// return the K f32 logits + K u32 indices the caller asked for.
+/// Wait for the readback mapping scheduled via [`StepEncoder::schedule_topk_map`]
+/// to complete and return the K f32 logits + K u32 indices.
 ///
-/// This must be called AFTER the step's command buffer has been submitted —
-/// i.e. the readback copy is in flight. There is no separate submit here.
-pub fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)> {
-    use core::result::Result as StdResult;
-    use std::sync::{Arc, OnceLock};
-
-    use wgpu::{BufferAsyncError, PollType};
-    type MapResult = StdResult<(), BufferAsyncError>;
+/// `slot` must have been obtained from `schedule_topk_map` on the encoder that
+/// produced the submitted command buffer. The mapping fires at submit time;
+/// this call just polls until GPU work finishes.
+pub fn wait_topk_readback(model: &Model, k: u32, slot: MapSlot) -> Result<(Vec<f32>, Vec<u32>)> {
+    use wgpu::PollType;
     let bytes = u64::from(k) * 8; // K f32 + K u32
     let slice = model.buffers.readback.slice(0..bytes);
-    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
-    let slot2 = slot.clone();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = slot2.set(res);
-    });
     if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
@@ -521,6 +534,7 @@ pub fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)>
         }
         None => unreachable!("map_async callback did not fire before poll returned"),
     }
+    drop(slot);
     let data = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&data[..bytes as usize]);
     let logits: Vec<f32> = words[..k as usize]
@@ -646,12 +660,18 @@ pub fn encode_step_matvec<M: StepMarker>(
 /// inside one CB (embed runs before `topk_reduce`), and across pipelined CBs
 /// the host's `write_buffer` is queue-ordered after the prior submit, so
 /// `sample[0]` is restored to the next input before the next CB starts.
-pub fn build_step_matvec_topk_cb(model: &Model, pos: u32, k: u32) -> wgpu::CommandBuffer {
+pub fn build_step_matvec_topk_cb(
+    model: &Model,
+    pos: u32,
+    k: u32,
+) -> (wgpu::CommandBuffer, MapSlot) {
     let k = k.clamp(1, TOPK_MAX);
     let mut se = StepEncoder::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos, &mut NoMarker);
-    se.copy_sample_to_readback(u64::from(k) * 8);
-    se.finish()
+    let bytes = u64::from(k) * 8;
+    se.copy_sample_to_readback(bytes);
+    let slot = se.schedule_topk_map(bytes);
+    (se.finish(), slot)
 }
 
 /// Run one matvec step at `pos`, reading the current token from CPU and
@@ -666,10 +686,9 @@ pub fn step_matvec_topk(
     model
         .queue
         .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&token_id));
-    model
-        .queue
-        .submit(Some(build_step_matvec_topk_cb(model, pos, k)));
-    wait_topk_readback(model, k)
+    let (cb, slot) = build_step_matvec_topk_cb(model, pos, k);
+    model.queue.submit(Some(cb));
+    wait_topk_readback(model, k, slot)
 }
 
 /// Same as [`step_matvec_topk`] but does not perform any sampling readback.
@@ -986,13 +1005,15 @@ pub fn prefill_matmul_topk<M: StepMarker>(
         marker.mark(&mut pass, "prefill_pass_end");
     }
 
-    // Phase 4: append readback copy so it ships with this same command buffer.
-    se.copy_sample_to_readback(u64::from(k) * 8);
+    // Phase 4: append readback copy + schedule map, all in the same command buffer.
+    let bytes = u64::from(k) * 8;
+    se.copy_sample_to_readback(bytes);
+    let slot = se.schedule_topk_map(bytes);
 
     let cb = se.finish();
     model.queue.submit(Some(cb));
 
-    wait_topk_readback(model, k)
+    wait_topk_readback(model, k, slot)
 }
 
 fn layer_step_matmul_in_pass(
@@ -1214,12 +1235,7 @@ impl<'m> BenchMarker<'m> {
     /// pick what they need via [`BenchTimings::total_ns`] (cheap) or
     /// [`BenchTimings::spans`] (per-mark deltas).
     pub fn resolve(self) -> Result<BenchTimings> {
-        use core::result::Result as StdResult;
-        use std::sync::{Arc, OnceLock};
-
-        use wgpu::{BufferAsyncError, MapMode, PollType};
-
-        type MapResult = StdResult<(), BufferAsyncError>;
+        use wgpu::PollType;
 
         let n = self.next_idx;
         if n < 2 {
@@ -1250,14 +1266,19 @@ impl<'m> BenchMarker<'m> {
             0,
             bytes,
         );
+        let slot: MapSlot = Arc::new(OnceLock::new());
+        let slot2 = slot.clone();
+        enc.map_buffer_on_submit(
+            &self.model.buffers.bench_readback,
+            wgpu::MapMode::Read,
+            0..bytes,
+            move |res| {
+                let _ = slot2.set(res);
+            },
+        );
         self.model.queue.submit(Some(enc.finish()));
 
         let slice = self.model.buffers.bench_readback.slice(0..bytes);
-        let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
-        let slot2 = slot.clone();
-        slice.map_async(MapMode::Read, move |res| {
-            let _ = slot2.set(res);
-        });
         if let Err(e) = self.model.device.poll(PollType::wait_indefinitely()) {
             self.model.check_device()?;
             return Err(PotError::Poll(e));

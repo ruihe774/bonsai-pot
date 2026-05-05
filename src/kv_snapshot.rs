@@ -201,7 +201,7 @@ use std::sync::{Arc, OnceLock};
 
 /// Read back the live `[0..pos)` slice of the GPU KV cache to a [`KvSnapshot`].
 pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
-    use core::result::Result as StdResult;
+    use std::result::Result as StdResult;
     type MapResult = StdResult<(), wgpu::BufferAsyncError>;
     let cfg = &model.cfg;
     let n_layer = cfg.n_layer;
@@ -266,14 +266,19 @@ pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
         }
     }
 
+    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
+    let slot2 = slot.clone();
+    enc.map_buffer_on_submit(
+        &staging,
+        wgpu::MapMode::Read,
+        0..snap_payload_bytes as u64,
+        move |res| {
+            let _ = slot2.set(res);
+        },
+    );
     model.queue.submit([enc.finish()]);
 
     let slice = staging.slice(0..snap_payload_bytes as u64);
-    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
-    let slot2 = slot.clone();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = slot2.set(res);
-    });
     if let Err(e) = model.device.poll(wgpu::PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
