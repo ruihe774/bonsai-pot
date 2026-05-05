@@ -27,12 +27,12 @@
 //!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use std::fmt::Display;
+use std::fmt::{Display, Write as _};
 use std::io::{Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 use bonsai_pot::{GenerateOptions, KvSnapshot, LoadOptions, Model, PotError, Sampler};
@@ -303,6 +303,16 @@ impl Emitter<'_> {
     }
 }
 
+fn fmt_phase(label: &str, n_tok: usize, dt: Duration) -> String {
+    let ms = dt.as_secs_f64() * 1000.0;
+    let tps = if ms > 0.0 {
+        n_tok as f64 / dt.as_secs_f64()
+    } else {
+        f64::INFINITY
+    };
+    format!("{label} {n_tok} tok / {ms:.1} ms = {tps:.0} t/s")
+}
+
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
@@ -412,7 +422,10 @@ fn main() {
             // `model.max_prefill_tokens()`). The first sampled token is not
             // yet in KV — it is fed back via `step` in the streaming loop
             // below.
+            let pp_t0 = Instant::now();
             let next = sess.prefill(&tokens, &sampler).expect("prefill");
+            let pp_dt = pp_t0.elapsed();
+            let pp_n = tokens.len();
 
             // Snapshot here: the first sampled token hasn't been `step`-fed
             // yet, so this captures KV state just after `<|im_start|>assistant\n`.
@@ -435,8 +448,10 @@ fn main() {
             };
 
             let mut out_tokens: Vec<u32> = Vec::new();
+            let mut tg_count: usize = 0;
             let hit_overflow;
             let in_think;
+            let tg_dt;
             {
                 let mut emitter = Emitter {
                     stdout: &mut stdout,
@@ -449,11 +464,16 @@ fn main() {
                 // `next` is the prefill-sampled token; generate_streaming feeds
                 // first_token as input without invoking the callback for it, so
                 // emit it manually first.
+                let tg_t0 = Instant::now();
                 if stop(next) {
                     hit_overflow = false;
                 } else {
                     emitter.emit(next);
-                    match sess.generate_streaming(next, &gen_opts, |id| emitter.emit(id)) {
+                    tg_count += 1;
+                    match sess.generate_streaming(next, &gen_opts, |id| {
+                        emitter.emit(id);
+                        tg_count += 1;
+                    }) {
                         Ok(_) => {
                             hit_overflow = false;
                         }
@@ -463,6 +483,7 @@ fn main() {
                         Err(e) => panic!("generate_streaming: {e}"),
                     }
                 }
+                tg_dt = tg_t0.elapsed();
                 in_think = emitter.in_think;
             }
             // Reset dim if we hit max_new_tokens or overflow mid-think.
@@ -482,6 +503,7 @@ fn main() {
             // Rewind KV cache to just after the assistant header, then
             // re-prefill with thinking blocks removed. This matches the Qwen3
             // chat template, which strips prior-turn thinking from history.
+            let mut post_pp: Option<(usize, Duration)> = None;
             if let Some(snap) = pre_assistant_snap {
                 let stripped = strip_thinking(&out_tokens, think_open, think_close);
                 if stripped.len() != out_tokens.len() {
@@ -490,11 +512,25 @@ fn main() {
                     if stripped.is_empty() {
                         writeln!(stdout, "(no response after thinking)").ok();
                     } else {
+                        let post_t0 = Instant::now();
                         sess.prefill(&stripped, &sampler)
                             .expect("re-prefill stripped response");
+                        post_pp = Some((stripped.len(), post_t0.elapsed()));
                     }
                 }
             }
+
+            let mut perf = format!(
+                "[{}  |  {}",
+                fmt_phase("PP", pp_n, pp_dt),
+                fmt_phase("TG", tg_count, tg_dt),
+            );
+            if let Some((n, dt)) = post_pp {
+                let _ = write!(&mut perf, "  |  {}", fmt_phase("Post-PP", n, dt));
+            }
+            perf.push(']');
+            eprintln!("{perf}");
+
             turn += 1;
         }
     });
