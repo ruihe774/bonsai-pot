@@ -66,9 +66,26 @@ impl Default for GenerateOptions<fn(u32) -> bool> {
 
 /// Per-conversation inference state. Carries the current KV-cache cursor.
 ///
-/// A `Session` borrows the [`Model`] immutably; multiple sessions against one
-/// `Model` cannot run concurrently because they share GPU buffers (KV cache,
-/// activations, sample). Drive them sequentially.
+/// # Safety contract: drive sequentially
+///
+/// A `Session` borrows the [`Model`] *immutably*, so the borrow checker will
+/// happily let you mint two `Session`s against the same `Model` and use them
+/// in alternation. **Don't.** All sessions on a given `Model` share the same
+/// GPU buffers — the KV cache, the activation scratch, and the `sample` /
+/// `readback` buffers are owned by the `Model`, not the `Session`. Interleaving
+/// calls across sessions will silently corrupt each other's state (a `step` on
+/// session B overwrites the activations and KV slots session A's next call
+/// expects to find intact).
+///
+/// The shared (`&Model`) borrow is deliberate: it allows `Model` methods like
+/// [`Model::is_device_lost`] / [`Model::decode_token`] to be called while a
+/// session is alive, and supports the device-lost test pattern of holding a
+/// session, destroying the device on the model, and observing the session's
+/// methods returning `DeviceLost`. Type-enforcing exclusivity (`&mut Model` on
+/// session creation) would forbid those patterns. The cost of that choice is
+/// this contract: **only one session per `Model` may be in active use at a
+/// time.** You may freely [`reset`](Self::reset) and reuse a session, or open
+/// a fresh one once the previous is dropped.
 pub struct Session<'m> {
     model: &'m Model,
     pos: u32,
