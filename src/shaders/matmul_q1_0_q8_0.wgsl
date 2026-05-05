@@ -69,50 +69,45 @@ fn main(
 
   var acc: array<f32, 16>;
 
+  // Bonsai's matmul callers guarantee:
+  //   - every n-axis dim (q_dim, kv_dim, n_embd, n_ff) is a multiple of
+  //     TILE_N=64, so n is never partial;
+  //   - the activation buffer (`act_q8`) is sized for M_MAX=512 tokens at
+  //     max_k=n_ff, so any m_idx in [m_base, m_base+TILE_M) up to M_MAX-1
+  //     stays within the buffer. With shader bounds checks off (see
+  //     ShaderRuntimeChecks::unchecked in model.rs), partial-tile loads
+  //     past valid data read garbage into LDS slots that only the OOB
+  //     threads themselves consult — final writes are gated by m_idx<p.m
+  //     so corruption can't reach `y`. So we run the full-tile load path
+  //     unconditionally and skip the per-thread bounds-checking branch.
   for (var b: u32 = 0u; b < nb_q1; b = b + 1u) {
     // ---- Cooperative loads ----
     if (tid < 64u) {
       let n_idx = n_base + tid;
-      var v: f32 = 0.0;
-      if (n_idx < p.n) {
-        v = load_w_f16(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
-      }
-      w_d_lds[tid] = v;
+      w_d_lds[tid] = load_w_f16(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
     }
     {
       let n_local = tid / 4u;
       let s = tid % 4u;
       let n_idx = n_base + n_local;
-      var v: u32 = 0u;
-      if (n_idx < p.n) {
-        let off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
-        v = weights[off >> 2u];
-      }
-      w_bits_lds[s * 64u + n_local] = v;
+      let off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
+      w_bits_lds[s * 64u + n_local] = weights[off >> 2u];
     }
     {
       let s = tid / 64u;
       let m_local = tid % 64u;
       let m_idx = m_base + m_local;
-      var v: f32 = 0.0;
-      if (m_idx < p.m) {
-        let a_block = b * 4u + s;
-        let off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
-        v = bitcast<f32>(acts[off >> 2u]);
-      }
-      a_d_lds[s * 64u + m_local] = v;
+      let a_block = b * 4u + s;
+      let off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
+      a_d_lds[s * 64u + m_local] = bitcast<f32>(acts[off >> 2u]);
     }
     for (var li: u32 = 0u; li < 8u; li = li + 1u) {
       let idx = li * WG + tid;
       let m_local = idx / 32u;
       let su = idx % 32u;
       let m_idx = m_base + m_local;
-      var v: u32 = 0u;
-      if (m_idx < p.m) {
-        let off = p.a_qs_offset + m_idx * p.k + b * 128u + su * 4u;
-        v = acts[off >> 2u];
-      }
-      a_qs_lds[m_local * 32u + su] = v;
+      let off = p.a_qs_offset + m_idx * p.k + b * 128u + su * 4u;
+      a_qs_lds[m_local * 32u + su] = acts[off >> 2u];
     }
     workgroupBarrier();
 
