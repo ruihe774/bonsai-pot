@@ -209,7 +209,7 @@ def main():
     # Each merge is a space-separated pair of byte-level-encoded strings, in
     # rank order (one per line). Plain UTF-8 text — no header.
     merges_field = r.fields["tokenizer.ggml.merges"]
-    with open(os.path.join(args.out, "merges.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.out, "merges.txt"), "w", encoding="utf-8", newline="\n") as f:
         for idx in merges_field.data:
             line = bytes(merges_field.parts[idx]).decode("utf-8")
             # Sanity: a merges entry is "<a> <b>". Pass through unchanged.
@@ -223,7 +223,7 @@ def main():
         if isinstance(v, list): return ",".join(str(x) for x in v)
         return str(v)
 
-    with open(os.path.join(args.out, "config.ini"), "w") as f:
+    with open(os.path.join(args.out, "config.ini"), "w", newline="\n") as f:
         for k, v in cfg.items():
             f.write(f"{k} = {_ini_fmt(v)}\n")
         for name, entry in manifest["tensors"].items():
