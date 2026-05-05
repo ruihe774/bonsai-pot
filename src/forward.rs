@@ -60,16 +60,28 @@ const fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
 // ---------- step-encoder marker --------------------------------------------
 // Generic hook for instrumenting `encode_step_matvec` / `prefill_matmul_topk`
 // without forking them. Production passes `&mut NoMarker` (zero-cost: the
-// trait method is `#[inline(always)]` and the body is empty, so the compiler
-// drops the call entirely). Bench builds (`bench-internals`) provide a
-// `BenchMarker` impl that writes GPU timestamps; see further down.
+// trait methods are `#[inline(always)]` with empty bodies, so the compiler
+// drops the calls entirely). Bench builds (`bench-internals`) provide two
+// alternative impls — `BenchMarker` (whole-pass begin/end timestamps via
+// `ComputePassDescriptor::timestamp_writes`, no per-dispatch overhead) and
+// `MicroMarker` (per-dispatch `pass.write_timestamp` for kernel breakdowns);
+// see further down.
 
 pub trait StepMarker {
+    /// Populate the pass descriptor before `begin_compute_pass`. `BenchMarker`
+    /// uses this hook to install whole-pass `timestamp_writes` (cheap, no
+    /// per-dispatch flushes); `NoMarker` and `MicroMarker` leave it untouched.
+    fn setup_desc<'a>(&'a self, desc: &mut wgpu::ComputePassDescriptor<'a>);
+
+    /// Write a per-dispatch timestamp inside an open pass. `MicroMarker` uses
+    /// this; `NoMarker` and `BenchMarker` are no-ops.
     fn mark(&mut self, pass: &mut wgpu::ComputePass<'_>, label: &'static str);
 }
 
 pub struct NoMarker;
 impl StepMarker for NoMarker {
+    #[inline(always)]
+    fn setup_desc<'a>(&'a self, _desc: &mut wgpu::ComputePassDescriptor<'a>) {}
     #[inline(always)]
     fn mark(&mut self, _pass: &mut wgpu::ComputePass<'_>, _label: &'static str) {}
 }
@@ -573,10 +585,12 @@ pub fn encode_step_matvec<M: StepMarker>(
 ) {
     let StepEncoder { model: m, encoder } = se;
     let ot = &m.output_tensors;
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+    let mut desc = wgpu::ComputePassDescriptor {
         label: Some("step_matvec"),
         timestamp_writes: None,
-    });
+    };
+    marker.setup_desc(&mut desc);
+    let mut pass = encoder.begin_compute_pass(&desc);
     marker.mark(&mut pass, "start");
 
     // embed
@@ -991,10 +1005,12 @@ pub fn prefill_matmul_topk<M: StepMarker>(
     se.write_sample(0, bytemuck::cast_slice(prompt));
 
     {
-        let mut pass = se.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let mut desc = wgpu::ComputePassDescriptor {
             label: Some("prefill_matmul"),
             timestamp_writes: None,
-        });
+        };
+        marker.setup_desc(&mut desc);
+        let mut pass = se.encoder.begin_compute_pass(&desc);
         marker.mark(&mut pass, "start");
 
         // Phase 1: embed all M tokens (one dispatch).
@@ -1243,25 +1259,31 @@ fn layer_step_matmul_in_pass(
 // here via `super::`.
 // =========================================================================
 
-/// GPU timestamp marker for bench / microbench measurement.
+/// Per-dispatch GPU timestamp marker for microbench (per-kernel breakdown).
 ///
-/// Call [`BenchMarker::mark`] between dispatches inside a compute pass to write
+/// Call [`MicroMarker::mark`] between dispatches inside a compute pass to write
 /// GPU-side timestamps. After the command buffer containing those dispatches has
-/// been submitted and fully polled (GPU done), call [`BenchMarker::resolve`] to
+/// been submitted and fully polled (GPU done), call [`MicroMarker::resolve`] to
 /// read the per-span durations in nanoseconds.
 ///
-/// Each `BenchMarker` reuses `model.buffers.bench_query_set` starting from slot 0,
-/// so only one `BenchMarker` may be live at a time (the previous one must be
+/// Each `pass.write_timestamp` forces a flush at the dispatch boundary on most
+/// drivers (RADV included), which slows the GPU work itself — so this marker is
+/// only appropriate when you actually want a per-kernel breakdown. For clean
+/// whole-pass timing of pp/tg, use [`BenchMarker`] instead, which installs the
+/// timestamps via the pass descriptor (no per-dispatch flushes).
+///
+/// Each `MicroMarker` reuses `model.buffers.bench_query_set` starting from slot 0,
+/// so only one `MicroMarker` may be live at a time (the previous one must be
 /// resolved before a new one is marked into the same query set).
 #[cfg(feature = "bench-internals")]
-pub struct BenchMarker<'m> {
+pub struct MicroMarker<'m> {
     model: &'m Model,
     next_idx: u32,
     labels: Vec<&'static str>,
 }
 
 #[cfg(feature = "bench-internals")]
-impl<'m> BenchMarker<'m> {
+impl<'m> MicroMarker<'m> {
     pub const fn new(model: &'m Model) -> Self {
         Self {
             model,
@@ -1271,114 +1293,30 @@ impl<'m> BenchMarker<'m> {
     }
 
     /// After the step CB has been submitted and polled (GPU work done),
-    /// resolve all timestamps. Returns raw ticks plus their labels; callers
-    /// pick what they need via [`BenchTimings::total_ns`] (cheap) or
-    /// [`BenchTimings::spans`] (per-mark deltas).
-    pub fn resolve(self) -> Result<BenchTimings> {
+    /// resolve all timestamps and return `(label, duration_ns)` spans.
+    /// Each span is the GPU time between the previous and current mark.
+    /// The "start" sentinel is consumed but not returned as a span.
+    pub fn resolve(self) -> Result<Vec<(&'static str, f32)>> {
         let n = self.next_idx;
         if n < 2 {
-            return Ok(BenchTimings {
-                period_ns: self.model.bench_ts_period_ns,
-                labels: self.labels,
-                ticks: Vec::new(),
-            });
+            return Ok(vec![]);
         }
-        let bytes = u64::from(n) * 8;
-
-        let mut enc = self
-            .model
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bench_resolve"),
-            });
-        enc.resolve_query_set(
-            &self.model.buffers.bench_query_set,
-            0..n,
-            &self.model.buffers.bench_resolve,
-            0,
-        );
-        enc.copy_buffer_to_buffer(
-            &self.model.buffers.bench_resolve,
-            0,
-            &self.model.buffers.bench_readback,
-            0,
-            bytes,
-        );
-        let slot: MapSlot = Arc::new(OnceLock::new());
-        let slot2 = slot.clone();
-        enc.map_buffer_on_submit(
-            &self.model.buffers.bench_readback,
-            wgpu::MapMode::Read,
-            0..bytes,
-            move |res| {
-                let _ = slot2.set(res);
-            },
-        );
-        self.model.queue.submit(Some(enc.finish()));
-
-        let slice = self.model.buffers.bench_readback.slice(0..bytes);
-        if let Err(e) = self.model.device.poll(PollType::wait_indefinitely()) {
-            self.model.check_device()?;
-            return Err(PotError::Poll(e));
+        let ticks = bench_resolve_ticks(self.model, n)?;
+        let period = self.model.bench_ts_period_ns;
+        let mut spans: Vec<(&'static str, f32)> = Vec::with_capacity((n - 1) as usize);
+        for i in 1..n as usize {
+            let dt_ns = ticks[i].saturating_sub(ticks[i - 1]) as f32 * period;
+            spans.push((self.labels[i], dt_ns));
         }
-        match slot.get() {
-            Some(Ok(())) => {}
-            Some(Err(e)) => {
-                self.model.check_device()?;
-                return Err(PotError::BufferMap(e.clone()));
-            }
-            None => unreachable!("bench map_async callback did not fire before poll returned"),
-        }
-
-        let data = slice.get_mapped_range();
-        let ticks: Vec<u64> = bytemuck::cast_slice::<_, u64>(&data[..bytes as usize]).to_vec();
-        drop(data);
-        self.model.buffers.bench_readback.unmap();
-        Ok(BenchTimings {
-            period_ns: self.model.bench_ts_period_ns,
-            labels: self.labels,
-            ticks,
-        })
-    }
-}
-
-/// Resolved GPU timestamps from a [`BenchMarker`].
-///
-/// `labels[i]` is the label of the mark at `ticks[i]`; `labels[0]` is the
-/// "start" sentinel. Empty `ticks` means fewer than two marks were written.
-#[cfg(feature = "bench-internals")]
-pub struct BenchTimings {
-    period_ns: f32,
-    labels: Vec<&'static str>,
-    ticks: Vec<u64>,
-}
-
-#[cfg(feature = "bench-internals")]
-impl BenchTimings {
-    /// Total GPU time from the first mark to the last, in nanoseconds.
-    pub fn total_ns(&self) -> f32 {
-        let (Some(first), Some(last)) = (self.ticks.first(), self.ticks.last()) else {
-            return 0.0;
-        };
-        if self.ticks.len() < 2 {
-            return 0.0;
-        }
-        last.saturating_sub(*first) as f32 * self.period_ns
-    }
-
-    /// Per-span `(label, duration_ns)` iterator. Each span is the GPU time
-    /// between the previous and current mark; the "start" sentinel is skipped.
-    pub fn spans(&self) -> impl Iterator<Item = (&'static str, f32)> + '_ {
-        let p = self.period_ns;
-        self.ticks
-            .windows(2)
-            .enumerate()
-            .map(move |(i, w)| (self.labels[i + 1], w[1].saturating_sub(w[0]) as f32 * p))
+        Ok(spans)
     }
 }
 
 #[cfg(feature = "bench-internals")]
-impl StepMarker for BenchMarker<'_> {
+impl StepMarker for MicroMarker<'_> {
+    #[inline(always)]
+    fn setup_desc<'a>(&'a self, _desc: &mut wgpu::ComputePassDescriptor<'a>) {}
+
     /// Write a GPU timestamp at the current slot and associate `label` with it.
     /// The label conventionally names the kernel that just COMPLETED (the slot
     /// before the first label is the pass start sentinel named "start").
@@ -1386,12 +1324,114 @@ impl StepMarker for BenchMarker<'_> {
         use crate::model::BENCH_QS_SLOTS;
         assert!(
             self.next_idx < BENCH_QS_SLOTS,
-            "BenchMarker: exceeded BENCH_QS_SLOTS"
+            "MicroMarker: exceeded BENCH_QS_SLOTS"
         );
         pass.write_timestamp(&self.model.buffers.bench_query_set, self.next_idx);
         self.labels.push(label);
         self.next_idx += 1;
     }
+}
+
+/// Whole-pass GPU timestamp marker for end-to-end pp/tg timing.
+///
+/// Installs `timestamp_writes` on the [`wgpu::ComputePassDescriptor`] (slots
+/// 0=begin, 1=end of pass) via [`StepMarker::setup_desc`]; [`mark`] is a no-op.
+/// Unlike [`MicroMarker`], no per-dispatch `pass.write_timestamp` calls are
+/// inserted, so the GPU work itself isn't slowed by mid-pass flushes — what we
+/// measure is the bare execution time of the pass.
+///
+/// Reuses `model.buffers.bench_query_set` slots 0/1, so only one `BenchMarker`
+/// may be live at a time and the pass it instruments must be the only one to
+/// write those slots between `new` and `resolve`.
+///
+/// [`mark`]: BenchMarker::mark
+#[cfg(feature = "bench-internals")]
+pub struct BenchMarker<'m> {
+    model: &'m Model,
+}
+
+#[cfg(feature = "bench-internals")]
+impl<'m> BenchMarker<'m> {
+    pub const fn new(model: &'m Model) -> Self {
+        Self { model }
+    }
+
+    /// After the instrumented pass has been submitted and polled (GPU done),
+    /// resolve the begin/end timestamps and return total GPU duration in
+    /// nanoseconds.
+    pub fn resolve(self) -> Result<f32> {
+        let ticks = bench_resolve_ticks(self.model, 2)?;
+        Ok(ticks[1].saturating_sub(ticks[0]) as f32 * self.model.bench_ts_period_ns)
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl StepMarker for BenchMarker<'_> {
+    fn setup_desc<'a>(&'a self, desc: &mut wgpu::ComputePassDescriptor<'a>) {
+        desc.timestamp_writes = Some(wgpu::ComputePassTimestampWrites {
+            query_set: &self.model.buffers.bench_query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
+    }
+    #[inline(always)]
+    fn mark(&mut self, _pass: &mut wgpu::ComputePass<'_>, _label: &'static str) {}
+}
+
+/// Resolve `n` timestamps from `bench_query_set[0..n]` to host memory. Shared
+/// by [`MicroMarker::resolve`] and [`BenchMarker::resolve`].
+#[cfg(feature = "bench-internals")]
+fn bench_resolve_ticks(model: &Model, n: u32) -> Result<Vec<u64>> {
+    let bytes = u64::from(n) * 8;
+    let mut enc = model
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bench_resolve"),
+        });
+    enc.resolve_query_set(
+        &model.buffers.bench_query_set,
+        0..n,
+        &model.buffers.bench_resolve,
+        0,
+    );
+    enc.copy_buffer_to_buffer(
+        &model.buffers.bench_resolve,
+        0,
+        &model.buffers.bench_readback,
+        0,
+        bytes,
+    );
+    let slot: MapSlot = Arc::new(OnceLock::new());
+    let slot2 = slot.clone();
+    enc.map_buffer_on_submit(
+        &model.buffers.bench_readback,
+        wgpu::MapMode::Read,
+        0..bytes,
+        move |res| {
+            let _ = slot2.set(res);
+        },
+    );
+    model.queue.submit(Some(enc.finish()));
+
+    let slice = model.buffers.bench_readback.slice(0..bytes);
+    if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+        model.check_device()?;
+        return Err(PotError::Poll(e));
+    }
+    match slot.get() {
+        Some(Ok(())) => {}
+        Some(Err(e)) => {
+            model.check_device()?;
+            return Err(PotError::BufferMap(e.clone()));
+        }
+        None => unreachable!("bench map_async callback did not fire before poll returned"),
+    }
+
+    let data = slice.get_mapped_range();
+    let ticks: Vec<u64> = bytemuck::cast_slice::<_, u64>(&data[..bytes as usize]).to_vec();
+    drop(data);
+    model.buffers.bench_readback.unmap();
+    Ok(ticks)
 }
 
 #[cfg(feature = "bench-internals")]

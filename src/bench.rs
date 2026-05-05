@@ -11,7 +11,7 @@ use std::time::Instant;
 use wgpu::PollType;
 
 use super::{
-    BenchMarker, BenchTimings, Model, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk,
+    BenchMarker, MicroMarker, Model, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk,
     step_matvec_no_sample, wait_topk_readback,
 };
 use crate::error::PotError;
@@ -80,7 +80,7 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let t = Instant::now();
         let mut marker = BenchMarker::new(model);
         let _ = prefill_matmul_topk(model, &prompt, 0, 1, &mut marker)?;
-        let gpu_ns = marker.resolve()?.total_ns();
+        let gpu_ns = marker.resolve()?;
         pp_wall_ts.push(pp_n as f32 / t.elapsed().as_secs_f32());
         pp_gpu_ts.push(pp_n as f32 / (gpu_ns / 1e9));
     }
@@ -109,7 +109,7 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
             model.queue.submit(Some(cb));
             model.belt_recall();
             wait_topk_readback(model, 1, slot)?;
-            total_gpu_ns += marker.resolve()?.total_ns();
+            total_gpu_ns += marker.resolve()?;
         }
         let wall_secs = t.elapsed().as_secs_f32();
         tg_wall_ts.push(tg_n as f32 / wall_secs);
@@ -226,14 +226,14 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
     let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
 
     for _ in 0..repeats {
-        let timings = run_instrumented_step(model, pos)?;
+        let spans = run_instrumented_step(model, pos)?;
         let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
-        for (label, ns) in timings.spans() {
-            let e = step_label_sum.entry(label).or_insert((0, 0.0));
+        for (label, ns) in &spans {
+            let e = step_label_sum.entry(*label).or_insert((0, 0.0));
             e.0 += 1;
             e.1 += ns;
         }
-        step_totals_ns.push(timings.total_ns());
+        step_totals_ns.push(spans.iter().map(|(_, ns)| ns).sum());
         for (label, (calls, ns_sum)) in step_label_sum {
             per_step_label_ns.entry(label).or_default().push(ns_sum);
             calls_per_step.entry(label).or_insert(calls);
@@ -287,12 +287,12 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
     Ok(())
 }
 
-/// Run one instrumented matvec step at `pos`, returning the resolved GPU timings.
-fn run_instrumented_step(model: &Model, pos: u32) -> Result<BenchTimings> {
+/// Run one instrumented matvec step at `pos`, returning per-span GPU durations.
+fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f32)>> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(model);
     se.write_sample(0, bytemuck::bytes_of(&tok));
-    let mut marker = BenchMarker::new(model);
+    let mut marker = MicroMarker::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut marker);
     se.copy_sample_to_readback(8);
     let slot = se.schedule_topk_map(8);
