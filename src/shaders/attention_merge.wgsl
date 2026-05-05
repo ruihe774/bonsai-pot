@@ -26,11 +26,11 @@ var<immediate> p: Params;
 @group(0) @binding(1) var<storage, read> partials: array<f32>;
 
 const SUBGROUP_MIN_SIZE: u32 = {{SUBGROUP_MIN_SIZE}}u;
-const WG: u32 = 64u;
+const WG: u32 = 128u;
 const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
-const ELEMS_PER_THREAD: u32 = 2u;
+const ELEMS_PER_THREAD: u32 = 1u;
 const PARTIAL_STRIDE: u32 = 130u;  // head_dim + 2
-// Cap on chunk count we keep weights for in shmem. n_chunks = ceil(pos/32).
+// Cap on chunk count we keep weights for in shmem. n_chunks = ceil(pos/16).
 // Runtime-baked from opts.max_seq at shader-load time (like {{SUBGROUP_MIN_SIZE}}).
 const MAX_CHUNKS: u32 = {{MAX_CHUNKS}}u;
 
@@ -102,19 +102,15 @@ fn main(
   let l_global = wg_sum(l_local, sg_id, sg_inv_id, num_subgroups);
 
   // weights_sh is written by Phase B (each thread writes the chunks it owns,
-  // strided by WG) and read by every thread in Phase C. When num_subgroups > 1
-  // the workgroupBarriers inside wg_sum sync these writes. On the
-  // num_subgroups == 1 fast path (RDNA wave64 with WG=64) wg_sum returns
-  // directly after a subgroupAdd, which is not a workgroup-scope memory
-  // barrier — strict WGSL would require one here. We skip it: the only
-  // hardware that takes this fast path is RDNA wave64, which executes the
-  // entire workgroup in lockstep so the writes are visible to every reader
-  // by the time Phase C starts. Spec-noncompliant but correct in practice.
+  // strided by WG) and read by every thread in Phase C. With WG=128, no
+  // shipping subgroup is large enough to take the num_subgroups==1 fast path
+  // in wg_sum, so the workgroupBarriers inside wg_sum always sync these
+  // writes for us — no extra barrier needed here.
 
   // Phase C: per-thread o accumulation using precomputed weights. The per-d
   // loops below assume head_dim == ELEMS_PER_THREAD * WG (true for the Bonsai
-  // family: head_dim=128, WG=64); models with a different head_dim would need
-  // ELEMS_PER_THREAD retemplated.
+  // family: head_dim=128, WG=128, ELEMS_PER_THREAD=1); models with a different
+  // head_dim would need WG / ELEMS_PER_THREAD retemplated.
   var o: array<f32, ELEMS_PER_THREAD>;
   for (var c: u32 = 0u; c < n; c++) {
     let pb = head_base + c * PARTIAL_STRIDE;
