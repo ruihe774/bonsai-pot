@@ -15,6 +15,45 @@ use super::{
     step_matvec_no_sample, wait_topk_readback,
 };
 use crate::error::PotError;
+use crate::session::{GenerateOptions, Sampler};
+
+// ChatML-wrapped: system="You are a helpful assistant.", user="Write 200 words
+// about the Roman Empire." Encoded once; vocab is identical for 4B and 8B.
+#[allow(clippy::unreadable_literal, reason = "encoded tokens")]
+const E2E_PROMPT: &[u32] = &[
+    151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 7985, 220,
+    17, 15, 15, 4244, 911, 279, 12751, 20448, 13, 151645, 198, 151644, 77091, 198,
+];
+
+// ChatML-wrapped: system="You are a helpful assistant.", user=<Roman Empire
+// article, ~330 tokens> + "Summarize the above in one word." Total: 366 tokens.
+// Used by e2e_pp to bench Session::prefill end-to-end on a real-length prompt.
+#[allow(clippy::unreadable_literal, reason = "encoded tokens")]
+const E2E_PP_PROMPT: &[u32] = &[
+    151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 785, 12751,
+    20448, 572, 279, 1736, 12, 68455, 1584, 315, 13833, 21718, 323, 374, 8789, 15985, 311, 3076,
+    279, 4168, 323, 17971, 21286, 553, 279, 48717, 2701, 4915, 59178, 594, 24335, 315, 13309, 5912,
+    1212, 279, 44529, 349, 304, 220, 17, 22, 18040, 13, 1084, 5230, 264, 3460, 51382, 5537, 2163,
+    279, 37685, 15029, 304, 4505, 11, 4787, 10174, 11, 323, 10867, 13622, 11, 323, 572, 21286, 553,
+    976, 712, 1087, 13, 576, 4399, 315, 279, 10867, 12751, 20448, 304, 220, 19, 22, 21, 9630, 11,
+    892, 12864, 279, 835, 315, 13833, 21718, 11, 374, 825, 315, 279, 1429, 5089, 4357, 304, 3738,
+    3840, 382, 1655, 1181, 12196, 12818, 11, 279, 12751, 20448, 9761, 220, 20, 3526, 9334, 51857,
+    323, 5644, 60129, 916, 458, 12943, 220, 22, 15, 3526, 1251, 11, 518, 429, 882, 220, 17, 16,
+    817, 2889, 315, 279, 1879, 594, 4453, 7042, 13, 576, 12751, 20448, 572, 4221, 279, 1429, 7988,
+    6955, 11, 12752, 11, 4948, 11, 323, 6277, 8437, 304, 279, 1879, 315, 1181, 882, 13, 1084, 572,
+    825, 315, 279, 7772, 976, 18968, 304, 1879, 3840, 13, 576, 1156, 1378, 23631, 315, 279, 31347,
+    594, 13885, 1033, 264, 4168, 315, 29969, 19753, 323, 43102, 3881, 438, 279, 70321, 11774, 3362,
+    11, 892, 46918, 15901, 438, 330, 60980, 25803, 2217, 60980, 8232, 572, 6351, 11, 7299, 12,
+    80418, 11, 323, 2745, 49823, 13, 19458, 572, 279, 24456, 4128, 315, 3033, 323, 2329, 11, 714,
+    17860, 14616, 13570, 21355, 304, 279, 23149, 39921, 13, 576, 48717, 7881, 17646, 11, 2329, 11,
+    14667, 11, 323, 34086, 5942, 429, 3060, 311, 10173, 10867, 8267, 7923, 311, 419, 1899, 13,
+    12751, 19241, 11, 15355, 80500, 82, 11, 323, 13702, 7146, 15978, 63301, 315, 14667, 13, 576,
+    5777, 16170, 20329, 1870, 1212, 279, 12751, 20448, 1212, 79, 20561, 6481, 5777, 5942, 3941,
+    4505, 323, 7797, 382, 785, 31347, 9583, 6718, 1119, 279, 10867, 12751, 20448, 323, 279, 18028,
+    12751, 20448, 11, 1083, 3881, 438, 279, 81660, 38357, 20448, 11, 892, 25882, 3080, 220, 16, 19,
+    20, 18, 9630, 382, 9190, 5612, 551, 279, 3403, 304, 825, 3409, 13, 151645, 198, 151644, 77091,
+    198,
+];
 
 pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     let cfg = &model.cfg;
@@ -79,6 +118,56 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     let (tg_wall_mean, tg_wall_std) = mean_std(&tg_wall_ts);
     let (tg_gpu_mean, tg_gpu_std) = mean_std(&tg_gpu_ts);
 
+    // ----- e2e_tg -----
+    // Wall-clock only: prefill is untimed; we time Session::generate exclusively.
+    // e2e_tg_n counts actual tokens produced: 1 (from prefill) + generate output.
+    let e2e_sampler = Sampler::default(); // temperature=1.0, stochastic
+    let opts = GenerateOptions {
+        max_new_tokens: tg_n.saturating_sub(1),
+        sampler: e2e_sampler.clone(),
+        ..Default::default()
+    };
+    let mut e2e_tg_wall_ts: Vec<f32> = Vec::with_capacity(repeats as usize);
+
+    // warmup — also establishes e2e_tg_n from the actual output length
+    let e2e_tg_n = {
+        let mut sess = model.new_session();
+        let first = sess.prefill_one_at_a_time(E2E_PROMPT, &e2e_sampler)?;
+        let (generated, _) = sess.generate(first, &opts)?;
+        1 + generated.len() as u32
+    };
+
+    for _ in 0..repeats {
+        let mut sess = model.new_session();
+        let first = sess.prefill_one_at_a_time(E2E_PROMPT, &e2e_sampler)?;
+        let t = Instant::now();
+        let (generated, _) = sess.generate(first, &opts)?;
+        let actual_n = 1 + generated.len() as u32;
+        e2e_tg_wall_ts.push(actual_n as f32 / t.elapsed().as_secs_f32());
+    }
+    let (e2e_tg_wall_mean, e2e_tg_wall_std) = mean_std(&e2e_tg_wall_ts);
+
+    // ----- e2e_pp -----
+    // Wall-clock only: times Session::prefill end-to-end on a real long-article
+    // prompt (ChatML-wrapped, 366 tokens). Includes matmul prefill + topk
+    // readback + CPU sample of the one-word answer token.
+    let pp_e2e_n = E2E_PP_PROMPT.len() as u32;
+    let mut e2e_pp_wall_ts: Vec<f32> = Vec::with_capacity(repeats as usize);
+
+    // warmup
+    {
+        let mut sess = model.new_session();
+        sess.prefill(E2E_PP_PROMPT, &e2e_sampler)?;
+    }
+
+    for _ in 0..repeats {
+        let mut sess = model.new_session();
+        let t = Instant::now();
+        sess.prefill(E2E_PP_PROMPT, &e2e_sampler)?;
+        e2e_pp_wall_ts.push(pp_e2e_n as f32 / t.elapsed().as_secs_f32());
+    }
+    let (e2e_pp_wall_mean, e2e_pp_wall_std) = mean_std(&e2e_pp_wall_ts);
+
     println!();
     println!("| backend           |         test |          wall t/s |           gpu t/s |");
     println!("| ----------------- | ------------ | ----------------: | ----------------: |");
@@ -87,6 +176,12 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     );
     println!(
         "| bonsai-pot        |        tg{tg_n:<3} | {tg_wall_mean:>9.2} ± {tg_wall_std:>5.2} | {tg_gpu_mean:>9.2} ± {tg_gpu_std:>5.2} |"
+    );
+    println!(
+        "| bonsai-pot        |    e2e_pp{pp_e2e_n:<3} | {e2e_pp_wall_mean:>9.2} ± {e2e_pp_wall_std:>5.2} |                 — |"
+    );
+    println!(
+        "| bonsai-pot        |    e2e_tg{e2e_tg_n:<3} | {e2e_tg_wall_mean:>9.2} ± {e2e_tg_wall_std:>5.2} |                 — |"
     );
     Ok(())
 }
