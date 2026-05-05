@@ -111,12 +111,12 @@ This design is correct under `ALLOW_VARYING_SUBGROUP_SIZE` (which wgpu-hal sets 
 
 `matvec_q1_0` and `matvec_q1_0_fused` use a `subgroupShuffleXor` butterfly for the per-row 8-lane reduction. This assumes `subgroup_invocation_id` increases linearly with `local_invocation_index` (true on AMD/NVIDIA/Intel/Apple) and `subgroup_size >= 8` so XOR mask 4 stays within a subgroup. The hard requirement `subgroup_min_size >= 8` is validated at `Model::load` against the adapter; hardware below this bound is rejected.
 
-To exercise the wave32 / multi-subgroup merge path on AMD RDNA, run with `RADV_PERFTEST=cswave32`. RX 9070 (RDNA4) at default wave64 (pp512/tg1024, after 1 warmup):
+To exercise the wave32 / multi-subgroup merge path on AMD RDNA, run with `RADV_PERFTEST=cswave32`. RX 9070 (RDNA4) at default wave64 (pp512/tg1024, after 1 warmup; tg column reports the `e2e_tg1024` row, which matches what `Session::generate` delivers — the bare `tg1024` row reads ~15% lower because per-step `BenchMarker::resolve` is dead wall-time and the bench loop doesn't pre-encode the next CB while the GPU drains):
 
-| model    | pp512 t/s | tg1024 t/s |
-|----------|----------:|-----------:|
-| Bonsai-4B | ~1350    | ~137       |
-| Bonsai-8B | ~808     | ~98        |
+| model     | pp512 t/s | tg1024 t/s (e2e) |
+|-----------|----------:|-----------------:|
+| Bonsai-4B |     ~1400 |             ~179 |
+| Bonsai-8B |      ~815 |             ~122 |
 
 Under `RADV_PERFTEST=cswave32` (4B), generation is unaffected but prefill carries a ~10% cost on this hardware.
 
