@@ -1126,7 +1126,9 @@ impl Model {
             let p = model_dir.join(fname);
             read(&p).map_err(|e| PotError::Io { path: p, source: e })
         };
-        let w_storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        // create_buffer_init uses mapped_at_creation, so COPY_DST is not needed
+        // for the initial upload. The weight + rope buffers are read-only after load.
+        let w_storage = wgpu::BufferUsages::STORAGE;
         let make_storage = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -1215,9 +1217,7 @@ impl Model {
         let act_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("act"),
             size: act_size,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
@@ -1229,7 +1229,7 @@ impl Model {
         let act_q8_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("act_q8"),
             size: u64::from(act_q8_size),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
