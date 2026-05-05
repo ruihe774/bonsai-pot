@@ -25,6 +25,8 @@
 use std::result::Result as StdResult;
 use std::sync::{Arc, OnceLock};
 
+use wgpu::PollType;
+
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
@@ -519,7 +521,6 @@ fn dispatch_attention(
 /// produced the submitted command buffer. The mapping fires at submit time;
 /// this call just polls until GPU work finishes.
 pub fn wait_topk_readback(model: &Model, k: u32, slot: MapSlot) -> Result<(Vec<f32>, Vec<u32>)> {
-    use wgpu::PollType;
     let bytes = u64::from(k) * 8; // K f32 + K u32
     let slice = model.buffers.readback.slice(0..bytes);
     if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
@@ -1235,8 +1236,6 @@ impl<'m> BenchMarker<'m> {
     /// pick what they need via [`BenchTimings::total_ns`] (cheap) or
     /// [`BenchTimings::spans`] (per-mark deltas).
     pub fn resolve(self) -> Result<BenchTimings> {
-        use wgpu::PollType;
-
         let n = self.next_idx;
         if n < 2 {
             return Ok(BenchTimings {

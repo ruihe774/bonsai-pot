@@ -19,6 +19,9 @@
 //! A snapshot captured with `max_seq=512` can be restored into a model loaded
 //! with `max_seq=2048` as long as `pos ≤ model.max_seq_len()`.
 
+use std::result::Result as StdResult;
+use std::sync::{Arc, OnceLock};
+
 use crate::error::{PotError, Result};
 use crate::model::Model;
 
@@ -197,11 +200,8 @@ pub const fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
 
 // ---- GPU paths --------------------------------------------------------------
 
-use std::sync::{Arc, OnceLock};
-
 /// Read back the live `[0..pos)` slice of the GPU KV cache to a [`KvSnapshot`].
 pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
-    use std::result::Result as StdResult;
     type MapResult = StdResult<(), wgpu::BufferAsyncError>;
     let cfg = &model.cfg;
     let n_layer = cfg.n_layer;
