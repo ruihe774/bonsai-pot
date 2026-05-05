@@ -53,7 +53,7 @@ const WG: u32 = 64u;
 const SG_PARTIAL_MAX: u32 = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 const Q_PER_GROUP: u32 = 4u;
 const ELEMS_PER_THREAD: u32 = 2u;  // head_dim (128) / WG (64)
-const CHUNK_SIZE: u32 = 32u;
+const CHUNK_SIZE: u32 = 16u;
 const PARTIAL_STRIDE: u32 = 130u;  // head_dim + 2
 
 // Cross-subgroup partial slots; fast-path (return sg_sum directly) taken when

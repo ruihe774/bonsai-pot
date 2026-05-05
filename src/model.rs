@@ -508,7 +508,7 @@ const DEFAULT_MAX_SEQ: u32 = 1024;
 pub const BENCH_QS_SLOTS: u32 = 2048;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.wgsl`.
-pub const ATTN_CHUNK_SIZE: u32 = 32;
+pub const ATTN_CHUNK_SIZE: u32 = 16;
 /// System-wide GPU queue scheduling priority, passed via `VK_EXT_global_priority`.
 ///
 /// Controls how the OS/driver kernel schedules this process's GPU work relative
