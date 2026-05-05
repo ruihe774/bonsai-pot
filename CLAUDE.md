@@ -140,9 +140,9 @@ KV cache is split into `kv_k` and `kv_v`, both stored as **Q8_0** (32-element bl
 
 `act_q8` is the Q8_0 activation scratch used only on the matmul path (FP32 d-section followed by i8 qs-section).
 
-### Uniforms via dynamic offsets
+### Per-dispatch params via immediates
 
-There is **one** `uniform` buffer (`UNIFORM_POOL_SLOTS * UNIFORM_SLOT_SIZE = 4096 * 256 = 1,048,576 bytes = 1 MiB`). Every dispatch's params struct is appended into a `UniformPool` (CPU-side `Vec<u8>`), and the dynamic offset is recorded; the pool is flushed in one `write_buffer` at `StepEncoder::finish`. All `Params` structs in `model.rs` are ≤ 64 bytes and packed into 256-byte slots. **Every BGL has its UBO at binding 0 with `has_dynamic_offset: true`** — bind-group helpers in `forward.rs::make_bg` set this up.
+Every dispatch passes its `Params` struct as wgpu immediates (push constants): each dispatch helper in `forward.rs` calls `pass.set_immediates(0, bytemuck::bytes_of(&p))`. Each pipeline is created with an `immediate_size` field baked into its `PipelineLayoutDescriptor` (`mk_pipe` in `model.rs`). The device limit `max_immediate_size` is requested at ≥ 128 bytes. All `Params` structs are ≤ 64 bytes; this is enforced by the unit test `params_struct_sizes_fit_immediate_limit` in `model.rs`. BGLs contain only storage bindings (starting at binding 0) — there is no UBO.
 
 ### Bind-group layout discipline
 
