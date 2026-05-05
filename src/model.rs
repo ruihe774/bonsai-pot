@@ -5,6 +5,7 @@
 //! `Q8_0` activations (used by the `dot4I8Packed` matmul path). Norm weights and the
 //! `RoPE` cos/sin table are also f16; `Q8_0` scales remain f32.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{read, read_to_string};
 use std::mem::size_of;
@@ -509,6 +510,9 @@ pub const BENCH_QS_SLOTS: u32 = 2048;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.wgsl`.
 pub const ATTN_CHUNK_SIZE: u32 = 16;
+/// Maximum `max_seq` accepted at runtime. Matches the `MAX_CHUNKS = 2048`
+/// baked into the pre-compiled SPIR-V shaders (`max_seq = MAX_CHUNKS * ATTN_CHUNK_SIZE`).
+const MAX_SEQ_BAKED: u32 = 2048 * ATTN_CHUNK_SIZE;
 /// System-wide GPU queue scheduling priority, passed via `VK_EXT_global_priority`.
 ///
 /// Controls how the OS/driver kernel schedules this process's GPU work relative
@@ -906,6 +910,12 @@ impl Model {
         if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
             return Err(PotError::FeatureUnsupported("IMMEDIATES"));
         }
+        if !adapter
+            .features()
+            .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        {
+            return Err(PotError::FeatureUnsupported("PASSTHROUGH_SHADERS"));
+        }
         #[cfg(feature = "bench-internals")]
         if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return Err(PotError::FeatureUnsupported("TIMESTAMP_QUERY"));
@@ -942,8 +952,11 @@ impl Model {
         // (MatvecFusedNormedParams, 72 bytes) with generous headroom.
         limits.max_immediate_size = limits.max_immediate_size.max(128);
 
-        let required_features =
-            wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP | wgpu::Features::IMMEDIATES | {
+        let required_features = wgpu::Features::SHADER_F16
+            | wgpu::Features::SUBGROUP
+            | wgpu::Features::IMMEDIATES
+            | wgpu::Features::PASSTHROUGH_SHADERS
+            | {
                 #[cfg(feature = "bench-internals")]
                 {
                     wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
@@ -1114,6 +1127,20 @@ impl Model {
             ));
         }
         let subgroup_min_size = sg_min;
+        // Check that the built-in SPIR-V variant for this SG size was compiled in.
+        let sg_feature_ok = match subgroup_min_size {
+            8 if cfg!(feature = "sg-8") => true,
+            16 if cfg!(feature = "sg-16") => true,
+            32 if cfg!(feature = "sg-32") => true,
+            64 if cfg!(feature = "sg-64") => true,
+            _ => false,
+        };
+        if !sg_feature_ok {
+            return Err(PotError::Config(
+                "adapter subgroup_min_size is not covered by a built-in sg-N feature; \
+                 rebuild with the matching sg-{8,16,32,64} Cargo feature enabled",
+            ));
+        }
         log::info!(
             "adapter={} backend={:?} subgroup range={}..={} (shmem worst-case N_SG={})",
             info.name,
@@ -1235,6 +1262,15 @@ impl Model {
             mapped_at_creation: false,
         });
 
+        // SPIR-V shaders bake MAX_CHUNKS = 2048 (max_seq = 32768 / ATTN_CHUNK_SIZE = 16).
+        // Reject max_seq values that exceed the baked constant at runtime.
+        if opts.max_seq > MAX_SEQ_BAKED {
+            return Err(PotError::Config(
+                "max_seq exceeds the SPIR-V baked MAX_CHUNKS=2048 (max_seq=32768); \
+                 reduce --max-seq or rebuild pot-shader with a larger bake",
+            ));
+        }
+
         // Split-K attention partials: per layer, n_head * n_chunks_max chunks of
         // (head_dim + 2) f32 each. Reused across layers within a step.
         let n_chunks_max = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
@@ -1310,58 +1346,39 @@ impl Model {
         };
 
         // ---- shaders & pipelines -------------------------------------------
-        // `{{SUBGROUP_MIN_SIZE}}` and `{{MAX_CHUNKS}}` are substituted with
-        // runtime values at load time; shaders that don't reference them get a
-        // pass-through `replace`. SUBGROUP_MIN_SIZE is used as a compile-time
-        // worst-case for cross-subgroup shmem sizing; actual subgroup counts
-        // are read from @builtin(num_subgroups) at runtime.
-        let subgroup_min_size_str = subgroup_min_size.to_string();
-        let max_chunks = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
-        let max_chunks_str = max_chunks.to_string();
-        // n_embd is baked into matvec_q1_0_fused_normed.wgsl so the in-LDS
-        // x_sh array is sized exactly to this model (5 KiB at 4B / 8 KiB at 8B)
-        // — this maximizes WG-occupancy on AMD RDNA, which allocates LDS in
-        // 1 KiB granularity per WG.
-        let n_embd_v4_str = (cfg.n_embd / 4).to_string();
-
-        // Pre-flight: check the attention_merge LDS budget before shader compile.
-        // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs SG_PARTIAL_MAX
-        // f32 slots = ceil(WG=64 / subgroup_min_size) in the worst case.
-        let merge_lds_bytes =
-            4 * u64::from(max_chunks) + 4 * u64::from(64u32.div_ceil(subgroup_min_size));
-        if merge_lds_bytes > u64::from(device.limits().max_compute_workgroup_storage_size) {
-            return Err(PotError::Config(
-                "max_seq exceeds attention_merge LDS budget; reduce --max-seq",
-            ));
+        // SPIR-V is pre-compiled at build time by pot_shader!. SUBGROUP_MIN_SIZE,
+        // N_EMBD_V4 (=1024, worst-case for 8B), and MAX_CHUNKS (=2048, max_seq=32768)
+        // are baked into each variant; the right variant is selected at runtime
+        // by matching on `subgroup_min_size`.
+        let sg = subgroup_min_size;
+        // SAFETY: words are naga-generated SPIR-V, validated at build time.
+        macro_rules! mk_shader {
+            ($name:literal) => {
+                unsafe {
+                    device.create_shader_module_passthrough(
+                        wgpu::ShaderModuleDescriptorPassthrough {
+                            label: Some($name),
+                            spirv: Some(Cow::Borrowed(pot_shader::pot_shader!($name, sg))),
+                            ..Default::default()
+                        },
+                    )
+                }
+            };
         }
-
-        macro_rules! load_shader {
-            ($file:expr) => {{
-                let src: &str = include_str!(concat!("shaders/", $file));
-                let templated = src
-                    .replace("{{SUBGROUP_MIN_SIZE}}", &subgroup_min_size_str)
-                    .replace("{{MAX_CHUNKS}}", &max_chunks_str)
-                    .replace("{{N_EMBD_V4}}", &n_embd_v4_str);
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some($file),
-                    source: wgpu::ShaderSource::Wgsl(templated.into()),
-                })
-            }};
-        }
-        let sh_embed = load_shader!("embed.wgsl");
-        let sh_rms = load_shader!("rms_norm.wgsl");
-        let sh_matvec = load_shader!("matvec_q1_0.wgsl");
-        let sh_matvec_silu = load_shader!("matvec_q1_0_silu.wgsl");
-        let sh_matvec_fused_normed = load_shader!("matvec_q1_0_fused_normed.wgsl");
-        let sh_quant = load_shader!("quantize_q8_0.wgsl");
-        let sh_matmul = load_shader!("matmul_q1_0_q8_0.wgsl");
-        let sh_attn = load_shader!("attention.wgsl");
-        let sh_attn_split = load_shader!("attention_split.wgsl");
-        let sh_attn_merge = load_shader!("attention_merge.wgsl");
-        let sh_silu = load_shader!("silu_mul.wgsl");
-        let sh_topk = load_shader!("topk_reduce.wgsl");
-        let sh_kv_writeback_fused = load_shader!("kv_writeback_fused.wgsl");
-        let sh_q_norm_rope_fused = load_shader!("q_norm_rope_fused.wgsl");
+        let sh_embed = mk_shader!("embed.wgsl");
+        let sh_rms = mk_shader!("rms_norm.wgsl");
+        let sh_matvec = mk_shader!("matvec_q1_0.wgsl");
+        let sh_matvec_silu = mk_shader!("matvec_q1_0_silu.wgsl");
+        let sh_matvec_fused_normed = mk_shader!("matvec_q1_0_fused_normed.wgsl");
+        let sh_quant = mk_shader!("quantize_q8_0.wgsl");
+        let sh_matmul = mk_shader!("matmul_q1_0_q8_0.wgsl");
+        let sh_attn = mk_shader!("attention.wgsl");
+        let sh_attn_split = mk_shader!("attention_split.wgsl");
+        let sh_attn_merge = mk_shader!("attention_merge.wgsl");
+        let sh_silu = mk_shader!("silu_mul.wgsl");
+        let sh_topk = mk_shader!("topk_reduce.wgsl");
+        let sh_kv_writeback_fused = mk_shader!("kv_writeback_fused.wgsl");
+        let sh_q_norm_rope_fused = mk_shader!("q_norm_rope_fused.wgsl");
 
         let make_bgl =
             |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {

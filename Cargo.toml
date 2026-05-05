@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/pot-shader"]
+resolver = "3"
+
 [package]
 name = "bonsai-pot"
 version = "0.1.0"
@@ -14,7 +18,7 @@ path = "src/bin/bonsai-pot.rs"
 required-features = ["bench-internals"]
 
 [features]
-default = ["half"]
+default = ["half", "sg-8", "sg-16", "sg-32", "sg-64"]
 # Exposes bench/microbench utilities under `bonsai_pot::__bench` and pulls in
 # the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
 # stable public library API.
@@ -24,15 +28,22 @@ bench-internals = ["dep:pollster", "dep:env_logger"]
 nightly = []
 # Use the `half` crate. This is required if `nightly` is not enabled
 half = ["dep:half"]
+# Pre-compiled SPIR-V variants for each subgroup size. All four are on by
+# default; disable any size you know your hardware never uses to slim the binary.
+sg-8  = ["pot-shader/sg-8"]
+sg-16 = ["pot-shader/sg-16"]
+sg-32 = ["pot-shader/sg-32"]
+sg-64 = ["pot-shader/sg-64"]
 
 [dependencies]
 # Library deps.
-wgpu = { version = "29", default-features = false, features = ["std", "vulkan", "wgsl"] }
+wgpu = { version = "29", default-features = false, features = ["std", "vulkan"] }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"], optional = true }
 log = "0.4"
 thiserror = "2"
+pot-shader = { path = "crates/pot-shader" }
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
 pollster = { version = "0.3", optional = true }
