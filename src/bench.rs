@@ -57,11 +57,14 @@ const E2E_PP_PROMPT: &[u32] = &[
 
 pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     let cfg = &model.cfg;
+    // `prefill_matmul_topk` caps batch size at `model.m_max` (M_MAX=512), so a
+    // larger `--pp` would silently truncate the prompt while still dividing by
+    // the un-clamped count — inflating t/s by `pp_n / m_max`. Clamp here so the
+    // reported number reflects what we actually ran.
+    let pp_n = pp_n.min(model.m_max);
     eprintln!("--- bench: pp={pp_n}, tg={tg_n}, repeats={repeats} (after 1 warmup) ---");
 
-    let prompt: Vec<u32> = (0..pp_n.min(model.m_max))
-        .map(|i| (i % (cfg.n_vocab - 1)) + 1)
-        .collect();
+    let prompt: Vec<u32> = (0..pp_n).map(|i| (i % (cfg.n_vocab - 1)) + 1).collect();
 
     // warm up
     let mut warm_marker = BenchMarker::new(model);
