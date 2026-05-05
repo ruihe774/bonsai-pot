@@ -341,8 +341,6 @@ pub struct Pipelines {
     // Kept built but unused on the active code path: the matvec single-token
     // path's two callers both fold in the preceding rms_norm via
     // `matvec_fused_normed`. Retained for future no-rms-norm fused callers.
-    #[allow(dead_code, reason = "kept for future no-rms-norm callers")]
-    pub(crate) matvec_fused: wgpu::ComputePipeline,
     pub(crate) matvec_silu: wgpu::ComputePipeline,
     pub(crate) matvec_fused_normed: wgpu::ComputePipeline,
     pub(crate) quantize: wgpu::ComputePipeline,
@@ -1351,7 +1349,6 @@ impl Model {
         let sh_embed = load_shader!("embed.wgsl");
         let sh_rms = load_shader!("rms_norm.wgsl");
         let sh_matvec = load_shader!("matvec_q1_0.wgsl");
-        let sh_matvec_fused = load_shader!("matvec_q1_0_fused.wgsl");
         let sh_matvec_silu = load_shader!("matvec_q1_0_silu.wgsl");
         let sh_matvec_fused_normed = load_shader!("matvec_q1_0_fused_normed.wgsl");
         let sh_quant = load_shader!("quantize_q8_0.wgsl");
@@ -1436,12 +1433,6 @@ impl Model {
                 &sh_matvec,
                 "matvec",
                 size_of::<MatvecParams>() as u32,
-            ),
-            matvec_fused: mk_pipe(
-                &bgls.matvec,
-                &sh_matvec_fused,
-                "matvec_fused",
-                size_of::<MatvecFusedParams>() as u32,
             ),
             matvec_silu: mk_pipe(
                 &bgls.matvec,
@@ -1718,13 +1709,11 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
 // ----- public(crate) helpers used by forward.rs -----------------------------
 
 #[allow(
-    clippy::panic,
+    clippy::unwrap_used,
     reason = "manifest is fully validated at load; missing tensor is a programmer error"
 )]
 pub fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
-    cfg.manifest
-        .get(name)
-        .unwrap_or_else(|| panic!("missing tensor in manifest: {name}"))
+    cfg.manifest.get(name).unwrap()
 }
 
 /// Build the full set of cached bind groups in one go. Called once at load.

@@ -25,9 +25,9 @@
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
-    KvWritebackFusedParams, MatmulParams, MatvecFusedNormedParams, MatvecFusedParams, MatvecParams,
-    MatvecSiluParams, Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams,
-    TOPK_MAX, TopKParams, WeightSet,
+    KvWritebackFusedParams, MatmulParams, MatvecFusedNormedParams, MatvecParams, MatvecSiluParams,
+    Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams, TOPK_MAX, TopKParams,
+    WeightSet,
 };
 
 // ---------- Q8_0 KV cache layout helpers ------------------------------------
@@ -193,56 +193,6 @@ fn dispatch_matvec_q1_0(
         dispatch_x_dim: dispatch_x,
     };
     pass.set_pipeline(&model.pipes.matvec);
-    pass.set_bind_group(0, matvec_bg(model, weights), &[]);
-    pass.set_immediates(0, bytemuck::bytes_of(&p));
-    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-}
-
-// Currently unused: both call sites (QKV, gate+up) on the matvec single-token
-// path now go through `dispatch_matvec_q1_0_fused_normed` which folds in the
-// preceding `rms_norm`. Kept as the canonical 2-/3-range fused matvec for any
-// future caller that doesn't have an `rms_norm` immediately before it.
-#[allow(dead_code, reason = "kept for future no-rms-norm callers")]
-fn dispatch_matvec_q1_0_fused(
-    model: &Model,
-    pass: &mut wgpu::ComputePass<'_>,
-    k: u32,
-    input_offset: u32,
-    weights: WeightSet,
-    ranges: &[(u32, u32, u32, u32)],
-) {
-    const ROWS_PER_WG: u32 = 8;
-    debug_assert!(ranges.len() == 2 || ranges.len() == 3);
-    for (_, _, n, _) in ranges {
-        debug_assert!(n % 8 == 0);
-    }
-    let r = |i: usize| ranges.get(i).copied().unwrap_or((0, 0, 0, 0));
-    let (d0, qs0, n0, o0) = r(0);
-    let (d1, qs1, n1, o1) = r(1);
-    let (d2, qs2, n2, o2) = r(2);
-    let n_total = n0 + n1 + n2;
-    let n_wg = n_total.div_ceil(ROWS_PER_WG);
-    let dispatch_x = n_wg.min(65535);
-    let dispatch_y = n_wg.div_ceil(dispatch_x);
-    let p = MatvecFusedParams {
-        k,
-        n_total,
-        input_offset,
-        dispatch_x_dim: dispatch_x,
-        d_offset_0: d0,
-        qs_offset_0: qs0,
-        n_0: n0,
-        output_offset_0: o0,
-        d_offset_1: d1,
-        qs_offset_1: qs1,
-        n_1: n1,
-        output_offset_1: o1,
-        d_offset_2: d2,
-        qs_offset_2: qs2,
-        n_2: n2,
-        output_offset_2: o2,
-    };
-    pass.set_pipeline(&model.pipes.matvec_fused);
     pass.set_bind_group(0, matvec_bg(model, weights), &[]);
     pass.set_immediates(0, bytemuck::bytes_of(&p));
     pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
