@@ -1335,6 +1335,13 @@ impl Model {
             ));
         }
 
+        // SAFETY: all WGSL below is hand-written, statically validated by naga
+        // (wgpu still parses + validates with `bounds_checks=false`; only the
+        // *injection* of clamps into the emitted SPIR-V is skipped). The
+        // shaders are audited to never index out of bounds — every dynamic
+        // index is masked or clamped in WGSL before use, and every loop has a
+        // statically-bounded count. See the docs on
+        // `ShaderRuntimeChecks::unchecked` for the safety contract.
         macro_rules! load_shader {
             ($file:expr) => {{
                 let src: &str = include_str!(concat!("shaders/", $file));
@@ -1342,10 +1349,15 @@ impl Model {
                     .replace("{{SUBGROUP_MIN_SIZE}}", &subgroup_min_size_str)
                     .replace("{{MAX_CHUNKS}}", &max_chunks_str)
                     .replace("{{N_EMBD_V4}}", &n_embd_v4_str);
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some($file),
-                    source: wgpu::ShaderSource::Wgsl(templated.into()),
-                })
+                unsafe {
+                    device.create_shader_module_trusted(
+                        wgpu::ShaderModuleDescriptor {
+                            label: Some($file),
+                            source: wgpu::ShaderSource::Wgsl(templated.into()),
+                        },
+                        wgpu::ShaderRuntimeChecks::unchecked(),
+                    )
+                }
             }};
         }
         let sh_embed = load_shader!("embed.wgsl");
