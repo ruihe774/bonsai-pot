@@ -115,14 +115,14 @@ To exercise the wave32 / multi-subgroup merge path on AMD RDNA, run with `RADV_P
 
 | model     | pp512 t/s | tg1024 t/s (e2e) |
 |-----------|----------:|-----------------:|
-| Bonsai-4B |     ~1400 |             ~179 |
-| Bonsai-8B |      ~815 |             ~122 |
+| Bonsai-4B |     ~1675 |             ~266 |
+| Bonsai-8B |      ~970 |             ~181 |
 
 Under `RADV_PERFTEST=cswave32` (4B), generation is unaffected but prefill carries a ~10% cost on this hardware.
 
 ### Sampling: hybrid GPU top-K → CPU finish
 
-There is no GPU argmax shader. After the LM-head matvec, `topk_reduce.wgsl` (single workgroup, WG=64, K_MAX=32) reduces the full logits array to top-K candidates: each thread maintains a per-thread top-K_MAX min-heap in shmem, then a halving-tree two-pointer merge produces the global top-K. Output: K `f32` logits (descending) followed by K `u32` indices, written to the `sample` buffer.
+There is no GPU argmax shader. After the LM-head matvec, `topk_reduce.wgsl` (single workgroup, WG=256, K_MAX=32) reduces the full logits array to top-K candidates: each thread maintains a per-thread top-K_MAX min-heap in shmem, then a halving-tree two-pointer merge produces the global top-K. Output: K `f32` logits (descending) followed by K `u32` indices, written to the `sample` buffer.
 
 The CPU then reads `sample[0..2K]` back and finishes sampling: temperature scale → softmax → top-p nucleus filter → multinomial via xorshift/SplitMix64 PRNG seeded by `(sampler.seed + pos)`. Implementation in `session.rs::sample_from_topk`. With `temperature == 0.0` this short-circuits to argmax over the K candidates — which is exact, because the global max is always `sample[0]`.
 
