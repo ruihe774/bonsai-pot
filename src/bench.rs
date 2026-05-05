@@ -59,15 +59,16 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let t = Instant::now();
         let mut total_gpu_ns = 0.0f32;
         for pos in 0..tg_n {
-            model
-                .queue
-                .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&tok));
             let mut se = StepEncoder::new(model);
+            se.write_sample(0, bytemuck::bytes_of(&tok));
             let mut marker = BenchMarker::new(model);
             encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), pos, &mut marker);
             se.copy_sample_to_readback(8);
             let slot = se.schedule_topk_map(8);
-            model.queue.submit(Some(se.finish()));
+            let cb = se.finish();
+            model.belt_finish();
+            model.queue.submit(Some(cb));
+            model.belt_recall();
             wait_topk_readback(model, 1, slot)?;
             total_gpu_ns += marker.resolve()?.total_ns();
         }
@@ -194,15 +195,16 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
 /// Run one instrumented matvec step at `pos`, returning the resolved GPU timings.
 fn run_instrumented_step(model: &Model, pos: u32) -> Result<BenchTimings> {
     let tok: u32 = 1;
-    model
-        .queue
-        .write_buffer(&model.buffers.sample, 0, bytemuck::bytes_of(&tok));
     let mut se = StepEncoder::new(model);
+    se.write_sample(0, bytemuck::bytes_of(&tok));
     let mut marker = BenchMarker::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut marker);
     se.copy_sample_to_readback(8);
     let slot = se.schedule_topk_map(8);
-    model.queue.submit(Some(se.finish()));
+    let cb = se.finish();
+    model.belt_finish();
+    model.queue.submit(Some(cb));
+    model.belt_recall();
     wait_topk_readback(model, 1, slot)?;
     marker.resolve()
 }

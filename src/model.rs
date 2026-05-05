@@ -10,14 +10,14 @@ use std::fs::{read, read_to_string};
 use std::mem::size_of;
 use std::path::Path;
 use std::str::{FromStr, from_utf8};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::ext::global_priority;
 use ash::vk;
 use bytemuck::{Pod, Zeroable, cast_slice};
 use wgpu::hal::DeviceError;
 use wgpu::hal::api::Vulkan as VulkanApi;
-use wgpu::util::DeviceExt as _;
+use wgpu::util::{DeviceExt as _, StagingBelt};
 
 use crate::decode;
 use crate::error::{PotError, Result};
@@ -494,12 +494,14 @@ pub struct Model {
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
     pub(crate) lost: Arc<OnceLock<DeviceLostInfo>>,
+    pub(crate) belt: Mutex<StagingBelt>,
     #[cfg(feature = "bench-internals")]
     pub(crate) bench_ts_period_ns: f32,
 }
 
 const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
+const STAGING_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB
 /// Number of timestamp query slots allocated for bench/microbench.
 /// Must be >= max marks per step (`n_layer` * 8 + 5 for the matvec path).
 #[cfg(feature = "bench-internals")]
@@ -1583,6 +1585,8 @@ impl Model {
         #[cfg(feature = "bench-internals")]
         let bench_ts_period_ns = queue.get_timestamp_period();
 
+        let belt = Mutex::new(StagingBelt::new(device.clone(), STAGING_CHUNK));
+
         Ok(Self {
             device,
             queue,
@@ -1597,6 +1601,7 @@ impl Model {
             output_tensors,
             vocab,
             lost,
+            belt,
             #[cfg(feature = "bench-internals")]
             bench_ts_period_ns,
         })
@@ -1606,6 +1611,51 @@ impl Model {
     #[must_use]
     pub const fn max_seq_len(&self) -> u32 {
         self.max_seq
+    }
+
+    /// Stage `data` into `dst[offset..]` via the belt, recording the copy on
+    /// `encoder`. `data.len()` and `offset` must be multiples of 4
+    /// (`wgpu::COPY_BUFFER_ALIGNMENT`).
+    pub(crate) fn belt_write(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::Buffer,
+        offset: wgpu::BufferAddress,
+        data: &[u8],
+    ) {
+        debug_assert!(data.len().is_multiple_of(4) && offset.is_multiple_of(4));
+        let Some(size) = wgpu::BufferSize::new(data.len() as u64) else {
+            return;
+        };
+        // Tighten the guard scope: view outlives the MutexGuard safely because
+        // BufferViewMut is owned (no borrow back to the belt).
+        let mut view = {
+            #[allow(
+                clippy::expect_used,
+                reason = "mutex poison indicates a preceding panic"
+            )]
+            let mut belt = self.belt.lock().expect("belt mutex poisoned");
+            belt.write_buffer(encoder, dst, offset, size)
+        };
+        view.copy_from_slice(data);
+        // view drops here, removing the mapped-range registration before any
+        // future belt_finish() call (which calls buffer.unmap()).
+    }
+
+    pub(crate) fn belt_finish(&self) {
+        #[allow(
+            clippy::expect_used,
+            reason = "mutex poison indicates a preceding panic"
+        )]
+        self.belt.lock().expect("belt mutex poisoned").finish();
+    }
+
+    pub(crate) fn belt_recall(&self) {
+        #[allow(
+            clippy::expect_used,
+            reason = "mutex poison indicates a preceding panic"
+        )]
+        self.belt.lock().expect("belt mutex poisoned").recall();
     }
 
     /// Maximum batch size supported by a single matmul prefill dispatch.
