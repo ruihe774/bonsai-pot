@@ -16,25 +16,25 @@ Tokenization is intentionally out of the Rust crate. Use `scripts/bpe.py` to BPE
 
 ```
 # Library only:
-cargo build --release --lib
+cargo build --lib
 
 # Demo CLI (pulls in the bench/microbench helpers):
-cargo build --release --features bench-internals
+cargo build --features bench-internals
 
 # End-to-end run: tokenize then generate. `uv run` resolves the script's
 # inline dependencies on the fly — no separate `pip install` step.
 uv run scripts/bpe.py ./model "Once upon a time" \
-  | cargo run --release --features bench-internals -- ./model \
+  | cargo run --features bench-internals -- ./model \
         --mode prompt --max-new-tokens 64
 
 # Benches and microbench don't need stdin:
-cargo run --release --features bench-internals -- ./model --mode bench --pp 512 --tg 128
-cargo run --release --features bench-internals -- ./model --mode microbench
+cargo run --features bench-internals -- ./model --mode bench --pp 512 --tg 128
+cargo run --features bench-internals -- ./model --mode microbench
 ```
 
 `<model_dir>` is the output of `scripts/extract.py` (default `./model`). It must contain `config.ini`, the five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and (for the tokenizer) `merges.txt`. The runtime no longer reads `prompt.bin`; prompts come in over stdin from `scripts/bpe.py`.
 
-Tests live in `tests/gpu_integration.rs` (end-to-end on a real GPU against `./model`) plus unit tests in `src/session.rs` (CPU sampler) and `src/kv_snapshot.rs` (header round-trips). Run with `cargo test --release`. Beyond that, `--mode gen` / `--mode prompt` plus parity diffs against captured baselines (and `examples/chat.rs`) are the correctness harness.
+Tests live in `tests/gpu_integration.rs` (end-to-end on a real GPU against `./model`) plus unit tests in `src/session.rs` (CPU sampler) and `src/kv_snapshot.rs` (header round-trips). Run with `cargo test`. Beyond that, `--mode gen` / `--mode prompt` plus parity diffs against captured baselines (and `examples/chat.rs`) are the correctness harness.
 
 - `--mode gen` (default): single-token matvec path for both prompt and generation (multiply-free Q1_0 hot path).
 - `--mode prompt`: batched dot4I8Packed matmul prefill (with a Q8_0 activation quantize pre-pass), then matvec for generation.
