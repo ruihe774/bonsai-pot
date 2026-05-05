@@ -29,9 +29,9 @@ use wgpu::PollType;
 
 use crate::error::{PotError, Result};
 use crate::model::{
-    ATTN_CHUNK_SIZE, AttnMergeParams, AttnParams, AttnSplitParams, Config, EmbedParams,
+    ATTN_CHUNK_SIZE, AttnMergeParams, AttnPrefillTiledParams, AttnSplitParams, Config, EmbedParams,
     KvWritebackFusedParams, MatmulParams, MatvecFusedNormedParams, MatvecParams, MatvecSiluParams,
-    Model, QNormRopeFusedParams, QuantParams, RmsNormParams, SiluMulParams, TOPK_MAX,
+    Model, QNormRopeFusedParams, RmsNormParams, RmsNormQ8Params, SiluMulQ8Params, TOPK_MAX,
     TOPK_NUM_PARTIAL_WG, TopKMergeParams, TopKPartialParams, WeightSet,
 };
 
@@ -436,31 +436,62 @@ fn dispatch_q_norm_rope_fused(
     pass.dispatch_workgroups(cfg.n_head, m_tokens, 1);
 }
 
-fn dispatch_quantize_act(
+/// Fused: `rms_norm(x) * w` → Q8_0 quantize → write to `act_q8`. One WG per
+/// token. Replaces the prefill-path `dispatch_rms_norm + dispatch_quantize_act`
+/// pair (eliminates the `act.x_norm` round-trip and one dispatch). Returns
+/// `(d_offset, qs_offset)` of the freshly-written Q8_0 region in `act_q8`.
+fn dispatch_rms_norm_q8_0(
     model: &Model,
+    cfg: &Config,
     pass: &mut wgpu::ComputePass<'_>,
     k: u32,
     m: u32,
-    in_off_f32: u32,
+    in_off_f16: u32,
+    w_off_f16: u32,
 ) -> (u32, u32) {
     let nb_q8 = k / 32;
     let d_off = 0u32;
     let qs_off = m * nb_q8 * 4;
-    let total = m * nb_q8;
-    let dispatch_x = total.min(65535);
-    let dispatch_y = total.div_ceil(dispatch_x);
-    let p = QuantParams {
+    let p = RmsNormQ8Params {
         k,
-        m,
-        input_offset: in_off_f32,
+        input_offset: in_off_f16,
+        weight_offset: w_off_f16,
         d_offset: d_off,
         qs_offset: qs_off,
-        dispatch_x_dim: dispatch_x,
+        eps: cfg.rms_eps,
     };
-    pass.set_pipeline(&model.pipes.quantize);
-    pass.set_bind_group(0, &model.cached.quantize, &[]);
+    pass.set_pipeline(&model.pipes.rms_norm_q8_0);
+    pass.set_bind_group(0, &model.cached.rms_norm_q8_0, &[]);
     pass.set_immediates(0, bytemuck::bytes_of(&p));
-    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    pass.dispatch_workgroups(m, 1, 1);
+    (d_off, qs_off)
+}
+
+/// Fused: `silu(gate) * up` → Q8_0 quantize → write to `act_q8`. One WG per
+/// token. Replaces `dispatch_silu_mul + dispatch_quantize_act` (eliminates
+/// the `act.ffn_in` round-trip and one dispatch).
+fn dispatch_silu_mul_q8_0(
+    model: &Model,
+    pass: &mut wgpu::ComputePass<'_>,
+    k: u32,
+    m: u32,
+    gate_off: u32,
+    up_off: u32,
+) -> (u32, u32) {
+    let nb_q8 = k / 32;
+    let d_off = 0u32;
+    let qs_off = m * nb_q8 * 4;
+    let p = SiluMulQ8Params {
+        k,
+        gate_offset: gate_off,
+        up_offset: up_off,
+        d_offset: d_off,
+        qs_offset: qs_off,
+    };
+    pass.set_pipeline(&model.pipes.silu_mul_q8_0);
+    pass.set_bind_group(0, &model.cached.silu_mul_q8_0, &[]);
+    pass.set_immediates(0, bytemuck::bytes_of(&p));
+    pass.dispatch_workgroups(m, 1, 1);
     (d_off, qs_off)
 }
 
@@ -495,66 +526,50 @@ fn dispatch_matmul_q1_0(
     pass.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);
 }
 
-fn dispatch_silu_mul(
-    model: &Model,
-    pass: &mut wgpu::ComputePass<'_>,
-    n: u32,
-    m: u32,
-    gate_off: u32,
-    up_off: u32,
-    out_off: u32,
-) {
-    let total = n * m;
-    let groups = total.div_ceil(64);
-    let dispatch_x = groups.min(65535);
-    let dispatch_y = groups.div_ceil(dispatch_x);
-    let p = SiluMulParams {
-        n,
-        m,
-        gate_offset: gate_off,
-        up_offset: up_off,
-        out_offset: out_off,
-        dispatch_x_count: dispatch_x * 64,
-    };
-    pass.set_pipeline(&model.pipes.silu_mul);
-    pass.set_bind_group(0, &model.cached.silu_mul, &[]);
-    pass.set_immediates(0, bytemuck::bytes_of(&p));
-    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-}
-
-fn dispatch_attention(
+/// Q-tiled + GQA-batched FlashAttention-2 prefill kernel with fused Q8_0
+/// output. One workgroup handles Q_TILE=2 consecutive query tokens × 4 GQA
+/// Q-heads sharing the same KV head. K/V are loaded once per cache position
+/// and reused across all 2 * 4 queries — the bandwidth win that keeps
+/// prefill from degrading quadratically. The attention output is quantized
+/// to Q8_0 in-place and written to `act_q8` (no f16 staging in
+/// `act.attn_out`), so the Wo matmul reads it as-is. Returns the
+/// `(d_offset, qs_offset)` byte offsets of the freshly written Q8_0 region.
+/// See `shaders/attention_prefill_tiled.wgsl`.
+fn dispatch_attention_prefill_tiled(
     model: &Model,
     cfg: &Config,
     pass: &mut wgpu::ComputePass<'_>,
     layer_il: u32,
     max_seq: u32,
-    pos: u32,
     m_tokens: u32,
-    is_prefill: bool,
     pos_base: u32,
-) {
+) -> (u32, u32) {
+    const Q_TILE: u32 = 2;
     let (d_word, qs_byte) = kv_layer_offsets(cfg, max_seq, layer_il);
-    let p = AttnParams {
+    let nb_q8 = cfg.q_dim / 32;
+    let out_d_offset = 0u32;
+    let out_qs_offset = m_tokens * nb_q8 * 4;
+    let p = AttnPrefillTiledParams {
         head_dim: cfg.head_dim,
         n_head: cfg.n_head,
         n_kv_head: cfg.n_kv_head,
-        pos,
+        m_tokens,
+        pos_base,
         kv_stride: cfg.kv_dim,
         q_offset: model.act_layout.q,
         k_d_word_offset: d_word,
         k_qs_byte_offset: qs_byte,
         v_d_word_offset: d_word,
         v_qs_byte_offset: qs_byte,
-        out_offset: model.act_layout.attn_out,
+        out_d_offset,
+        out_qs_offset,
         scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-        m_tokens,
-        is_prefill: u32::from(is_prefill),
-        pos_base,
     };
-    pass.set_pipeline(&model.pipes.attention);
-    pass.set_bind_group(0, &model.cached.attn, &[]);
+    pass.set_pipeline(&model.pipes.attention_prefill_tiled);
+    pass.set_bind_group(0, &model.cached.attn_prefill_tiled, &[]);
     pass.set_immediates(0, bytemuck::bytes_of(&p));
-    pass.dispatch_workgroups(cfg.n_head, m_tokens, 1);
+    pass.dispatch_workgroups(cfg.n_kv_head, m_tokens.div_ceil(Q_TILE), 1);
+    (out_d_offset, out_qs_offset)
 }
 
 // ---------- async readback helper -------------------------------------------
@@ -1106,20 +1121,17 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
 ) {
     let lt = &model.layer_tensors[il as usize];
 
-    // attn_norm + quantize + Q/K/V matmul.
-    dispatch_rms_norm(
+    // attn_norm fused with Q8_0 quantize (writes act_q8 directly).
+    let (a_d, a_qs) = dispatch_rms_norm_q8_0(
         model,
         cfg,
         pass,
-        m,
         cfg.n_embd,
+        m,
         model.act_layout.x,
-        model.act_layout.x_norm,
         lt.attn_norm_off,
     );
-    marker.mark(pass, "rms_norm");
-    let (a_d, a_qs) = dispatch_quantize_act(model, pass, cfg.n_embd, m, model.act_layout.x_norm);
-    marker.mark(pass, "quantize_act");
+    marker.mark(pass, "rms_norm_q8");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1190,23 +1202,12 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
     );
     marker.mark(pass, "kv_writeback");
 
-    // Attention.
-    dispatch_attention(
-        model,
-        cfg,
-        pass,
-        il,
-        model.max_seq,
-        /*pos=*/ 0,
-        m,
-        /*is_prefill=*/ true,
-        pos_base,
-    );
+    // Attention (Q-tiled FA-2 prefill, Q8_0 output written directly to act_q8).
+    let (a_d2, a_qs2) =
+        dispatch_attention_prefill_tiled(model, cfg, pass, il, model.max_seq, m, pos_base);
     marker.mark(pass, "attention");
 
-    // Wo (residual) + ffn_norm + gate/up + silu_mul + Wd (residual).
-    let (a_d2, a_qs2) = dispatch_quantize_act(model, pass, cfg.q_dim, m, model.act_layout.attn_out);
-    marker.mark(pass, "quantize_act");
+    // Wo (residual) + ffn_norm + gate/up + silu_mul_q8 + Wd (residual).
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1222,19 +1223,16 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
         true,
     );
     marker.mark(pass, "wo_matmul");
-    dispatch_rms_norm(
+    let (a_d3, a_qs3) = dispatch_rms_norm_q8_0(
         model,
         cfg,
         pass,
-        m,
         cfg.n_embd,
+        m,
         model.act_layout.x,
-        model.act_layout.x_norm,
         lt.ffn_norm_off,
     );
-    marker.mark(pass, "rms_norm");
-    let (a_d3, a_qs3) = dispatch_quantize_act(model, pass, cfg.n_embd, m, model.act_layout.x_norm);
-    marker.mark(pass, "quantize_act");
+    marker.mark(pass, "rms_norm_q8");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1265,18 +1263,15 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
         false,
     );
     marker.mark(pass, "wu_matmul");
-    dispatch_silu_mul(
+    let (a_d4, a_qs4) = dispatch_silu_mul_q8_0(
         model,
         pass,
         cfg.n_ff,
         m,
         model.act_layout.gate,
         model.act_layout.up,
-        model.act_layout.ffn_in,
     );
-    marker.mark(pass, "silu_mul");
-    let (a_d4, a_qs4) = dispatch_quantize_act(model, pass, cfg.n_ff, m, model.act_layout.ffn_in);
-    marker.mark(pass, "quantize_act");
+    marker.mark(pass, "silu_mul_q8");
     dispatch_matmul_q1_0(
         model,
         pass,

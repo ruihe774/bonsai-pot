@@ -169,16 +169,6 @@ pub struct MatvecFusedNormedParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub struct QuantParams {
-    pub(crate) k: u32,
-    pub(crate) m: u32,
-    pub(crate) input_offset: u32,
-    pub(crate) d_offset: u32,
-    pub(crate) qs_offset: u32,
-    pub(crate) dispatch_x_dim: u32,
-}
-#[repr(C)]
-#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct MatmulParams {
     pub(crate) k: u32,
     pub(crate) n: u32,
@@ -192,22 +182,21 @@ pub struct MatmulParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub struct AttnParams {
+pub struct AttnPrefillTiledParams {
     pub(crate) head_dim: u32,
     pub(crate) n_head: u32,
     pub(crate) n_kv_head: u32,
-    pub(crate) pos: u32,
+    pub(crate) m_tokens: u32,
+    pub(crate) pos_base: u32,
     pub(crate) kv_stride: u32,
     pub(crate) q_offset: u32,
     pub(crate) k_d_word_offset: u32,
     pub(crate) k_qs_byte_offset: u32,
     pub(crate) v_d_word_offset: u32,
     pub(crate) v_qs_byte_offset: u32,
-    pub(crate) out_offset: u32,
+    pub(crate) out_d_offset: u32,
+    pub(crate) out_qs_offset: u32,
     pub(crate) scale: f32,
-    pub(crate) m_tokens: u32,
-    pub(crate) is_prefill: u32,
-    pub(crate) pos_base: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -235,16 +224,6 @@ pub struct AttnMergeParams {
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
-pub struct SiluMulParams {
-    pub(crate) n: u32,
-    pub(crate) m: u32,
-    pub(crate) gate_offset: u32,
-    pub(crate) up_offset: u32,
-    pub(crate) out_offset: u32,
-    pub(crate) dispatch_x_count: u32,
-}
-#[repr(C)]
-#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
 pub struct TopKPartialParams {
     pub(crate) n: u32,
     pub(crate) in_offset: u32,
@@ -258,6 +237,25 @@ pub struct TopKMergeParams {
     pub(crate) num_partials: u32,
     pub(crate) out_offset: u32,
     pub(crate) k: u32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct RmsNormQ8Params {
+    pub(crate) k: u32,
+    pub(crate) input_offset: u32,
+    pub(crate) weight_offset: u32,
+    pub(crate) d_offset: u32,
+    pub(crate) qs_offset: u32,
+    pub(crate) eps: f32,
+}
+#[repr(C)]
+#[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
+pub struct SiluMulQ8Params {
+    pub(crate) k: u32,
+    pub(crate) gate_offset: u32,
+    pub(crate) up_offset: u32,
+    pub(crate) d_offset: u32,
+    pub(crate) qs_offset: u32,
 }
 #[repr(C)]
 #[derive(Pod, Zeroable, Copy, Clone, Default, Debug)]
@@ -302,14 +300,12 @@ pub const TOPK_NUM_PARTIAL_WG: u32 = 32;
 #[derive(Copy, Clone, Debug)]
 pub struct ActLayout {
     pub(crate) x: u32,
-    pub(crate) x_norm: u32,
     pub(crate) q: u32,
     pub(crate) k_cur: u32,
     pub(crate) v_cur: u32,
     pub(crate) attn_out: u32,
     pub(crate) gate: u32,
     pub(crate) up: u32,
-    pub(crate) ffn_in: u32,
     pub(crate) logits: u32,
     pub(crate) total_elems: u32,
 }
@@ -323,25 +319,21 @@ impl ActLayout {
             r
         };
         let x = alloc(m_max * cfg.n_embd, &mut o);
-        let x_norm = alloc(m_max * cfg.n_embd, &mut o);
         let q = alloc(m_max * cfg.q_dim, &mut o);
         let k_cur = alloc(m_max * cfg.kv_dim, &mut o);
         let v_cur = alloc(m_max * cfg.kv_dim, &mut o);
         let attn_out = alloc(m_max * cfg.q_dim, &mut o);
         let gate = alloc(m_max * cfg.n_ff, &mut o);
         let up = alloc(m_max * cfg.n_ff, &mut o);
-        let ffn_in = alloc(m_max * cfg.n_ff, &mut o);
         let logits = alloc(cfg.n_vocab, &mut o);
         Self {
             x,
-            x_norm,
             q,
             k_cur,
             v_cur,
             attn_out,
             gate,
             up,
-            ffn_in,
             logits,
             total_elems: o,
         }
@@ -359,12 +351,12 @@ pub struct Pipelines {
     // `matvec_fused_normed`. Retained for future no-rms-norm fused callers.
     pub(crate) matvec_silu: wgpu::ComputePipeline,
     pub(crate) matvec_fused_normed: wgpu::ComputePipeline,
-    pub(crate) quantize: wgpu::ComputePipeline,
     pub(crate) matmul: wgpu::ComputePipeline,
-    pub(crate) attention: wgpu::ComputePipeline,
+    pub(crate) attention_prefill_tiled: wgpu::ComputePipeline,
     pub(crate) attention_split: wgpu::ComputePipeline,
     pub(crate) attention_merge: wgpu::ComputePipeline,
-    pub(crate) silu_mul: wgpu::ComputePipeline,
+    pub(crate) rms_norm_q8_0: wgpu::ComputePipeline,
+    pub(crate) silu_mul_q8_0: wgpu::ComputePipeline,
     pub(crate) topk_partial: wgpu::ComputePipeline,
     pub(crate) topk_merge: wgpu::ComputePipeline,
     pub(crate) kv_writeback_fused: wgpu::ComputePipeline,
@@ -398,12 +390,12 @@ pub struct BindGroupLayouts {
     pub(crate) rms_norm: wgpu::BindGroupLayout,
     pub(crate) matvec: wgpu::BindGroupLayout,
     pub(crate) matvec_fused_normed: wgpu::BindGroupLayout,
-    pub(crate) quantize: wgpu::BindGroupLayout,
     pub(crate) matmul: wgpu::BindGroupLayout,
-    pub(crate) attn: wgpu::BindGroupLayout,
+    pub(crate) attn_prefill_tiled: wgpu::BindGroupLayout,
     pub(crate) attn_split: wgpu::BindGroupLayout,
     pub(crate) attn_merge: wgpu::BindGroupLayout,
-    pub(crate) silu_mul: wgpu::BindGroupLayout,
+    pub(crate) rms_norm_q8_0: wgpu::BindGroupLayout,
+    pub(crate) silu_mul_q8_0: wgpu::BindGroupLayout,
     pub(crate) topk_partial: wgpu::BindGroupLayout,
     pub(crate) topk_merge: wgpu::BindGroupLayout,
     pub(crate) kv_writeback_fused: wgpu::BindGroupLayout,
@@ -421,15 +413,15 @@ pub struct CachedBindGroups {
     pub(crate) matvec_w_embed: wgpu::BindGroup, // (w_embed,  act) — LM head
     pub(crate) matvec_fused_normed_w_attn: wgpu::BindGroup, // (w_attn,   act, w_norms)
     pub(crate) matvec_fused_normed_w_ffn_gu: wgpu::BindGroup, // (w_ffn_gu, act, w_norms)
-    pub(crate) quantize: wgpu::BindGroup,      // (act, act_q8)
     pub(crate) matmul_w_attn: wgpu::BindGroup, // (w_attn,   act_q8, act)
     pub(crate) matmul_w_ffn_gu: wgpu::BindGroup,
     pub(crate) matmul_w_ffn_d: wgpu::BindGroup,
     pub(crate) matmul_w_embed: wgpu::BindGroup,
-    pub(crate) attn: wgpu::BindGroup,         // (act, kv_k, kv_v)
+    pub(crate) attn_prefill_tiled: wgpu::BindGroup, // (act ro, kv_k, kv_v, act_q8 rw)
     pub(crate) attn_split: wgpu::BindGroup,   // (act, kv_k, kv_v, attn_partials)
     pub(crate) attn_merge: wgpu::BindGroup,   // (act, attn_partials)
-    pub(crate) silu_mul: wgpu::BindGroup,     // (act)
+    pub(crate) rms_norm_q8_0: wgpu::BindGroup, // (act, w_norms, act_q8)
+    pub(crate) silu_mul_q8_0: wgpu::BindGroup, // (act, act_q8)
     pub(crate) topk_partial: wgpu::BindGroup, // (act, sample)
     pub(crate) topk_merge: wgpu::BindGroup,   // (sample)
     pub(crate) kv_writeback_fused: wgpu::BindGroup, // (act, w_norms, rope_cs, kv_k, kv_v)
@@ -1388,12 +1380,12 @@ impl Model {
         let sh_matvec = load_shader!("matvec_q1_0.wgsl");
         let sh_matvec_silu = load_shader!("matvec_q1_0_silu.wgsl");
         let sh_matvec_fused_normed = load_shader!("matvec_q1_0_fused_normed.wgsl");
-        let sh_quant = load_shader!("quantize_q8_0.wgsl");
         let sh_matmul = load_shader!("matmul_q1_0_q8_0.wgsl");
-        let sh_attn = load_shader!("attention.wgsl");
+        let sh_attn_prefill_tiled = load_shader!("attention_prefill_tiled.wgsl");
         let sh_attn_split = load_shader!("attention_split.wgsl");
         let sh_attn_merge = load_shader!("attention_merge.wgsl");
-        let sh_silu = load_shader!("silu_mul.wgsl");
+        let sh_rms_q8 = load_shader!("rms_norm_q8_0.wgsl");
+        let sh_silu_q8 = load_shader!("silu_mul_q8_0.wgsl");
         let sh_topk_partial = load_shader!("topk_partial.wgsl");
         let sh_topk_merge = load_shader!("topk_merge.wgsl");
         let sh_kv_writeback_fused = load_shader!("kv_writeback_fused.wgsl");
@@ -1416,12 +1408,12 @@ impl Model {
             rms_norm: make_bgl("rms_norm_bgl", 2, 0b01), // act rw, w ro
             matvec: make_bgl("matvec_bgl", 2, 0b10), // weights ro, act rw
             matvec_fused_normed: make_bgl("matvec_fused_normed_bgl", 3, 0b010), // weights ro, act rw, w_norms ro
-            quantize: make_bgl("quantize_bgl", 2, 0b10),                        // act ro, outbuf rw
             matmul: make_bgl("matmul_bgl", 3, 0b100), // weights ro, acts ro, y rw
-            attn: make_bgl("attn_bgl", 3, 0b001),     // act rw, k ro, v ro
+            attn_prefill_tiled: make_bgl("attn_prefill_tiled_bgl", 4, 0b1000), // act ro, k ro, v ro, act_q8 rw
             attn_split: make_bgl("attn_split_bgl", 4, 0b1000), // act ro, k ro, v ro, partials rw
             attn_merge: make_bgl("attn_merge_bgl", 2, 0b01), // act rw, partials ro
-            silu_mul: make_bgl("silu_mul_bgl", 1, 0b1), // act rw
+            rms_norm_q8_0: make_bgl("rms_norm_q8_0_bgl", 3, 0b100), // act ro, w ro, outbuf rw
+            silu_mul_q8_0: make_bgl("silu_mul_q8_0_bgl", 2, 0b10),  // act ro, outbuf rw
             topk_partial: make_bgl("topk_partial_bgl", 2, 0b10), // logits ro, result rw
             topk_merge: make_bgl("topk_merge_bgl", 1, 0b1), // result rw
             kv_writeback_fused: make_bgl("kv_writeback_fused_bgl", 5, 0b11000), // act ro, w_norms ro, rope_cs ro, kv_k rw, kv_v rw
@@ -1485,23 +1477,17 @@ impl Model {
                 "matvec_fused_normed",
                 size_of::<MatvecFusedNormedParams>() as u32,
             ),
-            quantize: mk_pipe(
-                &bgls.quantize,
-                &sh_quant,
-                "quantize",
-                size_of::<QuantParams>() as u32,
-            ),
             matmul: mk_pipe(
                 &bgls.matmul,
                 &sh_matmul,
                 "matmul",
                 size_of::<MatmulParams>() as u32,
             ),
-            attention: mk_pipe(
-                &bgls.attn,
-                &sh_attn,
-                "attention",
-                size_of::<AttnParams>() as u32,
+            attention_prefill_tiled: mk_pipe(
+                &bgls.attn_prefill_tiled,
+                &sh_attn_prefill_tiled,
+                "attention_prefill_tiled",
+                size_of::<AttnPrefillTiledParams>() as u32,
             ),
             attention_split: mk_pipe(
                 &bgls.attn_split,
@@ -1515,11 +1501,17 @@ impl Model {
                 "attention_merge",
                 size_of::<AttnMergeParams>() as u32,
             ),
-            silu_mul: mk_pipe(
-                &bgls.silu_mul,
-                &sh_silu,
-                "silu_mul",
-                size_of::<SiluMulParams>() as u32,
+            rms_norm_q8_0: mk_pipe(
+                &bgls.rms_norm_q8_0,
+                &sh_rms_q8,
+                "rms_norm_q8_0",
+                size_of::<RmsNormQ8Params>() as u32,
+            ),
+            silu_mul_q8_0: mk_pipe(
+                &bgls.silu_mul_q8_0,
+                &sh_silu_q8,
+                "silu_mul_q8_0",
+                size_of::<SiluMulQ8Params>() as u32,
             ),
             topk_partial: mk_pipe(
                 &bgls.topk_partial,
@@ -1874,11 +1866,6 @@ fn build_cached_bind_groups(
             &bgls.matvec_fused_normed,
             &[&buffers.w_ffn_gu, &buffers.act, &buffers.w_norms],
         ),
-        quantize: mk(
-            "cached_quantize",
-            &bgls.quantize,
-            &[&buffers.act, &buffers.act_q8],
-        ),
         matmul_w_attn: mk(
             "cached_matmul_attn",
             &bgls.matmul,
@@ -1899,10 +1886,10 @@ fn build_cached_bind_groups(
             &bgls.matmul,
             &[&buffers.w_embed, &buffers.act_q8, &buffers.act],
         ),
-        attn: mk(
-            "cached_attn",
-            &bgls.attn,
-            &[&buffers.act, &buffers.kv_k, &buffers.kv_v],
+        attn_prefill_tiled: mk(
+            "cached_attn_prefill_tiled",
+            &bgls.attn_prefill_tiled,
+            &[&buffers.act, &buffers.kv_k, &buffers.kv_v, &buffers.act_q8],
         ),
         attn_split: mk(
             "cached_attn_split",
@@ -1919,7 +1906,16 @@ fn build_cached_bind_groups(
             &bgls.attn_merge,
             &[&buffers.act, &buffers.attn_partials],
         ),
-        silu_mul: mk("cached_silu_mul", &bgls.silu_mul, &[&buffers.act]),
+        rms_norm_q8_0: mk(
+            "cached_rms_norm_q8_0",
+            &bgls.rms_norm_q8_0,
+            &[&buffers.act, &buffers.w_norms, &buffers.act_q8],
+        ),
+        silu_mul_q8_0: mk(
+            "cached_silu_mul_q8_0",
+            &bgls.silu_mul_q8_0,
+            &[&buffers.act, &buffers.act_q8],
+        ),
         topk_partial: mk(
             "cached_topk_partial",
             &bgls.topk_partial,
@@ -2004,27 +2000,23 @@ mod tests {
         let m = ActLayout::build(&cfg, 512);
         // Each region starts where the previous one ended.
         assert_eq!(m.x, 0);
-        assert_eq!(m.x_norm, 512 * cfg.n_embd);
-        assert_eq!(m.q, m.x_norm + 512 * cfg.n_embd);
+        assert_eq!(m.q, 512 * cfg.n_embd);
         assert_eq!(m.k_cur, m.q + 512 * cfg.q_dim);
         assert_eq!(m.v_cur, m.k_cur + 512 * cfg.kv_dim);
         assert_eq!(m.attn_out, m.v_cur + 512 * cfg.kv_dim);
         assert_eq!(m.gate, m.attn_out + 512 * cfg.q_dim);
         assert_eq!(m.up, m.gate + 512 * cfg.n_ff);
-        assert_eq!(m.ffn_in, m.up + 512 * cfg.n_ff);
-        assert_eq!(m.logits, m.ffn_in + 512 * cfg.n_ff);
+        assert_eq!(m.logits, m.up + 512 * cfg.n_ff);
         assert_eq!(m.total_elems, m.logits + cfg.n_vocab);
         // Regions are strictly ordered.
         assert!(
-            m.x < m.x_norm
-                && m.x_norm < m.q
+            m.x < m.q
                 && m.q < m.k_cur
                 && m.k_cur < m.v_cur
                 && m.v_cur < m.attn_out
                 && m.attn_out < m.gate
                 && m.gate < m.up
-                && m.up < m.ffn_in
-                && m.ffn_in < m.logits
+                && m.up < m.logits
         );
     }
 
@@ -2039,12 +2031,12 @@ mod tests {
         assert!(size_of::<MatvecSiluParams>() <= LIMIT);
         assert!(size_of::<MatvecFusedParams>() <= LIMIT);
         assert!(size_of::<MatvecFusedNormedParams>() <= LIMIT);
-        assert!(size_of::<QuantParams>() <= LIMIT);
         assert!(size_of::<MatmulParams>() <= LIMIT);
-        assert!(size_of::<AttnParams>() <= LIMIT);
+        assert!(size_of::<AttnPrefillTiledParams>() <= LIMIT);
         assert!(size_of::<AttnSplitParams>() <= LIMIT);
         assert!(size_of::<AttnMergeParams>() <= LIMIT);
-        assert!(size_of::<SiluMulParams>() <= LIMIT);
+        assert!(size_of::<RmsNormQ8Params>() <= LIMIT);
+        assert!(size_of::<SiluMulQ8Params>() <= LIMIT);
         assert!(size_of::<TopKPartialParams>() <= LIMIT);
         assert!(size_of::<TopKMergeParams>() <= LIMIT);
         assert!(size_of::<KvWritebackFusedParams>() <= LIMIT);
