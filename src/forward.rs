@@ -221,7 +221,7 @@ fn dispatch_matvec_q1_0(
     out_off: u32,
     accumulate: bool,
 ) {
-    const ROWS_PER_WG: u32 = 8;
+    const ROWS_PER_WG: u32 = 16;
     let n_wg = n.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
     let dispatch_y = n_wg.div_ceil(dispatch_x);

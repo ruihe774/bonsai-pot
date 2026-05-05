@@ -8,7 +8,7 @@ enable f16;
 //   qs[r, 0..nb, 0..16]: nb*16 bytes starting at qs_offset + r*nb*16
 //   (qs region is u32-aligned by extract.py's pad4)
 //
-// Activation `x` is staged into an LDS tile so the 8 ty-rows in each WG share
+// Activation `x` is staged into an LDS tile so the 16 ty-rows in each WG share
 // loads instead of redundantly fetching from global per-row, and so the inner
 // body can issue vec4<f16> reads to halve instruction count vs. scalar
 // f16-per-bit.
@@ -35,16 +35,17 @@ fn load_f16_at(b_offset: u32) -> f32 {
 }
 
 const WG_X: u32 = 8u;
-const WG_Y: u32 = 8u;
+const WG_Y: u32 = 16u;
 const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
 
 // LDS tile size for the staged input activations. K values used by
-// matvec_q1_0 dispatches (n_embd=2560, q_dim=4096, n_ff=9728) aren't all
-// multiples of TILE_K, so the loop handles a partial trailing tile (K and
-// all tile boundaries are multiples of 128 = the q1_0 block size).
-// 2048 was empirically the sweet spot at 64 threads/WG on RDNA4 — 4 KiB of
+// matvec_q1_0 dispatches (n_embd=2560, q_dim=4096) aren't all multiples of
+// TILE_K, so the loop handles a partial trailing tile (K and all tile
+// boundaries are multiples of 128 = the q1_0 block size).
+// 2048 was empirically the sweet spot at 128 threads/WG on RDNA4 — 4 KiB of
 // LDS keeps occupancy high while still amortizing redundant per-row reads.
+// (TILE_K=4096 hurts wo's 11.6→13.6us; TILE_K=1024 is a wash.)
 const TILE_K: u32 = 2048u;
 const TILE_VEC4: u32 = TILE_K / 4u;
 

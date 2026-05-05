@@ -41,10 +41,12 @@ const WG_Y: u32 = 16u;
 const WG: u32 = WG_X * WG_Y;
 const ROWS_PER_WG: u32 = WG_Y;
 
-// Same TILE_K as matvec_q1_0 — Wd's K=n_ff=9728 is a multiple of 128 (the
-// q1_0 block size) but not of TILE_K=2048; the trailing-partial-tile handling
-// mirrors the unfused kernel.
-const TILE_K: u32 = 2048u;
+// TILE_K=4096 (vs matvec_q1_0's 2048): Wd's K=n_ff=9728 is a multiple of 128
+// (the q1_0 block size) but not of TILE_K, so the trailing-partial-tile
+// handling mirrors the unfused kernel. The larger TILE_K wins here because
+// the silu/up loads are amortized across more rows; TILE_K=2048 splits Wd
+// into 5 tiles vs 3 here, reloading the silu(g)*u activation each time.
+const TILE_K: u32 = 4096u;
 const TILE_VEC4: u32 = TILE_K / 4u;
 
 var<workgroup> x_sh: array<vec4<f16>, TILE_VEC4>;
