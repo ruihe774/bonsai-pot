@@ -307,6 +307,99 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
     marker.resolve()
 }
 
+/// Per-kernel breakdown of one matmul-prefill step at batch size `m`.
+///
+/// Mirrors [`microbench_tg`] but for the batched-prefill (matmul) path.
+/// Reports per-call us, per-step ms, and %step for each labeled dispatch in
+/// `prefill_matmul_topk`.
+pub fn microbench_pp(model: &Model, m: u32, repeats: u32) -> Result<()> {
+    let m = m.min(model.m_max);
+    if m == 0 {
+        return Err(PotError::PrefillTooLarge {
+            n: 0,
+            max: model.m_max,
+        });
+    }
+    eprintln!("--- microbench pp (m={m}, repeats={repeats}) ---");
+    let cfg = &model.cfg;
+    let prompt: Vec<u32> = (0..m).map(|i| (i % (cfg.n_vocab - 1)) + 1).collect();
+
+    // warm up
+    let _ = run_instrumented_prefill(model, &prompt)?;
+
+    let mut per_step_label_ns: HashMap<&'static str, Vec<f32>> = HashMap::new();
+    let mut calls_per_step: HashMap<&'static str, u32> = HashMap::new();
+    let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
+
+    for _ in 0..repeats {
+        let spans = run_instrumented_prefill(model, &prompt)?;
+        let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
+        for (label, ns) in &spans {
+            let e = step_label_sum.entry(*label).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += ns;
+        }
+        step_totals_ns.push(spans.iter().map(|(_, ns)| ns).sum());
+        for (label, (calls, ns_sum)) in step_label_sum {
+            per_step_label_ns.entry(label).or_default().push(ns_sum);
+            calls_per_step.entry(label).or_insert(calls);
+        }
+    }
+
+    let mut rows: Vec<(&'static str, u32, f32, f32, f32)> = per_step_label_ns
+        .iter()
+        .map(|(label, per_step_ns)| {
+            let calls = calls_per_step[label];
+            let (mean_ns, std_ns) = mean_std(per_step_ns);
+            let per_call_us = mean_ns / calls as f32 / 1000.0;
+            (*label, calls, per_call_us, mean_ns / 1e6, std_ns / 1e6)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
+
+    let total_per_step_ms: f32 = rows.iter().map(|(_, _, _, ms, _)| ms).sum();
+
+    println!();
+    println!(
+        "| kernel                                        | calls/step | per-call us |   per-step ms ± std | %step |"
+    );
+    println!(
+        "|-----------------------------------------------|-----------:|------------:|--------------------:|------:|"
+    );
+    for (label, calls, per_call_us, per_step_ms, per_step_std_ms) in &rows {
+        let pct = 100.0 * per_step_ms / total_per_step_ms;
+        println!(
+            "| {label:<45} | {calls:>10} | {per_call_us:>11.2} | {per_step_ms:>11.3} ± {per_step_std_ms:>5.3} | {pct:>5.1} |"
+        );
+    }
+    println!(
+        "|-----------------------------------------------|-----------:|------------:|--------------------:|------:|"
+    );
+    println!(
+        "| TOTAL (sum of means)                          |            |             | {total_per_step_ms:>19.3} |       |"
+    );
+
+    let (step_mean_ns, step_std_ns) = mean_std(&step_totals_ns);
+    let step_mean_ms = step_mean_ns / 1e6;
+    let step_std_ms = step_std_ns / 1e6;
+    println!();
+    println!(
+        "step time: {step_mean_ms:.3} ± {step_std_ms:.3} ms  →  {:.1} t/s",
+        m as f32 * 1000.0 / step_mean_ms
+    );
+    Ok(())
+}
+
+fn run_instrumented_prefill(model: &Model, prompt: &[u32]) -> Result<Vec<(&'static str, f32)>> {
+    let mut marker = MicroMarker::new(model);
+    let _ = prefill_matmul_topk(model, prompt, 0, 1, &mut marker)?;
+    if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+        model.check_device()?;
+        return Err(PotError::Poll(e));
+    }
+    marker.resolve()
+}
+
 fn mean_std(xs: &[f32]) -> (f32, f32) {
     let mean = xs.iter().sum::<f32>() / xs.len() as f32;
     let std = if xs.len() < 2 {

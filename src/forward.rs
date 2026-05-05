@@ -1026,9 +1026,11 @@ pub fn prefill_matmul_topk<M: StepMarker>(
         pass.set_immediates(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(m, 1, 1);
 
+        marker.mark(&mut pass, "embed");
+
         // Phase 2: per-layer transformer.
         for il in 0..cfg.n_layer {
-            layer_step_matmul_in_pass(model, cfg, &mut pass, il, m);
+            layer_step_matmul_in_pass(model, cfg, &mut pass, il, m, marker);
         }
 
         // Phase 3: output_norm (last token, in-place) + LM head + topk_reduce.
@@ -1043,6 +1045,7 @@ pub fn prefill_matmul_topk<M: StepMarker>(
             last_x,
             ot.output_norm_off,
         );
+        marker.mark(&mut pass, "output_norm");
         dispatch_matvec_q1_0(
             model,
             &mut pass,
@@ -1055,8 +1058,9 @@ pub fn prefill_matmul_topk<M: StepMarker>(
             model.act_layout.logits,
             false,
         );
+        marker.mark(&mut pass, "lm_head");
         dispatch_topk_reduce(model, &mut pass, cfg.n_vocab, k, model.act_layout.logits, 0);
-        marker.mark(&mut pass, "prefill_pass_end");
+        marker.mark(&mut pass, "topk_reduce");
     }
 
     // Phase 4: append readback copy + schedule map, all in the same command buffer.
@@ -1072,12 +1076,13 @@ pub fn prefill_matmul_topk<M: StepMarker>(
     wait_topk_readback(model, k, slot)
 }
 
-fn layer_step_matmul_in_pass(
+fn layer_step_matmul_in_pass<M: StepMarker>(
     model: &Model,
     cfg: &Config,
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     m: u32,
+    marker: &mut M,
 ) {
     let pos_base = 0u32;
     let lt = &model.layer_tensors[il as usize];
@@ -1093,7 +1098,9 @@ fn layer_step_matmul_in_pass(
         model.act_layout.x_norm,
         lt.attn_norm_off,
     );
+    marker.mark(pass, "rms_norm");
     let (a_d, a_qs) = dispatch_quantize_act(model, pass, cfg.n_embd, m, model.act_layout.x_norm);
+    marker.mark(pass, "quantize_act");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1108,6 +1115,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.q,
         false,
     );
+    marker.mark(pass, "wq_matmul");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1122,6 +1130,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.k_cur,
         false,
     );
+    marker.mark(pass, "wk_matmul");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1136,6 +1145,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.v_cur,
         false,
     );
+    marker.mark(pass, "wv_matmul");
 
     // Q/K rms+rope (in-place) + KV writeback into kv_{k,v}.
     dispatch_q_norm_rope_fused(
@@ -1147,6 +1157,7 @@ fn layer_step_matmul_in_pass(
         pos_base,
         m,
     );
+    marker.mark(pass, "q_norm_rope");
     dispatch_kv_writeback_fused(
         model,
         cfg,
@@ -1158,6 +1169,7 @@ fn layer_step_matmul_in_pass(
         pos_base,
         m,
     );
+    marker.mark(pass, "kv_writeback");
 
     // Attention.
     dispatch_attention(
@@ -1170,9 +1182,11 @@ fn layer_step_matmul_in_pass(
         m,
         /*is_prefill=*/ true,
     );
+    marker.mark(pass, "attention");
 
     // Wo (residual) + ffn_norm + gate/up + silu_mul + Wd (residual).
     let (a_d2, a_qs2) = dispatch_quantize_act(model, pass, cfg.q_dim, m, model.act_layout.attn_out);
+    marker.mark(pass, "quantize_act");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1187,6 +1201,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.x,
         true,
     );
+    marker.mark(pass, "wo_matmul");
     dispatch_rms_norm(
         model,
         cfg,
@@ -1197,7 +1212,9 @@ fn layer_step_matmul_in_pass(
         model.act_layout.x_norm,
         lt.ffn_norm_off,
     );
+    marker.mark(pass, "rms_norm");
     let (a_d3, a_qs3) = dispatch_quantize_act(model, pass, cfg.n_embd, m, model.act_layout.x_norm);
+    marker.mark(pass, "quantize_act");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1212,6 +1229,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.gate,
         false,
     );
+    marker.mark(pass, "wg_matmul");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1226,6 +1244,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.up,
         false,
     );
+    marker.mark(pass, "wu_matmul");
     dispatch_silu_mul(
         model,
         pass,
@@ -1235,7 +1254,9 @@ fn layer_step_matmul_in_pass(
         model.act_layout.up,
         model.act_layout.ffn_in,
     );
+    marker.mark(pass, "silu_mul");
     let (a_d4, a_qs4) = dispatch_quantize_act(model, pass, cfg.n_ff, m, model.act_layout.ffn_in);
+    marker.mark(pass, "quantize_act");
     dispatch_matmul_q1_0(
         model,
         pass,
@@ -1250,6 +1271,7 @@ fn layer_step_matmul_in_pass(
         model.act_layout.x,
         true,
     );
+    marker.mark(pass, "wd_matmul");
 }
 
 // =========================================================================

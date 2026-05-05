@@ -57,10 +57,9 @@ MODES:
                            Reads u32 prompt tokens from stdin.
     --mode bench           Print a pp/tg table with wall-clock and GPU t/s.
                            No stdin input required.
-    --mode microbench      Per-kernel GPU-timestamp breakdown for a tg step.
-                           No stdin input required. The KV cache is pre-filled
-                           up to --tg before measurement so attention is timed
-                           at a representative sequence length.
+    --mode microbench      Per-kernel GPU-timestamp breakdown for a matmul
+                           prefill step (--pp tokens) followed by a tg step
+                           (KV cache pre-filled to --tg). No stdin input.
 
 GEN/PROMPT OPTIONS:
     --max-new-tokens <n>   Tokens to generate (incl. the first sampled token).
@@ -221,6 +220,10 @@ fn main() {
                 });
             }
             "microbench" => {
+                __bench::microbench_pp(&model, args.pp_n, args.repeats).unwrap_or_else(|e| {
+                    eprintln!("microbench error: {e}");
+                    exit(3)
+                });
                 __bench::microbench_tg(&model, args.tg_n, args.repeats).unwrap_or_else(|e| {
                     eprintln!("microbench error: {e}");
                     exit(3)

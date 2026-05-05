@@ -40,5 +40,5 @@ pub use session::{GenerateOptions, Sampler, Session, StopReason};
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod __bench {
-    pub use crate::forward::bench_internals::{bench, microbench_tg};
+    pub use crate::forward::bench_internals::{bench, microbench_pp, microbench_tg};
 }
