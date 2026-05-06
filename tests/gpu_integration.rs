@@ -11,8 +11,7 @@ fn model_dir() -> PathBuf {
 #[allow(clippy::panic, reason = "test helper")]
 fn load_model() -> Model {
     let dir = model_dir();
-    pollster::block_on(Model::load(&dir))
-        .unwrap_or_else(|e| panic!("failed to load {}: {e}", dir.display()))
+    Model::load(&dir).unwrap_or_else(|e| panic!("failed to load {}: {e}", dir.display()))
 }
 
 fn greedy_sampler() -> Sampler {
@@ -42,7 +41,7 @@ fn greedy_opts(max_new_tokens: u32) -> GenerateOptions {
 
 #[test]
 fn model_load_bad_path_is_io_error() {
-    let result = pollster::block_on(Model::load(Path::new("./does-not-exist")));
+    let result = Model::load(Path::new("./does-not-exist"));
     assert!(matches!(result, Err(PotError::Io { .. })));
 }
 

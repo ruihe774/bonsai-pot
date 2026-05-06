@@ -9,7 +9,7 @@
 //! use bonsai_pot::{Model, GenerateOptions, Sampler};
 //!
 //! pollster::block_on(async {
-//!     let model = Model::load(std::path::Path::new("./model")).await.unwrap();
+//!     let model = Model::load(std::path::Path::new("./model")).unwrap();
 //!     let mut sess = model.new_session();
 //!     let prompt: &[u32] = &[/* token ids ... */];
 //!     let first = sess.prefill(prompt, &Sampler::default()).unwrap();

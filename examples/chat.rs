@@ -322,216 +322,213 @@ fn main() {
 
     eprintln!("seed: {}", args.seed);
 
-    pollster::block_on(async move {
-        eprintln!("loading model from {}…", args.model_dir.display());
-        let model = Model::load_with_options(
-            &args.model_dir,
-            LoadOptions {
-                max_seq: args.max_seq,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("load model");
-        let im_end = model.token_id("<|im_end|>").unwrap_or_else(|| {
-            eprintln!("error: vocab missing <|im_end|>");
-            exit(2);
-        });
-        let endoftext = model.token_id("<|endoftext|>").unwrap_or_else(|| {
-            eprintln!("error: vocab missing <|endoftext|>");
-            exit(2);
-        });
-        // Qwen3 thinking tokens — absent on non-Qwen3 vocabs, in which case
-        // stripping is silently disabled.
-        let think_open = model.token_id("<think>");
-        let think_close = model.token_id("</think>");
-        let thinking_supported = think_open.is_some() && think_close.is_some();
-        let sampler = Sampler {
-            temperature: args.temperature,
-            top_k: args.top_k,
-            top_p: args.top_p,
-            seed: args.seed,
+    eprintln!("loading model from {}…", args.model_dir.display());
+    let model = Model::load_with_options(
+        &args.model_dir,
+        LoadOptions {
+            max_seq: args.max_seq,
+            ..Default::default()
+        },
+    )
+    .expect("load model");
+    let im_end = model.token_id("<|im_end|>").unwrap_or_else(|| {
+        eprintln!("error: vocab missing <|im_end|>");
+        exit(2);
+    });
+    let endoftext = model.token_id("<|endoftext|>").unwrap_or_else(|| {
+        eprintln!("error: vocab missing <|endoftext|>");
+        exit(2);
+    });
+    // Qwen3 thinking tokens — absent on non-Qwen3 vocabs, in which case
+    // stripping is silently disabled.
+    let think_open = model.token_id("<think>");
+    let think_close = model.token_id("</think>");
+    let thinking_supported = think_open.is_some() && think_close.is_some();
+    let sampler = Sampler {
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        seed: args.seed,
+    };
+    let tok = build_tokenizer(&model, &args.model_dir);
+    let mut sess = model.new_session();
+    let mut stdout = stdout().lock();
+
+    // Prefill the system prompt once with the fast batched-matmul path
+    // (requires pos == 0), then snapshot the KV state. /reset restores
+    // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
+    let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system);
+    let system_tokens: Vec<u32> = tok
+        .encode(system_segment.as_str(), false)
+        .expect("tokenize system segment")
+        .get_ids()
+        .to_vec();
+    eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
+    sess.prefill(&system_tokens, &sampler)
+        .expect("system prefill");
+    let system_snap: KvSnapshot = sess.snapshot().expect("system snapshot");
+
+    let mut turn: u32 = 0;
+
+    eprintln!("ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).");
+
+    loop {
+        write!(stdout, "\nYou: ").ok();
+        stdout.flush().ok();
+        let Some(user) = read_user_line() else {
+            writeln!(stdout).ok();
+            break;
         };
-        let tok = build_tokenizer(&model, &args.model_dir);
-        let mut sess = model.new_session();
-        let mut stdout = stdout().lock();
+        let user = user.trim();
+        if user.is_empty() {
+            continue;
+        }
+        if user == "/quit" || user == "/exit" {
+            break;
+        }
+        if user == "/reset" {
+            sess.restore(&system_snap).expect("restore system snapshot");
+            turn = 0;
+            writeln!(stdout, "(conversation reset)").ok();
+            continue;
+        }
 
-        // Prefill the system prompt once with the fast batched-matmul path
-        // (requires pos == 0), then snapshot the KV state. /reset restores
-        // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
-        let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system);
-        let system_tokens: Vec<u32> = tok
-            .encode(system_segment.as_str(), false)
-            .expect("tokenize system segment")
-            .get_ids()
-            .to_vec();
-        eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
-        sess.prefill(&system_tokens, &sampler)
-            .expect("system prefill");
-        let system_snap: KvSnapshot = sess.snapshot().expect("system snapshot");
-
-        let mut turn: u32 = 0;
-
-        eprintln!("ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).");
-
-        loop {
-            write!(stdout, "\nYou: ").ok();
-            stdout.flush().ok();
-            let Some(user) = read_user_line() else {
-                writeln!(stdout).ok();
-                break;
-            };
-            let user = user.trim();
-            if user.is_empty() {
-                continue;
-            }
-            if user == "/quit" || user == "/exit" {
-                break;
-            }
-            if user == "/reset" {
-                sess.restore(&system_snap).expect("restore system snapshot");
-                turn = 0;
-                writeln!(stdout, "(conversation reset)").ok();
-                continue;
-            }
-
-            // Build the ChatML segment for this user turn. The system prompt
-            // is already in the KV cache, so we only encode the user/assistant
-            // wrapper. On turn 0 there is no prior assistant close; on later
-            // turns we re-emit <|im_end|> to close the previous assistant turn
-            // (generation stops before that token enters the KV cache).
-            let segment = if turn == 0 {
-                format!(
-                    "<|im_start|>user\n{user}<|im_end|>\n\
+        // Build the ChatML segment for this user turn. The system prompt
+        // is already in the KV cache, so we only encode the user/assistant
+        // wrapper. On turn 0 there is no prior assistant close; on later
+        // turns we re-emit <|im_end|> to close the previous assistant turn
+        // (generation stops before that token enters the KV cache).
+        let segment = if turn == 0 {
+            format!(
+                "<|im_start|>user\n{user}<|im_end|>\n\
                      <|im_start|>assistant\n"
-                )
-            } else {
-                format!(
-                    "<|im_end|>\n\
+            )
+        } else {
+            format!(
+                "<|im_end|>\n\
                      <|im_start|>user\n{user}<|im_end|>\n\
                      <|im_start|>assistant\n"
-                )
+            )
+        };
+        let tokens: Vec<u32> = tok
+            .encode(segment.as_str(), false)
+            .expect("tokenize turn segment")
+            .get_ids()
+            .to_vec();
+
+        // Batched matmul prefill (chunks internally for turns longer than
+        // `model.max_prefill_tokens()`). The first sampled token is not
+        // yet in KV — it is fed back via `step` in the streaming loop
+        // below.
+        let pp_t0 = Instant::now();
+        let next = sess.prefill(&tokens, &sampler).expect("prefill");
+        let pp_dt = pp_t0.elapsed();
+        let pp_n = tokens.len();
+
+        // Snapshot here: the first sampled token hasn't been `step`-fed
+        // yet, so this captures KV state just after `<|im_start|>assistant\n`.
+        // We'll rewind to this point after generation to re-prefill with
+        // thinking stripped, as required by the Qwen3 chat template.
+        let pre_assistant_snap = if thinking_supported {
+            Some(sess.snapshot().expect("pre-assistant snapshot"))
+        } else {
+            None
+        };
+
+        write!(stdout, "Assistant: ").ok();
+        stdout.flush().ok();
+
+        let stop = |t: u32| t == im_end || t == endoftext;
+        let gen_opts = GenerateOptions {
+            max_new_tokens: args.max_new_tokens,
+            stop_pred: Some(stop),
+            sampler: sampler.clone(),
+        };
+
+        let mut out_tokens: Vec<u32> = Vec::new();
+        let mut tg_count: usize = 0;
+        let hit_overflow;
+        let in_think;
+        let tg_dt;
+        {
+            let mut emitter = Emitter {
+                stdout: &mut stdout,
+                model: &model,
+                think_open: if thinking_supported { think_open } else { None },
+                think_close,
+                out_tokens: &mut out_tokens,
+                in_think: false,
             };
-            let tokens: Vec<u32> = tok
-                .encode(segment.as_str(), false)
-                .expect("tokenize turn segment")
-                .get_ids()
-                .to_vec();
-
-            // Batched matmul prefill (chunks internally for turns longer than
-            // `model.max_prefill_tokens()`). The first sampled token is not
-            // yet in KV — it is fed back via `step` in the streaming loop
-            // below.
-            let pp_t0 = Instant::now();
-            let next = sess.prefill(&tokens, &sampler).expect("prefill");
-            let pp_dt = pp_t0.elapsed();
-            let pp_n = tokens.len();
-
-            // Snapshot here: the first sampled token hasn't been `step`-fed
-            // yet, so this captures KV state just after `<|im_start|>assistant\n`.
-            // We'll rewind to this point after generation to re-prefill with
-            // thinking stripped, as required by the Qwen3 chat template.
-            let pre_assistant_snap = if thinking_supported {
-                Some(sess.snapshot().expect("pre-assistant snapshot"))
+            // `next` is the prefill-sampled token; generate_streaming feeds
+            // first_token as input without invoking the callback for it, so
+            // emit it manually first.
+            let tg_t0 = Instant::now();
+            if stop(next) {
+                hit_overflow = false;
             } else {
-                None
-            };
-
-            write!(stdout, "Assistant: ").ok();
-            stdout.flush().ok();
-
-            let stop = |t: u32| t == im_end || t == endoftext;
-            let gen_opts = GenerateOptions {
-                max_new_tokens: args.max_new_tokens,
-                stop_pred: Some(stop),
-                sampler: sampler.clone(),
-            };
-
-            let mut out_tokens: Vec<u32> = Vec::new();
-            let mut tg_count: usize = 0;
-            let hit_overflow;
-            let in_think;
-            let tg_dt;
-            {
-                let mut emitter = Emitter {
-                    stdout: &mut stdout,
-                    model: &model,
-                    think_open: if thinking_supported { think_open } else { None },
-                    think_close,
-                    out_tokens: &mut out_tokens,
-                    in_think: false,
-                };
-                // `next` is the prefill-sampled token; generate_streaming feeds
-                // first_token as input without invoking the callback for it, so
-                // emit it manually first.
-                let tg_t0 = Instant::now();
-                if stop(next) {
-                    hit_overflow = false;
-                } else {
-                    emitter.emit(next);
+                emitter.emit(next);
+                tg_count += 1;
+                match sess.generate_streaming(next, &gen_opts, |id| {
+                    emitter.emit(id);
                     tg_count += 1;
-                    match sess.generate_streaming(next, &gen_opts, |id| {
-                        emitter.emit(id);
-                        tg_count += 1;
-                    }) {
-                        Ok(_) => {
-                            hit_overflow = false;
-                        }
-                        Err(PotError::ContextOverflow { .. }) => {
-                            hit_overflow = true;
-                        }
-                        Err(e) => panic!("generate_streaming: {e}"),
+                }) {
+                    Ok(_) => {
+                        hit_overflow = false;
                     }
-                }
-                tg_dt = tg_t0.elapsed();
-                in_think = emitter.in_think;
-            }
-            // Reset dim if we hit max_new_tokens or overflow mid-think.
-            if in_think {
-                stdout.write_all(b"\x1b[0m").ok();
-            }
-            writeln!(stdout).ok();
-            if hit_overflow {
-                writeln!(
-                    stdout,
-                    "(context full at {} tokens — use /reset to start a new conversation)",
-                    sess.pos(),
-                )
-                .ok();
-            }
-
-            // Rewind KV cache to just after the assistant header, then
-            // re-prefill with thinking blocks removed. This matches the Qwen3
-            // chat template, which strips prior-turn thinking from history.
-            let mut post_pp: Option<(usize, Duration)> = None;
-            if let Some(snap) = pre_assistant_snap {
-                let stripped = strip_thinking(&out_tokens, think_open, think_close);
-                if stripped.len() != out_tokens.len() {
-                    // Something was stripped — rewind and rebuild KV.
-                    sess.restore(&snap).expect("restore pre-assistant snapshot");
-                    if stripped.is_empty() {
-                        writeln!(stdout, "(no response after thinking)").ok();
-                    } else {
-                        let post_t0 = Instant::now();
-                        sess.prefill(&stripped, &sampler)
-                            .expect("re-prefill stripped response");
-                        post_pp = Some((stripped.len(), post_t0.elapsed()));
+                    Err(PotError::ContextOverflow { .. }) => {
+                        hit_overflow = true;
                     }
+                    Err(e) => panic!("generate_streaming: {e}"),
                 }
             }
-
-            let mut perf = format!(
-                "[{}  |  {}",
-                fmt_phase("PP", pp_n, pp_dt),
-                fmt_phase("TG", tg_count, tg_dt),
-            );
-            if let Some((n, dt)) = post_pp {
-                let _ = write!(&mut perf, "  |  {}", fmt_phase("Post-PP", n, dt));
-            }
-            perf.push(']');
-            eprintln!("{perf}");
-
-            turn += 1;
+            tg_dt = tg_t0.elapsed();
+            in_think = emitter.in_think;
         }
-    });
+        // Reset dim if we hit max_new_tokens or overflow mid-think.
+        if in_think {
+            stdout.write_all(b"\x1b[0m").ok();
+        }
+        writeln!(stdout).ok();
+        if hit_overflow {
+            writeln!(
+                stdout,
+                "(context full at {} tokens — use /reset to start a new conversation)",
+                sess.pos(),
+            )
+            .ok();
+        }
+
+        // Rewind KV cache to just after the assistant header, then
+        // re-prefill with thinking blocks removed. This matches the Qwen3
+        // chat template, which strips prior-turn thinking from history.
+        let mut post_pp: Option<(usize, Duration)> = None;
+        if let Some(snap) = pre_assistant_snap {
+            let stripped = strip_thinking(&out_tokens, think_open, think_close);
+            if stripped.len() != out_tokens.len() {
+                // Something was stripped — rewind and rebuild KV.
+                sess.restore(&snap).expect("restore pre-assistant snapshot");
+                if stripped.is_empty() {
+                    writeln!(stdout, "(no response after thinking)").ok();
+                } else {
+                    let post_t0 = Instant::now();
+                    sess.prefill(&stripped, &sampler)
+                        .expect("re-prefill stripped response");
+                    post_pp = Some((stripped.len(), post_t0.elapsed()));
+                }
+            }
+        }
+
+        let mut perf = format!(
+            "[{}  |  {}",
+            fmt_phase("PP", pp_n, pp_dt),
+            fmt_phase("TG", tg_count, tg_dt),
+        );
+        if let Some((n, dt)) = post_pp {
+            let _ = write!(&mut perf, "  |  {}", fmt_phase("Post-PP", n, dt));
+        }
+        perf.push(']');
+        eprintln!("{perf}");
+
+        turn += 1;
+    }
 }

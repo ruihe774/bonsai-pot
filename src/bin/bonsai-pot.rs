@@ -198,88 +198,85 @@ fn main() {
         .init();
     let args = parse_args();
 
-    pollster::block_on(async move {
-        let model = Model::load_with_options(
-            &args.model_dir,
-            LoadOptions {
-                max_seq: args.max_seq,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("load error: {e}");
-            exit(2)
-        });
+    let model = Model::load_with_options(
+        &args.model_dir,
+        LoadOptions {
+            max_seq: args.max_seq,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("load error: {e}");
+        exit(2)
+    });
 
-        match args.mode.as_str() {
-            "bench" => {
-                __bench::bench(&model, args.pp_n, args.tg_n, args.repeats).unwrap_or_else(|e| {
-                    eprintln!("bench error: {e}");
-                    exit(3)
-                });
-            }
-            "microbench" => {
-                __bench::microbench_pp(&model, args.pp_n, args.repeats).unwrap_or_else(|e| {
-                    eprintln!("microbench error: {e}");
-                    exit(3)
-                });
-                __bench::microbench_tg(&model, args.tg_n, args.repeats).unwrap_or_else(|e| {
-                    eprintln!("microbench error: {e}");
-                    exit(3)
-                });
-            }
-            "gen" | "prompt" => {
-                let mut buf = Vec::new();
-                stdin().lock().read_to_end(&mut buf).expect("read stdin");
-                if buf.len() % 4 != 0 {
-                    eprintln!("stdin must be a multiple of 4 bytes (u32 token IDs)");
-                    exit(1);
-                }
-                let prompt: Vec<u32> = bytemuck::cast_slice(&buf).to_vec();
-                if prompt.is_empty() {
-                    eprintln!("empty prompt on stdin");
-                    exit(1);
-                }
-
-                let sampler = Sampler {
-                    temperature: args.temperature,
-                    top_k: args.top_k,
-                    top_p: args.top_p,
-                    seed: args.seed,
-                };
-                let mut sess = model.new_session();
-                let first = if args.use_matmul_prefill {
-                    sess.prefill(&prompt, &sampler).expect("prefill")
-                } else {
-                    sess.prefill_one_at_a_time(&prompt, &sampler)
-                        .expect("prefill")
-                };
-
-                let mut stdout = stdout().lock();
-                // Echo the decoded prompt before the first sampled token,
-                // matching the original CLI's behavior.
-                for &id in &prompt {
-                    stdout.write_all(&model.decode_token(id)).ok();
-                }
-                stdout.write_all(&model.decode_token(first)).ok();
-                stdout.flush().ok();
-                let opts = GenerateOptions {
-                    max_new_tokens: args.n_gen.saturating_sub(1),
-                    sampler,
-                    ..Default::default()
-                };
-                sess.generate_streaming(first, &opts, |id| {
-                    stdout.write_all(&model.decode_token(id)).ok();
-                    stdout.flush().ok();
-                })
-                .expect("generate");
-                writeln!(stdout).ok();
-            }
-            other => {
-                eprintln!("unknown mode: {other}");
+    match args.mode.as_str() {
+        "bench" => {
+            __bench::bench(&model, args.pp_n, args.tg_n, args.repeats).unwrap_or_else(|e| {
+                eprintln!("bench error: {e}");
+                exit(3)
+            });
+        }
+        "microbench" => {
+            __bench::microbench_pp(&model, args.pp_n, args.repeats).unwrap_or_else(|e| {
+                eprintln!("microbench error: {e}");
+                exit(3)
+            });
+            __bench::microbench_tg(&model, args.tg_n, args.repeats).unwrap_or_else(|e| {
+                eprintln!("microbench error: {e}");
+                exit(3)
+            });
+        }
+        "gen" | "prompt" => {
+            let mut buf = Vec::new();
+            stdin().lock().read_to_end(&mut buf).expect("read stdin");
+            if buf.len() % 4 != 0 {
+                eprintln!("stdin must be a multiple of 4 bytes (u32 token IDs)");
                 exit(1);
             }
+            let prompt: Vec<u32> = bytemuck::cast_slice(&buf).to_vec();
+            if prompt.is_empty() {
+                eprintln!("empty prompt on stdin");
+                exit(1);
+            }
+
+            let sampler = Sampler {
+                temperature: args.temperature,
+                top_k: args.top_k,
+                top_p: args.top_p,
+                seed: args.seed,
+            };
+            let mut sess = model.new_session();
+            let first = if args.use_matmul_prefill {
+                sess.prefill(&prompt, &sampler).expect("prefill")
+            } else {
+                sess.prefill_one_at_a_time(&prompt, &sampler)
+                    .expect("prefill")
+            };
+
+            let mut stdout = stdout().lock();
+            // Echo the decoded prompt before the first sampled token,
+            // matching the original CLI's behavior.
+            for &id in &prompt {
+                stdout.write_all(&model.decode_token(id)).ok();
+            }
+            stdout.write_all(&model.decode_token(first)).ok();
+            stdout.flush().ok();
+            let opts = GenerateOptions {
+                max_new_tokens: args.n_gen.saturating_sub(1),
+                sampler,
+                ..Default::default()
+            };
+            sess.generate_streaming(first, &opts, |id| {
+                stdout.write_all(&model.decode_token(id)).ok();
+                stdout.flush().ok();
+            })
+            .expect("generate");
+            writeln!(stdout).ok();
         }
-    });
+        other => {
+            eprintln!("unknown mode: {other}");
+            exit(1);
+        }
+    }
 }

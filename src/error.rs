@@ -16,10 +16,10 @@ pub enum PotError {
     Vocab(&'static str),
     #[error("no compatible GPU adapter found")]
     NoAdapter,
+    #[error("no compatible GPU device found")]
+    NoDevice,
     #[error("adapter does not support required feature: {0}")]
     FeatureUnsupported(&'static str),
-    #[error("wgpu device request failed: {0}")]
-    DeviceRequest(#[from] wgpu::RequestDeviceError),
     #[error("context overflow: pos {pos} + tokens {n} > max_seq {max}")]
     ContextOverflow { pos: u32, n: u32, max: u32 },
     #[error("prefill batch {n} exceeds max_prefill_tokens {max}")]

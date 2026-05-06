@@ -9,15 +9,17 @@ use std::collections::HashMap;
 use std::fs::{read, read_to_string};
 use std::mem::size_of;
 use std::path::Path;
+use std::pin::pin;
 use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll, Waker};
 
 use ash::ext::global_priority;
 use ash::vk;
 use bytemuck::{Pod, Zeroable, cast_slice};
-use wgpu::hal::DeviceError;
 use wgpu::hal::api::Vulkan as VulkanApi;
 use wgpu::util::DeviceExt as _;
+use wgpu::{Backends, InstanceDescriptor};
 
 use crate::decode;
 use crate::error::{PotError, Result};
@@ -544,7 +546,7 @@ pub type PowerPerference = wgpu::PowerPreference;
 ///
 /// These affect GPU buffer sizing (KV cache, `RoPE` table) and so cannot be
 /// changed per call — pick them once at load.
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct LoadOptions {
     /// Maximum sequence length (positions in the KV cache). Default: 1024.
     ///
@@ -857,8 +859,8 @@ impl Model {
     /// # Errors
     ///
     /// See [`Model::load_with_options`].
-    pub async fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_with_options(model_dir, LoadOptions::default()).await
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        Self::load_with_options(model_dir, LoadOptions::default())
     }
 
     /// Load weights, build pipelines, allocate the KV cache. Reads
@@ -872,7 +874,7 @@ impl Model {
     /// or parsed, no suitable wgpu adapter is available, the adapter does not
     /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
     /// subgroup size is unsupported, or the vocab files are malformed.
-    pub async fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
+    pub fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
         // Hoisted constants/items so we don't trip items-after-statements lints.
         // Sample buffer roles (max footprint dictates size):
         //   - input (matmul prefill): M_MAX u32 token ids
@@ -914,15 +916,19 @@ impl Model {
         validate_cfg(&cfg)?;
 
         // ---- wgpu init ------------------------------------------------------
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: opts.power_perference,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|_| PotError::NoAdapter)?;
+        let mut instance_desc = InstanceDescriptor::new_without_display_handle();
+        instance_desc.backends = Backends::VULKAN;
+        let instance = wgpu::Instance::new(instance_desc);
+        let adapter = pin!(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: opts.power_perference,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }));
+        let adapter = match adapter.poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Pending => unreachable!("native wgpu always resolves immediately"),
+            Poll::Ready(Ok(adapter)) => adapter,
+            Poll::Ready(Err(_)) => return Err(PotError::NoAdapter),
+        };
         log::info!("adapter: {:?}", adapter.get_info());
 
         if !adapter.features().contains(wgpu::Features::SHADER_F16) {
@@ -1001,109 +1007,91 @@ impl Model {
         // Instead we replicate `open_with_callback` ourselves and pass the
         // chosen family index through to `device_from_raw`.
         let hal_open = unsafe {
-            adapter.as_hal::<VulkanApi>().map(|hal_adapter| {
-                let pd = hal_adapter.raw_physical_device();
-                let instance = hal_adapter.shared_instance().raw_instance();
-                let families = instance.get_physical_device_queue_family_properties(pd);
-                // Prefer a compute-only family (no GRAPHICS bit) — the async
-                // compute queue on AMD.  Fall back to family 0 if none found.
-                let family_idx: u32 = families
-                    .iter()
-                    .position(|p| {
-                        p.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                            && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                    })
-                    .map_or(0, |i| i as u32);
-                log::info!(
-                    "vk queue family {} (async_compute={})",
-                    family_idx,
-                    family_idx != 0,
+            let Some(hal_adapter) = adapter.as_hal::<VulkanApi>() else {
+                unreachable!("Vulkan adapter expected");
+            };
+            let pd = hal_adapter.raw_physical_device();
+            let instance = hal_adapter.shared_instance().raw_instance();
+            let families = instance.get_physical_device_queue_family_properties(pd);
+            // Prefer a compute-only family (no GRAPHICS bit) — the async
+            // compute queue on AMD.  Fall back to family 0 if none found.
+            let family_idx: u32 = families
+                .iter()
+                .position(|p| {
+                    p.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                        && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                })
+                .map_or(0, |i| i as u32);
+            log::info!(
+                "vk queue family {} (async_compute={})",
+                family_idx,
+                family_idx != 0,
+            );
+
+            let enabled_extensions = hal_adapter.required_device_extensions(desc.required_features);
+            let mut enabled_phd_features =
+                hal_adapter.physical_device_features(&enabled_extensions, desc.required_features);
+
+            let gp_supported = instance
+                .enumerate_device_extension_properties(pd)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(global_priority::NAME));
+
+            let priorities = [global_priority_fallback_to_queue_prio(opts.priority)];
+            let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
+                .global_priority(opts.priority);
+            let mut qci = vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(family_idx)
+                .queue_priorities(&priorities);
+            if gp_supported {
+                qci = qci.push_next(&mut gp_info);
+            } else {
+                log::warn!(
+                    "VK_EXT_global_priority not supported; ignoring global_priority {:?}",
+                    opts.priority
                 );
-
-                let enabled_extensions =
-                    hal_adapter.required_device_extensions(desc.required_features);
-                let mut enabled_phd_features = hal_adapter
-                    .physical_device_features(&enabled_extensions, desc.required_features);
-
-                let gp_supported = instance
-                    .enumerate_device_extension_properties(pd)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|e| e.extension_name_as_c_str() == Ok(global_priority::NAME));
-
-                let priorities = [global_priority_fallback_to_queue_prio(opts.priority)];
-                let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
-                    .global_priority(opts.priority);
-                let mut qci = vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family_idx)
-                    .queue_priorities(&priorities);
-                if gp_supported {
-                    qci = qci.push_next(&mut gp_info);
-                } else {
-                    log::warn!(
-                        "VK_EXT_global_priority not supported; ignoring global_priority {:?}",
-                        opts.priority
-                    );
-                }
-                let queue_infos = [qci];
-
-                let mut str_pointers: Vec<_> =
-                    enabled_extensions.iter().map(|s| s.as_ptr()).collect();
-                if gp_supported {
-                    str_pointers.push(global_priority::NAME.as_ptr());
-                }
-
-                let pre_info = vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queue_infos)
-                    .enabled_extension_names(&str_pointers);
-                let info = enabled_phd_features.add_to_device_create(pre_info);
-
-                let raw_device = match instance.create_device(pd, &info, None) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // Mirror wgpu-hal's own `vkCreateDevice` error mapping
-                        // (private helpers `hal_usage_error` /
-                        // `map_host_device_oom_and_lost_err` aren't reachable
-                        // from outside the crate, so we inline the cases).
-                        log::warn!("vkCreateDevice on family {family_idx} failed: {e:?}");
-                        let mapped = match e {
-                            vk::Result::ERROR_OUT_OF_HOST_MEMORY
-                            | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
-                            | vk::Result::ERROR_TOO_MANY_OBJECTS => DeviceError::OutOfMemory,
-                            vk::Result::ERROR_INITIALIZATION_FAILED
-                            | vk::Result::ERROR_DEVICE_LOST => DeviceError::Lost,
-                            vk::Result::ERROR_NOT_PERMITTED_KHR => {
-                                log::warn!(
-                                    "vkCreateDevice denied global_priority {:?} (not permitted)",
-                                    opts.priority
-                                );
-                                DeviceError::Unexpected
-                            }
-                            _ => DeviceError::Unexpected,
-                        };
-                        return Err(mapped);
-                    }
-                };
-
-                hal_adapter.device_from_raw(
-                    raw_device,
-                    None,
-                    &enabled_extensions,
-                    desc.required_features,
-                    &desc.required_limits,
-                    &desc.memory_hints,
-                    family_idx,
-                    0,
-                )
-            })
-        };
-        let (device, queue) = match hal_open {
-            Some(Ok(open)) => unsafe { adapter.create_device_from_hal(open, &desc)? },
-            Some(Err(e)) => {
-                log::warn!("Vulkan HAL open failed ({e:?}), falling back to request_device");
-                adapter.request_device(&desc).await?
             }
-            None => adapter.request_device(&desc).await?,
+            let queue_infos = [qci];
+
+            let mut str_pointers: Vec<_> = enabled_extensions.iter().map(|s| s.as_ptr()).collect();
+            if gp_supported {
+                str_pointers.push(global_priority::NAME.as_ptr());
+            }
+
+            let pre_info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_infos)
+                .enabled_extension_names(&str_pointers);
+            let info = enabled_phd_features.add_to_device_create(pre_info);
+
+            let raw_device = match instance.create_device(pd, &info, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("vkCreateDevice on family {family_idx} failed: {e:?}");
+                    return Err(PotError::NoDevice);
+                }
+            };
+
+            match hal_adapter.device_from_raw(
+                raw_device,
+                None,
+                &enabled_extensions,
+                desc.required_features,
+                &desc.required_limits,
+                &desc.memory_hints,
+                family_idx,
+                0,
+            ) {
+                Ok(d) => d,
+                Err(_) => {
+                    return Err(PotError::NoDevice);
+                }
+            }
+        };
+
+        let Ok((device, queue)) = (unsafe { adapter.create_device_from_hal(hal_open, &desc) })
+        else {
+            return Err(PotError::NoDevice);
         };
 
         // ---- wire up device-lost and uncaptured-error callbacks ------------
@@ -1215,7 +1203,7 @@ impl Model {
             u64::from(cfg.n_layer) * u64::from(opts.max_seq) * u64::from(cfg.kv_dim);
         let kv_total: u64 = kv_d_total + kv_qs_total;
         {
-            let dl = device.limits();
+            let dl: wgpu::Limits = device.limits();
             let max_buf = dl.max_buffer_size;
             let max_bind = dl.max_storage_buffer_binding_size;
             if kv_total > max_buf || kv_total > max_bind {

@@ -31,7 +31,7 @@ default = ["half"]
 # Exposes bench/microbench utilities under `bonsai_pot::__bench` and pulls in
 # the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
 # stable public library API.
-bench-internals = ["dep:pollster", "dep:env_logger"]
+bench-internals = ["dep:env_logger"]
 # Use the built-in primitive `f16` type (requires a nightly toolchain with
 # `#![feature(f16)]`) instead of the `half` crate.
 nightly = []
@@ -48,11 +48,9 @@ log = "0.4"
 thiserror = "2"
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
-pollster = { version = "0.3", optional = true }
 env_logger = { version = "0.11", optional = true }
 
 [dev-dependencies]
-pollster = "0.3"
 env_logger = "0.11"
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 
