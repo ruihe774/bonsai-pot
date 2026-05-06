@@ -324,6 +324,27 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
     let d_size = u64::from(snap.pos) * nb(kv_dim) * 4;
     let qs_size = u64::from(snap.pos) * u64::from(kv_dim);
 
+    // Stage the whole payload into a single COPY_SRC buffer and issue all
+    // 4*n_layer copies + the submit in one shot, so the restore lands as a
+    // single GPU operation (~1-2 ms over PCIe vs interleaved write_buffer
+    // calls that get split across the queue's internal staging chunks).
+    let staging = model.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("kv_restore_staging"),
+        size: snap.payload.len() as u64,
+        usage: wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    staging
+        .slice(..)
+        .get_mapped_range_mut()
+        .copy_from_slice(&snap.payload);
+    staging.unmap();
+
+    let mut enc = model
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kv_restore"),
+        });
     for kind in 0u32..2 {
         let dst_buf = if kind == 0 {
             &model.buffers.kv_k
@@ -332,23 +353,16 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
         };
         for il in 0..n_layer {
             // d-section
-            let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 0);
+            let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 0) as u64;
             let dst_off = buf_d_offset(max_seq, kv_dim, il);
-            model.queue.write_buffer(
-                dst_buf,
-                dst_off,
-                &snap.payload[src_off..src_off + d_size as usize],
-            );
+            enc.copy_buffer_to_buffer(&staging, src_off, dst_buf, dst_off, d_size);
             // qs-section
-            let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 1);
+            let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 1) as u64;
             let dst_off = buf_qs_offset(n_layer, max_seq, kv_dim, il);
-            model.queue.write_buffer(
-                dst_buf,
-                dst_off,
-                &snap.payload[src_off..src_off + qs_size as usize],
-            );
+            enc.copy_buffer_to_buffer(&staging, src_off, dst_buf, dst_off, qs_size);
         }
     }
+    model.queue.submit([enc.finish()]);
 
     Ok(())
 }
