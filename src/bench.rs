@@ -135,9 +135,9 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
             let mut marker = BenchMarker::new(model);
             encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), pos, &mut marker);
             se.copy_sample_to_readback(8);
-            let slot = se.schedule_topk_map(8);
+            se.schedule_topk_map(8);
             model.queue.submit(Some(se.finish()));
-            wait_topk_readback(model, 1, slot)?;
+            wait_topk_readback(model, 1)?;
             total_gpu_ns += marker.resolve()?;
         }
         let wall_secs = t.elapsed().as_secs_f32();
@@ -328,9 +328,9 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
     let mut marker = MicroMarker::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut marker);
     se.copy_sample_to_readback(8);
-    let slot = se.schedule_topk_map(8);
+    se.schedule_topk_map(8);
     model.queue.submit(Some(se.finish()));
-    wait_topk_readback(model, 1, slot)?;
+    wait_topk_readback(model, 1)?;
     marker.resolve()
 }
 

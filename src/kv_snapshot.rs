@@ -19,9 +19,6 @@
 //! A snapshot captured with `max_seq=512` can be restored into a model loaded
 //! with `max_seq=2048` as long as `pos ≤ model.max_seq_len()`.
 
-use std::result::Result as StdResult;
-use std::sync::{Arc, OnceLock};
-
 use crate::error::{PotError, Result};
 use crate::model::Model;
 
@@ -202,7 +199,6 @@ pub const fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
 
 /// Read back the live `[0..pos)` slice of the GPU KV cache to a [`KvSnapshot`].
 pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
-    type MapResult = StdResult<(), wgpu::BufferAsyncError>;
     let cfg = &model.cfg;
     let n_layer = cfg.n_layer;
     let kv_dim = cfg.kv_dim;
@@ -266,15 +262,11 @@ pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
         }
     }
 
-    let slot: Arc<OnceLock<MapResult>> = Arc::new(OnceLock::new());
-    let slot2 = slot.clone();
     enc.map_buffer_on_submit(
         &staging,
         wgpu::MapMode::Read,
         0..snap_payload_bytes as u64,
-        move |res| {
-            let _ = slot2.set(res);
-        },
+        |_| {},
     );
     model.queue.submit([enc.finish()]);
 
@@ -282,14 +274,6 @@ pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
     if let Err(e) = model.device.poll(wgpu::PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
-    }
-    match slot.get() {
-        Some(Ok(())) => {}
-        Some(Err(e)) => {
-            model.check_device()?;
-            return Err(PotError::BufferMap(e.clone()));
-        }
-        None => unreachable!("map_async callback did not fire before poll returned"),
     }
 
     let mut payload = vec![0u8; snap_payload_bytes];

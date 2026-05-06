@@ -297,7 +297,7 @@ impl<'m> Session<'m> {
 
         // --- prime step 0 ---
         let model = self.model;
-        let (prime_cb, mut cur_slot) = build_step_matvec_topk_cb(model, self.pos, k);
+        let prime_cb = build_step_matvec_topk_cb(model, self.pos, k);
         commit_sample_upload(model, bytemuck::bytes_of(&first_token));
         model.queue.submit(Some(prime_cb));
 
@@ -307,13 +307,13 @@ impl<'m> Session<'m> {
             // need staging contents at encode time — the host write happens after
             // `wait_topk_readback` (which fires the prior remap so staging is mapped).
             // Gated on pos+2 <= max_seq and a next iteration existing.
-            let next_cb_slot = if self.pos + 2 <= max_seq && i + 1 < max_new {
+            let next_cb = if self.pos + 2 <= max_seq && i + 1 < max_new {
                 Some(build_step_matvec_topk_cb(model, self.pos + 1, k))
             } else {
                 None
             };
 
-            let (logits, indices) = wait_topk_readback(model, k, cur_slot)?;
+            let (logits, indices) = wait_topk_readback(model, k)?;
             let chosen = sample_from_topk(&logits, &indices, &opts.sampler, self.pos);
             self.pos += 1;
 
@@ -325,7 +325,7 @@ impl<'m> Session<'m> {
             if i + 1 == max_new {
                 return Ok(StopReason::MaxTokens);
             }
-            let Some((cb, slot)) = next_cb_slot else {
+            let Some(cb) = next_cb else {
                 return Err(PotError::ContextOverflow {
                     pos: self.pos,
                     n: 1,
@@ -334,7 +334,6 @@ impl<'m> Session<'m> {
             };
             commit_sample_upload(model, bytemuck::bytes_of(&chosen));
             model.queue.submit(Some(cb));
-            cur_slot = slot;
         }
         Ok(StopReason::MaxTokens)
     }

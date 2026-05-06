@@ -20,8 +20,6 @@ pub enum PotError {
     FeatureUnsupported(&'static str),
     #[error("wgpu device request failed: {0}")]
     DeviceRequest(#[from] wgpu::RequestDeviceError),
-    #[error("buffer mapping failed: {0:?}")]
-    BufferMap(wgpu::BufferAsyncError),
     #[error("context overflow: pos {pos} + tokens {n} > max_seq {max}")]
     ContextOverflow { pos: u32, n: u32, max: u32 },
     #[error("prefill batch {n} exceeds max_prefill_tokens {max}")]
@@ -72,11 +70,6 @@ mod tests {
             PotError::FeatureUnsupported("SHADER_F16")
                 .to_string()
                 .contains("SHADER_F16")
-        );
-        assert!(
-            PotError::BufferMap(wgpu::BufferAsyncError)
-                .to_string()
-                .contains("buffer")
         );
         assert!(
             PotError::ContextOverflow {
@@ -131,11 +124,6 @@ mod tests {
         assert!(PotError::Vocab("x").source().is_none());
         assert!(PotError::NoAdapter.source().is_none());
         assert!(PotError::FeatureUnsupported("x").source().is_none());
-        assert!(
-            PotError::BufferMap(wgpu::BufferAsyncError)
-                .source()
-                .is_none()
-        );
         assert!(
             PotError::ContextOverflow {
                 pos: 0,
