@@ -102,10 +102,6 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     // warm up
     let _ = run_full_prefill(&prompt)?;
     step_matvec_no_sample(model, 1u32, 0);
-    if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
-        model.check_device()?;
-        return Err(PotError::Poll(e));
-    }
 
     // ----- pp{pp_n} -----
     let mut pp_wall_ts: Vec<f32> = Vec::with_capacity(repeats as usize);
@@ -236,16 +232,10 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
     eprintln!("--- microbench tg (pos={pos}, repeats={repeats}) ---");
 
     // Pre-fill KV cache so attention scans `pos+1` cached tokens on each
-    // measured step. `step_matvec_no_sample` skips the topk readback, and we
-    // poll just once at the end.
-    if pos > 0 {
-        for p in 0..pos {
-            step_matvec_no_sample(model, 1, p);
-        }
-        if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
-            model.check_device()?;
-            return Err(PotError::Poll(e));
-        }
+    // measured step. `step_matvec_no_sample` skips the topk readback but polls
+    // internally to drive the staging-buffer remap callback.
+    for p in 0..pos {
+        step_matvec_no_sample(model, 1, p);
     }
 
     // warm up: one instrumented step at the measurement pos

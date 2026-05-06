@@ -774,6 +774,8 @@ pub fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut NoMarker);
     let cb = se.finish();
     model.queue.submit(Some(cb));
+    // Drive the staging-buffer remap callback so `staging` is mapped for the next call.
+    let _ = model.device.poll(PollType::wait_indefinitely());
 }
 
 /// Pre-KV-copy block of one layer: `rms_norm` → QKV fused → q/k norms → rope.
