@@ -436,10 +436,10 @@ fn dispatch_q_norm_rope_fused(
     pass.dispatch_workgroups(cfg.n_head, m_tokens, 1);
 }
 
-/// Fused: `rms_norm(x) * w` → Q8_0 quantize → write to `act_q8`. One WG per
+/// Fused: `rms_norm(x) * w` → `Q8_0` quantize → write to `act_q8`. One WG per
 /// token. Replaces the prefill-path `dispatch_rms_norm + dispatch_quantize_act`
 /// pair (eliminates the `act.x_norm` round-trip and one dispatch). Returns
-/// `(d_offset, qs_offset)` of the freshly-written Q8_0 region in `act_q8`.
+/// `(d_offset, qs_offset)` of the freshly-written `Q8_0` region in `act_q8`.
 fn dispatch_rms_norm_q8_0(
     model: &Model,
     cfg: &Config,
@@ -467,7 +467,7 @@ fn dispatch_rms_norm_q8_0(
     (d_off, qs_off)
 }
 
-/// Fused: `silu(gate) * up` → Q8_0 quantize → write to `act_q8`. One WG per
+/// Fused: `silu(gate) * up` → `Q8_0` quantize → write to `act_q8`. One WG per
 /// token. Replaces `dispatch_silu_mul + dispatch_quantize_act` (eliminates
 /// the `act.ffn_in` round-trip and one dispatch).
 fn dispatch_silu_mul_q8_0(
@@ -526,14 +526,14 @@ fn dispatch_matmul_q1_0(
     pass.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);
 }
 
-/// Q-tiled + GQA-batched FlashAttention-2 prefill kernel with fused Q8_0
-/// output. One workgroup handles Q_TILE=2 consecutive query tokens × 4 GQA
+/// Q-tiled + GQA-batched FlashAttention-2 prefill kernel with fused `Q8_0`
+/// output. One workgroup handles `Q_TILE=2` consecutive query tokens × 4 GQA
 /// Q-heads sharing the same KV head. K/V are loaded once per cache position
 /// and reused across all 2 * 4 queries — the bandwidth win that keeps
 /// prefill from degrading quadratically. The attention output is quantized
-/// to Q8_0 in-place and written to `act_q8` (no f16 staging in
+/// to `Q8_0` in-place and written to `act_q8` (no f16 staging in
 /// `act.attn_out`), so the Wo matmul reads it as-is. Returns the
-/// `(d_offset, qs_offset)` byte offsets of the freshly written Q8_0 region.
+/// `(d_offset, qs_offset)` byte offsets of the freshly written `Q8_0` region.
 /// See `shaders/attention_prefill_tiled.wgsl`.
 fn dispatch_attention_prefill_tiled(
     model: &Model,
