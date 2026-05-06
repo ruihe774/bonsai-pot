@@ -531,7 +531,7 @@ pub const ATTN_CHUNK_SIZE: u32 = 8;
 /// to *all* other GPU clients (compositors, games, other ML processes). Requires
 /// driver support for `VK_EXT_global_priority`; if unsupported the requested
 /// value is ignored and a warning is logged.
-pub type GlobalPriority = vk::QueueGlobalPriorityKHR;
+pub use vk::QueueGlobalPriorityKHR as GlobalPriority;
 
 fn global_priority_fallback_to_queue_prio(priority: GlobalPriority) -> f32 {
     const LOWEST: i32 = GlobalPriority::LOW.as_raw();
@@ -540,7 +540,7 @@ fn global_priority_fallback_to_queue_prio(priority: GlobalPriority) -> f32 {
 }
 
 /// Power Preference when choosing a physical adapter.
-pub type PowerPerference = wgpu::PowerPreference;
+pub use wgpu::PowerPreference;
 
 /// Allocate-time tunables for [`Model::load_with_options`].
 ///
@@ -566,9 +566,9 @@ pub struct LoadOptions {
     pub priority: GlobalPriority,
     /// Power Preference when choosing a physical adapter.
     ///
-    /// See [`PowerPerference`] for for the available levels. Default is
-    /// [`PowerPerference::HighPerformance`].
-    pub power_perference: PowerPerference,
+    /// See [`PowerPreference`] for for the available levels. Default is
+    /// [`PowerPreference::HighPerformance`].
+    pub power_perference: PowerPreference,
 }
 
 impl Default for LoadOptions {
@@ -576,7 +576,7 @@ impl Default for LoadOptions {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
             priority: GlobalPriority::LOW,
-            power_perference: PowerPerference::HighPerformance,
+            power_perference: PowerPreference::HighPerformance,
         }
     }
 }
@@ -865,8 +865,7 @@ impl Model {
 
     /// Load weights, build pipelines, allocate the KV cache. Reads
     /// `config.json`, `weights_*.bin`, `vocab.bin`, and `vocab_offsets.bin` from
-    /// `model_dir`. Does **not** read `prompt.bin` — callers supply
-    /// pre-tokenized prompts via [`crate::Session`].
+    /// `model_dir`.
     ///
     /// # Errors
     ///
