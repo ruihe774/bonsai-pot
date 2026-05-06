@@ -418,14 +418,14 @@ pub struct CachedBindGroups {
     pub(crate) matmul_w_ffn_d: wgpu::BindGroup,
     pub(crate) matmul_w_embed: wgpu::BindGroup,
     pub(crate) attn_prefill_tiled: wgpu::BindGroup, // (act ro, kv_k, kv_v, act_q8 rw)
-    pub(crate) attn_split: wgpu::BindGroup,   // (act, kv_k, kv_v, attn_partials)
-    pub(crate) attn_merge: wgpu::BindGroup,   // (act, attn_partials)
-    pub(crate) rms_norm_q8_0: wgpu::BindGroup, // (act, w_norms, act_q8)
-    pub(crate) silu_mul_q8_0: wgpu::BindGroup, // (act, act_q8)
-    pub(crate) topk_partial: wgpu::BindGroup, // (act, sample)
-    pub(crate) topk_merge: wgpu::BindGroup,   // (sample)
+    pub(crate) attn_split: wgpu::BindGroup,         // (act, kv_k, kv_v, attn_partials)
+    pub(crate) attn_merge: wgpu::BindGroup,         // (act, attn_partials)
+    pub(crate) rms_norm_q8_0: wgpu::BindGroup,      // (act, w_norms, act_q8)
+    pub(crate) silu_mul_q8_0: wgpu::BindGroup,      // (act, act_q8)
+    pub(crate) topk_partial: wgpu::BindGroup,       // (act, sample)
+    pub(crate) topk_merge: wgpu::BindGroup,         // (sample)
     pub(crate) kv_writeback_fused: wgpu::BindGroup, // (act, w_norms, rope_cs, kv_k, kv_v)
-    pub(crate) q_norm_rope_fused: wgpu::BindGroup, // (act, w_norms, rope_cs)
+    pub(crate) q_norm_rope_fused: wgpu::BindGroup,  // (act, w_norms, rope_cs)
 }
 
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
@@ -512,7 +512,10 @@ pub struct Model {
 
 const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
-const STAGING_CHUNK: u64 = 4 * 1024 * 1024; // 4 MiB
+// Largest single belt write is the matmul-prefill token chunk: M_MAX u32 token
+// ids. Tg path stages 4 B per submission (with up to 2 in flight from
+// `generate_streaming` pipelining). Double to make the belt work efficiently.
+const STAGING_CHUNK: u64 = (M_MAX as u64 * 4).next_power_of_two() * 2;
 /// Number of timestamp query slots allocated for bench/microbench.
 /// Must be >= max marks per step (`n_layer` * 8 + 5 for the matvec path).
 #[cfg(feature = "bench-internals")]
@@ -871,7 +874,21 @@ impl Model {
     /// subgroup size is unsupported, or the vocab files are malformed.
     pub async fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
         // Hoisted constants/items so we don't trip items-after-statements lints.
-        const SAMPLE_BYTES: u64 = 32 * 1024;
+        // Sample buffer roles (max footprint dictates size):
+        //   - input (matmul prefill): M_MAX u32 token ids
+        //   - output: 2*TOPK_MAX u32 (K f32 logits + K u32 indices) at offset 0
+        //   - partials scratch: TOPK_NUM_PARTIAL_WG * 2*TOPK_MAX u32 at offset 2*TOPK_MAX
+        const SAMPLE_OUT_AND_PARTIALS: u64 =
+            ((1 + TOPK_NUM_PARTIAL_WG as u64) * 2 * TOPK_MAX as u64) * 4;
+        const SAMPLE_INPUT: u64 = M_MAX as u64 * 4;
+        const SAMPLE_RAW: u64 = if SAMPLE_INPUT > SAMPLE_OUT_AND_PARTIALS {
+            SAMPLE_INPUT
+        } else {
+            SAMPLE_OUT_AND_PARTIALS
+        };
+        const SAMPLE_BYTES: u64 = SAMPLE_RAW.next_power_of_two();
+        // Readback holds exactly the topk output: K f32 logits + K u32 indices.
+        const READBACK_BYTES: u64 = 2 * TOPK_MAX as u64 * 4;
         const fn ssbo(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             wgpu::BindGroupLayoutEntry {
                 binding,
@@ -1258,14 +1275,12 @@ impl Model {
             mapped_at_creation: false,
         });
 
-        // Sample storage + readback. Roles:
+        // Sample storage + readback. Roles of `sample` (see SAMPLE_BYTES above):
         //   - input: M_MAX prompt token ids during matmul prefill (M_MAX*4 = 2048 B);
         //   - intermediate: pass-1 partial top-K scratch at u32 offset 2*TOPK_MAX
-        //     (TOPK_NUM_PARTIAL_WG * 2 * TOPK_MAX u32s = 4096 B at the default
-        //     16 partials × 32 K_MAX);
+        //     (TOPK_NUM_PARTIAL_WG * 2 * TOPK_MAX u32s = 8192 B);
         //   - output: 2*TOPK_MAX u32 entries (K f32 logits + K u32 indices,
-        //     written by topk_merge at offset 0).
-        // 8 KiB fits all three with margin.
+        //     written by topk_merge at offset 0, 256 B).
         let sample = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sample"),
             size: SAMPLE_BYTES,
@@ -1276,7 +1291,7 @@ impl Model {
         });
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: SAMPLE_BYTES,
+            size: READBACK_BYTES,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1411,11 +1426,11 @@ impl Model {
             matmul: make_bgl("matmul_bgl", 3, 0b100), // weights ro, acts ro, y rw
             attn_prefill_tiled: make_bgl("attn_prefill_tiled_bgl", 4, 0b1000), // act ro, k ro, v ro, act_q8 rw
             attn_split: make_bgl("attn_split_bgl", 4, 0b1000), // act ro, k ro, v ro, partials rw
-            attn_merge: make_bgl("attn_merge_bgl", 2, 0b01), // act rw, partials ro
+            attn_merge: make_bgl("attn_merge_bgl", 2, 0b01),   // act rw, partials ro
             rms_norm_q8_0: make_bgl("rms_norm_q8_0_bgl", 3, 0b100), // act ro, w ro, outbuf rw
-            silu_mul_q8_0: make_bgl("silu_mul_q8_0_bgl", 2, 0b10),  // act ro, outbuf rw
+            silu_mul_q8_0: make_bgl("silu_mul_q8_0_bgl", 2, 0b10), // act ro, outbuf rw
             topk_partial: make_bgl("topk_partial_bgl", 2, 0b10), // logits ro, result rw
-            topk_merge: make_bgl("topk_merge_bgl", 1, 0b1), // result rw
+            topk_merge: make_bgl("topk_merge_bgl", 1, 0b1),    // result rw
             kv_writeback_fused: make_bgl("kv_writeback_fused_bgl", 5, 0b11000), // act ro, w_norms ro, rope_cs ro, kv_k rw, kv_v rw
             q_norm_rope_fused: make_bgl("q_norm_rope_fused_bgl", 3, 0b001), // act rw, w_norms ro, rope_cs ro
         };
