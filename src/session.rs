@@ -1,7 +1,5 @@
 use crate::error::{PotError, Result};
-use crate::forward::{
-    self, build_step_matvec_topk_cb, build_step_matvec_topk_cb_deferred, wait_topk_readback,
-};
+use crate::forward::{self, build_step_matvec_topk_cb, commit_sample_upload, wait_topk_readback};
 use crate::kv_snapshot::{self, KvSnapshot};
 use crate::model::{Model, TOPK_MAX};
 
@@ -133,8 +131,8 @@ impl<'m> Session<'m> {
     /// the next call is typically [`prefill`](Self::prefill) (works at any
     /// `pos`) or [`step`](Self::step) if `snap.pos() > 0`.
     ///
-    /// Cost: one staging-belt-backed upload (all layers in one encoder),
-    /// serialized against subsequent dispatches by queue ordering.
+    /// Cost: one `Queue::write_buffer` upload per layer pair (cold path; uses the
+    /// queue's built-in staging since the KV buffers are too large for the sample staging buffer).
     ///
     /// # Errors
     ///
@@ -266,6 +264,8 @@ impl<'m> Session<'m> {
     ///
     /// Pipelined: the `CommandBuffer` for step i+1 is encoded on the CPU while
     /// the GPU drains step i, hiding the encode latency behind the GPU step time.
+    /// The token-id staging write is deferred to after `wait_topk_readback`
+    /// fires the previous step's staging remap callback.
     ///
     /// # Errors
     ///
@@ -295,20 +295,20 @@ impl<'m> Session<'m> {
             });
         }
 
-        // --- prime step 0: token write + step in one CB ---
+        // --- prime step 0 ---
         let model = self.model;
-        let (prime_cb, mut cur_slot) = build_step_matvec_topk_cb(model, first_token, self.pos, k);
-        model.belt_finish();
+        let (prime_cb, mut cur_slot) = build_step_matvec_topk_cb(model, self.pos, k);
+        commit_sample_upload(model, bytemuck::bytes_of(&first_token));
         model.queue.submit(Some(prime_cb));
-        model.belt_recall();
 
         for i in 0..max_new {
-            // Pre-encode the next step's CB while the GPU drains the current
-            // one. The staged copy_buffer_to_buffer for `sample[0]` is encoded
-            // now (allocated slot in the staging chunk), but the token bytes are
-            // written in later once sampling produces the chosen value.
-            let next = if self.pos + 2 <= max_seq && i + 1 < max_new {
-                Some(build_step_matvec_topk_cb_deferred(model, self.pos + 1, k))
+            // Encode next step's CB while the GPU drains the current one.
+            // The next CB records `copy_buffer_to_buffer(staging → sample)` but doesn't
+            // need staging contents at encode time — the host write happens after
+            // `wait_topk_readback` (which fires the prior remap so staging is mapped).
+            // Gated on pos+2 <= max_seq and a next iteration existing.
+            let next_cb_slot = if self.pos + 2 <= max_seq && i + 1 < max_new {
+                Some(build_step_matvec_topk_cb(model, self.pos + 1, k))
             } else {
                 None
             };
@@ -318,38 +318,22 @@ impl<'m> Session<'m> {
             self.pos += 1;
 
             if is_stop(chosen) {
-                // Discard the pre-built CB and clean up the staging chunk.
-                if let Some((_cb, _slot, view)) = next {
-                    drop(view);
-                    model.belt_finish();
-                    model.belt_recall();
-                }
                 return Ok(StopReason::Eos);
             }
             on_token(chosen);
 
             if i + 1 == max_new {
-                if let Some((_cb, _slot, view)) = next {
-                    drop(view);
-                    model.belt_finish();
-                    model.belt_recall();
-                }
                 return Ok(StopReason::MaxTokens);
             }
-            let Some((cb, slot, mut view)) = next else {
+            let Some((cb, slot)) = next_cb_slot else {
                 return Err(PotError::ContextOverflow {
                     pos: self.pos,
                     n: 1,
                     max: max_seq,
                 });
             };
-            // Fill the pre-allocated staging slot with the chosen token. Must
-            // drop the view before belt_finish() (which calls buffer.unmap()).
-            view.copy_from_slice(bytemuck::bytes_of(&chosen));
-            drop(view);
-            model.belt_finish();
+            commit_sample_upload(model, bytemuck::bytes_of(&chosen));
             model.queue.submit(Some(cb));
-            model.belt_recall();
             cur_slot = slot;
         }
         Ok(StopReason::MaxTokens)

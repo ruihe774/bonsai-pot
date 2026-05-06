@@ -133,16 +133,55 @@ impl<'a> StepEncoder<'a> {
         slot
     }
 
-    /// Stage `data` into `model.buffers.sample[offset..]` via the belt.
-    /// `data.len()` and `offset` must be multiples of 4.
-    pub fn write_sample(&mut self, offset: u64, data: &[u8]) {
-        self.model
-            .belt_write(&mut self.encoder, &self.model.buffers.sample, offset, data);
-    }
-
     pub fn finish(self) -> wgpu::CommandBuffer {
         self.encoder.finish()
     }
+}
+
+/// Encode-side: record `copy_buffer_to_buffer(staging[0..n_bytes] → sample[dst_off..])`
+/// into `encoder` and schedule a full-buffer remap of `staging` on submit.
+///
+/// This does not touch staging contents. Pair with [`commit_sample_upload`] before
+/// `queue.submit`. Used in pipelined paths where the data isn't known at encode time.
+pub fn encode_sample_upload(
+    model: &Model,
+    encoder: &mut wgpu::CommandEncoder,
+    dst_off: u64,
+    n_bytes: u64,
+) {
+    encoder.copy_buffer_to_buffer(
+        &model.buffers.staging,
+        0,
+        &model.buffers.sample,
+        dst_off,
+        n_bytes,
+    );
+    encoder.map_buffer_on_submit(&model.buffers.staging, wgpu::MapMode::Write, 0.., |_| ());
+}
+
+/// Write-side: copy `data` into the currently-mapped `staging` buffer and unmap it.
+///
+/// Precondition: `buffers.staging` is currently mapped (guaranteed by `mapped_at_creation`
+/// initially, and by [`encode_sample_upload`]'s `map_buffer_on_submit` after every preceding
+/// submit + poll). Must be called before the corresponding `queue.submit` so the GPU sees
+/// `staging` unmapped with the right data.
+pub fn commit_sample_upload(model: &Model, data: &[u8]) {
+    {
+        let mut view = model
+            .buffers
+            .staging
+            .slice(..data.len() as u64)
+            .get_mapped_range_mut();
+        view.copy_from_slice(data);
+    }
+    model.buffers.staging.unmap();
+}
+
+/// Convenience wrapper for non-pipelined paths: encode the copy + schedule the remap, then
+/// commit `data` immediately. Equivalent to `encode_sample_upload` + `commit_sample_upload`.
+pub fn upload_sample(model: &Model, encoder: &mut wgpu::CommandEncoder, dst_off: u64, data: &[u8]) {
+    encode_sample_upload(model, encoder, dst_off, data.len() as u64);
+    commit_sample_upload(model, data);
 }
 
 // ---------- weight-set selection -------------------------------------------
@@ -712,61 +751,29 @@ pub fn encode_step_matvec<M: StepMarker>(
     drop(pass);
 }
 
-/// Build (but do not submit) one full tg-step `CommandBuffer`: embed → all
-/// layers → `output_norm` → LM head → `topk_reduce` → sample→readback copy.
+/// Build (but do not submit) one full tg-step `CommandBuffer`: staging upload →
+/// embed → all layers → `output_norm` → LM head → `topk_reduce` → sample→readback copy.
 ///
-/// Stages `token_id` into `sample[0]` via the staging belt — the copy is
-/// encoded at the start of the CB before the embed dispatch reads it, so
-/// wgpu's implicit barrier ensures ordering. Callers must call
-/// `model.belt_finish()` before submitting the returned `CommandBuffer`, and
-/// `model.belt_recall()` after.
+/// The CB records `copy_buffer_to_buffer(staging[0..4] → sample[0..4])` as the first op
+/// and schedules a staging remap on submit. The caller must invoke
+/// [`commit_sample_upload`] with the input token id between encoding this CB and submitting
+/// it (in pipelined paths this happens after `wait_topk_readback` for the previous step,
+/// which fires the prior remap callback so `staging` is mapped again). `topk_reduce` then
+/// overwrites `sample[0..2k]` with the K f32 logits + K u32 indices for CPU readback; the
+/// two roles never alias inside one CB (embed runs before `topk_reduce`).
 pub fn build_step_matvec_topk_cb(
     model: &Model,
-    token_id: u32,
     pos: u32,
     k: u32,
 ) -> (wgpu::CommandBuffer, MapSlot) {
     let k = k.clamp(1, TOPK_MAX);
     let mut se = StepEncoder::new(model);
-    se.write_sample(0, bytemuck::bytes_of(&token_id));
+    encode_sample_upload(model, &mut se.encoder, 0, 4);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos, &mut NoMarker);
     let bytes = u64::from(k) * 8;
     se.copy_sample_to_readback(bytes);
     let slot = se.schedule_topk_map(bytes);
     (se.finish(), slot)
-}
-
-/// Like [`build_step_matvec_topk_cb`] but does not stage the token — the
-/// returned `wgpu::BufferViewMut` is a host-mapped 4-byte slot in the staging
-/// chunk. The caller must:
-///   1. fill the view with the chosen token bytes (`view.copy_from_slice(...)`),
-///   2. drop the view (unregisters the mapped range),
-///   3. call `model.belt_finish()` (unmaps the chunk),
-///   4. submit the `CommandBuffer`,
-///   5. call `model.belt_recall()`.
-pub fn build_step_matvec_topk_cb_deferred(
-    model: &Model,
-    pos: u32,
-    k: u32,
-) -> (wgpu::CommandBuffer, MapSlot, wgpu::BufferViewMut) {
-    let k = k.clamp(1, TOPK_MAX);
-    let mut se = StepEncoder::new(model);
-    let view = {
-        // BufferSize(4) is a non-zero constant; NonZeroU64::new(4) is always Some.
-        const TOKEN_ID_SIZE: wgpu::BufferSize = wgpu::BufferSize::new(4).unwrap();
-        #[allow(
-            clippy::expect_used,
-            reason = "mutex poison indicates a preceding panic"
-        )]
-        let mut belt = model.belt.lock().expect("belt mutex poisoned");
-        belt.write_buffer(&mut se.encoder, &model.buffers.sample, 0, TOKEN_ID_SIZE)
-        // guard drops here — BufferViewMut is owned, no borrow back to the belt.
-    };
-    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos, &mut NoMarker);
-    let bytes = u64::from(k) * 8;
-    se.copy_sample_to_readback(bytes);
-    let slot = se.schedule_topk_map(bytes);
-    (se.finish(), slot, view)
 }
 
 /// Run one matvec step at `pos`, reading the current token from CPU and
@@ -777,10 +784,9 @@ pub fn step_matvec_topk(
     pos: u32,
     k: u32,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
-    let (cb, slot) = build_step_matvec_topk_cb(model, token_id, pos, k);
-    model.belt_finish();
+    let (cb, slot) = build_step_matvec_topk_cb(model, pos, k);
+    commit_sample_upload(model, bytemuck::bytes_of(&token_id));
     model.queue.submit(Some(cb));
-    model.belt_recall();
     wait_topk_readback(model, k, slot)
 }
 
@@ -790,14 +796,12 @@ pub fn step_matvec_topk(
 #[cfg(feature = "bench-internals")]
 pub fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     let mut se = StepEncoder::new(model);
-    se.write_sample(0, bytemuck::bytes_of(&token_id));
+    upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&token_id));
     // We still encode the topk_reduce dispatch (with k=1, the single argmax case)
     // so the timing reflects real generation cost; we just skip the readback.
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut NoMarker);
     let cb = se.finish();
-    model.belt_finish();
     model.queue.submit(Some(cb));
-    model.belt_recall();
 }
 
 /// Pre-KV-copy block of one layer: `rms_norm` → QKV fused → q/k norms → rope.
@@ -984,11 +988,10 @@ pub fn prefill_matvec_loop_topk(
     for chunk_start in (0..rest.len()).step_by(CHUNK) {
         let chunk_end = (chunk_start + CHUNK).min(rest.len());
         let chunk = &rest[chunk_start..chunk_end];
-        // Stage this chunk's tokens into sample[0..chunk.len()]; the embed
-        // shader for step `i` reads `sample[i]`. The staged copy is encoded
-        // before the first compute pass so wgpu's implicit barrier applies.
+        // Upload this chunk's tokens to sample[0..chunk.len()]; the embed
+        // shader for step `i` reads `sample[i]`.
         let mut se = StepEncoder::new(model);
-        se.write_sample(0, bytemuck::cast_slice(chunk));
+        upload_sample(model, &mut se.encoder, 0, bytemuck::cast_slice(chunk));
         for (i, t) in (chunk_start..chunk_end).enumerate() {
             encode_step_matvec(
                 &mut se,
@@ -1000,9 +1003,9 @@ pub fn prefill_matvec_loop_topk(
             );
         }
         let cb = se.finish();
-        model.belt_finish();
         model.queue.submit(Some(cb));
-        model.belt_recall();
+        // Drive the staging buffer remap callback so staging is mapped for the next upload.
+        let _ = model.device.poll(PollType::wait_indefinitely());
     }
     step_matvec_topk(model, last, pos_base + rest.len() as u32, k)
 }
@@ -1035,8 +1038,7 @@ pub fn prefill_matmul_topk<M: StepMarker>(
     //      compute dispatches sharing ONE pass to amortize the
     //      begin_compute_pass cost (~25us each on RADV).
     let mut se = StepEncoder::new(model);
-    // Stage the prompt token ids into sample[0..m] before the embed pass.
-    se.write_sample(0, bytemuck::cast_slice(prompt));
+    upload_sample(model, &mut se.encoder, 0, bytemuck::cast_slice(prompt));
 
     {
         let mut desc = wgpu::ComputePassDescriptor {
@@ -1103,9 +1105,7 @@ pub fn prefill_matmul_topk<M: StepMarker>(
     let slot = se.schedule_topk_map(bytes);
 
     let cb = se.finish();
-    model.belt_finish();
     model.queue.submit(Some(cb));
-    model.belt_recall();
 
     wait_topk_readback(model, k, slot)
 }

@@ -321,21 +321,9 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
     let kv_dim = cfg.kv_dim;
     let max_seq = model.max_seq;
 
-    // d_size: pos * nb(kv_dim) * 4 bytes — multiple of 4 by construction.
-    // qs_size: pos * kv_dim bytes — kv_dim is a multiple of 32 (Q8_0 block),
-    // so qs_size is always 4-aligned.
     let d_size = u64::from(snap.pos) * nb(kv_dim) * 4;
     let qs_size = u64::from(snap.pos) * u64::from(kv_dim);
 
-    // Stage all per-layer d/qs writes into a single encoder so the whole
-    // restore lands in one submit. Per-call write sizes may exceed the belt's
-    // chunk_size (4 MiB) for the qs-section at large pos/kv_dim; the belt
-    // allocates a one-off chunk for those, which is fine for a one-shot op.
-    let mut enc = model
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("kv_restore"),
-        });
     for kind in 0u32..2 {
         let dst_buf = if kind == 0 {
             &model.buffers.kv_k
@@ -346,8 +334,7 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
             // d-section
             let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 0);
             let dst_off = buf_d_offset(max_seq, kv_dim, il);
-            model.belt_write(
-                &mut enc,
+            model.queue.write_buffer(
                 dst_buf,
                 dst_off,
                 &snap.payload[src_off..src_off + d_size as usize],
@@ -355,18 +342,13 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
             // qs-section
             let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 1);
             let dst_off = buf_qs_offset(n_layer, max_seq, kv_dim, il);
-            model.belt_write(
-                &mut enc,
+            model.queue.write_buffer(
                 dst_buf,
                 dst_off,
                 &snap.payload[src_off..src_off + qs_size as usize],
             );
         }
     }
-    let cb = enc.finish();
-    model.belt_finish();
-    model.queue.submit(Some(cb));
-    model.belt_recall();
 
     Ok(())
 }

@@ -12,7 +12,7 @@ use wgpu::PollType;
 
 use super::{
     BenchMarker, MicroMarker, Model, NoMarker, Result, StepEncoder, encode_step_matvec,
-    prefill_matmul_topk, step_matvec_no_sample, wait_topk_readback,
+    prefill_matmul_topk, step_matvec_no_sample, upload_sample, wait_topk_readback,
 };
 use crate::error::PotError;
 use crate::session::{GenerateOptions, Sampler};
@@ -131,15 +131,12 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let mut total_gpu_ns = 0.0f32;
         for pos in 0..tg_n {
             let mut se = StepEncoder::new(model);
-            se.write_sample(0, bytemuck::bytes_of(&tok));
+            upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
             let mut marker = BenchMarker::new(model);
             encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), pos, &mut marker);
             se.copy_sample_to_readback(8);
             let slot = se.schedule_topk_map(8);
-            let cb = se.finish();
-            model.belt_finish();
-            model.queue.submit(Some(cb));
-            model.belt_recall();
+            model.queue.submit(Some(se.finish()));
             wait_topk_readback(model, 1, slot)?;
             total_gpu_ns += marker.resolve()?;
         }
@@ -327,15 +324,12 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
 fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f32)>> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(model);
-    se.write_sample(0, bytemuck::bytes_of(&tok));
+    upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
     let mut marker = MicroMarker::new(model);
     encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut marker);
     se.copy_sample_to_readback(8);
     let slot = se.schedule_topk_map(8);
-    let cb = se.finish();
-    model.belt_finish();
-    model.queue.submit(Some(cb));
-    model.belt_recall();
+    model.queue.submit(Some(se.finish()));
     wait_topk_readback(model, 1, slot)?;
     marker.resolve()
 }
