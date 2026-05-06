@@ -1,8 +1,21 @@
 [package]
 name = "bonsai-pot"
-version = "0.1.0"
+version = "0.300.0"
+authors = ["Rui He <ruihe774@outlook.com>"]
 edition = "2024"
-publish = false
+rust-version = "1.87"
+description = "A from-scratch, dependency-light, dequant-free Bonsai (Qwen3-architecture) Q1_0 inference engine running on wgpu compute shaders"
+readme = "README.md"
+repository = "https://github.com/ruihe774/bonsai-pot"
+license = "CC0-1.0"
+keywords = [
+    "llm-inference",
+    "llm",
+    "vulkan",
+    "webgpu",
+    "wgpu",
+]
+categories = ["artificial-intelligence"]
 
 [lib]
 name = "bonsai_pot"
