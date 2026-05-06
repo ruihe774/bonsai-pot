@@ -6,6 +6,19 @@ The defining property of this engine: **weights are never dequantized**. Q1_0 st
 
 No `llama.cpp`, no `ggml`, no PyTorch on the hot path. Weights are loaded from a custom flat-file layout (produced from a GGUF by `scripts/extract.py`), every kernel is hand-rolled WGSL, and the host side is plain Rust + wgpu 29 + pollster.
 
+## Performance
+
+End-to-end throughput from `--mode bench --pp 512 --tg 128` (5 timed reps after 1 warmup):
+
+| GPU                         | model     | e2e_pp632 t/s        | e2e_tg128 t/s     |
+|-----------------------------|-----------|---------------------:|------------------:|
+| AMD RX 9070 (RDNA4, wave64) | Bonsai-4B | **1767.08** ± 6.40   | **308.06** ± 2.64 |
+| AMD RX 9070 (RDNA4, wave64) | Bonsai-8B |  993.42 ± 1.54       |  203.40 ± 1.89    |
+| NVIDIA GB10 (Blackwell, 32) | Bonsai-4B | 1595.47 ± 4.90       |  173.13 ± 1.76    |
+| NVIDIA GB10 (Blackwell, 32) | Bonsai-8B |  976.51 ± 8.22       |  121.46 ± 1.10    |
+
+`e2e_pp632` runs `Session::prefill` on a 632-token ChatML-wrapped prompt — long enough to exceed the `m_max=512` chunk cap and exercise the cross-chunk `pos_base` advancement. `e2e_tg128` runs `Session::generate` end-to-end with **stochastic top-K=32 sampling** (the GPU top-K reduction is the implicit top-K cap; the CPU does temperature → softmax → multinomial over those 32 candidates) and **encode pipelining** — the next step's command buffer is encoded on the CPU while the GPU drains the current step. So these are realistic chat-time numbers, not bare-forward microbenches. Both holds up at long context: on RX 9070, `e2e_tg1024` is ~272 t/s for 4B and ~187 t/s for 8B (~12% / ~8% drop vs `e2e_tg128`); bare-forward prefill (`--mode bench`, no sampler / no readback) goes pp512 ~1974, pp1024 ~1799, pp4096 ~1257 t/s, held together by the Q-tiled + GQA-batched FA-2 prefill kernel ([Attention](#attention)) — Q_TILE=2 × Q_PER_GROUP=4 means a single K[t] load is reused across 8 queries inside the workgroup, instead of being re-loaded once per Q-head per query.
+
 ## What's in here
 
 - A **library** (`bonsai_pot::{Model, Session, Sampler, GenerateOptions, …}`) for embedding the engine in other Rust programs.
@@ -54,7 +67,7 @@ cargo run --release --example chat -- ./model
 ### CLI modes
 
 - `--mode gen` (default) — single-token matvec path for both prompt and generation; the dequant-free, multiply-free Q1_0 hot path.
-- `--mode prompt` — batched `dot4I8Packed` matmul prefill (with a Q8_0 activation quantize pre-pass; weights still consumed in Q1_0 with no dequant), then matvec for generation.
+- `--mode prompt` — batched `dot4I8Packed` matmul prefill (weights stay in Q1_0; activations arrive Q8_0-quantized inline by the upstream fused kernels), then matvec for generation.
 - `--mode bench` — `llama-bench`-style table with pp/tg t/s.
 - `--mode microbench` — per-kernel breakdown (us/call × calls/step).
 
@@ -62,7 +75,7 @@ cargo run --release --example chat -- ./model
 
 `--temperature`, `--top-k`, `--top-p`, `--seed`. Default is greedy (`--temperature 0.0`). Greedy runs are byte-deterministic; stochastic runs are reproducible per seed.
 
-Sampling is hybrid: a single-workgroup `topk_reduce.wgsl` kernel reduces the full logits tensor to top-K candidates (`K = TOPK_MAX = 32`) on the GPU; the CPU then does temperature → softmax → top-p → multinomial.
+Sampling is hybrid: a two-pass multi-WG reduction (`topk_partial.wgsl` + `topk_merge.wgsl`) reduces the full logits tensor to top-K candidates (`K = TOPK_MAX = 32`) on the GPU; the CPU then does temperature → softmax → top-p → multinomial.
 
 ## How it works
 
@@ -72,21 +85,28 @@ Q1_0 stores 128 weights per block as 16 bytes of sign bits (±1 per weight) plus
 
 The shaders consume these two arrays **directly**:
 
-- **Matvec (`shaders/matvec_q1_0.wgsl`)** — for each block, the kernel walks 128 sign bits and accumulates `±x` via `select(-xv, xv, bit_set)`. The block contributes one FP16 multiply at the end (`block_sum * d`). No weight is ever materialized as a real number; nothing is unpacked into shared memory; the inner loop has zero multiplications. `matvec_q1_0_fused.wgsl` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup to amortize the activation load.
-- **Matmul (`shaders/matmul_q1_0_q8_0.wgsl`)** — used in batched prefill. Activations are pre-quantized to Q8_0 (`quantize_q8_0.wgsl`); the kernel then computes the dot product as `sum_of_signed_q8 * d_w * d_x` per block, using `dot4I8Packed` over the activation bytes with the weight sign bits selecting their sign. Again: no FP16 weight tensor, no dequantize step, weight bits are read straight from storage.
+- **Matvec (`shaders/matvec_q1_0.wgsl`)** — for each block, the kernel walks 128 sign bits and accumulates `±x` via `select(-xv, xv, bit_set)`. The block contributes one FP16 multiply at the end (`block_sum * d`). No weight is ever materialized as a real number; nothing is unpacked into shared memory; the inner loop has zero multiplications. `matvec_q1_0_fused_normed.wgsl` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup, amortizes the activation load across them, and additionally folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip. `matvec_q1_0_silu.wgsl` folds `silu(gate) * up` into the ffn_down matvec.
+- **Matmul (`shaders/matmul_q1_0_q8_0.wgsl`)** — used in batched prefill. Activations arrive Q8_0-quantized inline by the upstream fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, `attention_prefill_tiled`) — there is no separate quantize pass. The kernel then computes the dot product as `sum_of_signed_q8 * d_w * d_x` per block, using `dot4I8Packed` over the activation bytes with the weight sign bits selecting their sign. Again: no FP16 weight tensor, no dequantize step, weight bits are read straight from storage.
 
 ### Two execution paths
 
 1. **Single-token (matvec) path** — used for all of `--mode gen` and the generation phase of `--mode prompt`. The whole step (embed → transformer layers → output_norm → LM head → topk) is encoded into a single compute pass.
-2. **Batched-prefill (matmul) path** — used by `Session::prefill` and `--mode prompt`. Activations are quantized to Q8_0 once per layer; weights stay in Q1_0.
+2. **Batched-prefill (matmul) path** — used by `Session::prefill` and `--mode prompt`. Activations are Q8_0-quantized inline by fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, and `attention_prefill_tiled` for the attn output); weights stay in Q1_0.
 
-Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches every dispatch — embed, all layers, output norm, LM head, and `topk_reduce` — into a single compute pass. Per-layer K/V is quantized to Q8_0 directly into the KV cache by a `kv_writeback` kernel, replacing the `copy_buffer_to_buffer` that used to break the pass.
+Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches every dispatch — embed, all layers, output norm, LM head, and the two-pass top-K — into a single compute pass. Per-layer K/V is rms-normed, RoPE'd, Q8_0-quantized, and written directly into the KV cache by `kv_writeback_fused`, replacing the `copy_buffer_to_buffer` that used to break the pass.
+
+### Attention
+
+Two attention kernels, both fused-softmax flash-attention variants:
+
+- **Generation (tg, m=1)** — split-K + GQA-batched (`attention_split.wgsl` + `attention_merge.wgsl`). Each `(kv_head, chunk)` workgroup scans an 8-position slice of the cache; the four Q-heads sharing the KV group are processed together so each K/V load is reused 4×. Per-chunk `(m, l, o)` partials are written to scratch; `attention_merge` does a flash-attention log-sum-exp combination across the chunks. This decouples per-step latency from KV length.
+- **Prefill (matmul, m>1)** — Q-tiled + GQA-batched FA-2 (`attention_prefill_tiled.wgsl`). Each workgroup handles `Q_TILE=2` consecutive query tokens × 4 GQA Q-heads sharing the KV head, so a single K[t] load is reused across 8 queries. The output is **inline Q8_0-quantized** and written directly to the activation Q8_0 buffer — the downstream Wo matmul reads it without a round-trip. Per-query state (Q registers, output accumulators, m/l) is manually unrolled rather than indexed dynamically out of an array (NVIDIA spills `array<…, Q_TILE>` with dynamic indexing to local memory; manual unrolling stays in registers).
 
 ### GPU memory layout
 
 Weights live in **5 storage buffers** grouped by role: `w_attn`, `w_ffn_gu`, `w_ffn_d`, `w_norms`, `w_embed`. Activations are one f16 buffer with named regions (`ActLayout`). KV cache is split into `kv_k` / `kv_v` and stored in **Q8_0** (~2.25 bytes/element); per-step K/V is quantized straight into the cache, with no f16 staging copy. Capacity is set at load via `LoadOptions::max_seq` (default 1024; `--max-seq` on both the bin and the chat example). Bonsai 4B uses **tied** embeddings (`token_embd.weight` serves as both embed table and LM head); Bonsai 8B ships a separate `output.weight` tensor for the LM head.
 
-There is exactly one `uniform` buffer; every dispatch's params struct is appended to a CPU-side pool with a dynamic offset, and the whole pool is uploaded in one `write_buffer` per step.
+There is no UBO. Every dispatch's params struct (≤ 64 B) is passed as wgpu immediates (push constants) via `pass.set_immediates`, and BGLs hold only storage bindings.
 
 ## Architecture map
 
