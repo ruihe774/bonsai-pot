@@ -46,7 +46,9 @@ float load_w_f16(uint b_offset) {
 }
 
 uint expand_4_bits(uint bits) {
-    uint spread = (bits & 1u) | ((bits & 2u) << 7) | ((bits & 4u) << 14) | ((bits & 8u) << 21);
+    // Spread the 4 input bits to the 4 byte LSBs in one mul: bit i lands at bit (8i)
+    // because 0x00204081 has bits set at positions {0, 7, 14, 21}.
+    uint spread = (bits * 0x00204081u) & 0x01010101u;
     return ~(spread * 0xFEu);
 }
 
