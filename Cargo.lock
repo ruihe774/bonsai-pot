@@ -718,8 +718,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd91265cc2454558f659b3b4b9640f0ddb8cc6521277f166b8a8c181c898079"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -1392,8 +1391,7 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb3feacc458f7bee8bc1737149b42b6c731aa461039a4264a67bb6681646b250"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1421,8 +1419,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02da3ad1b568337f25513b317870960ef87073ea0945502e44b864b67a8c77b7"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -1452,8 +1449,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bfb01076d0aa08b0ba9bd741e178b5cc440f5abe99d9581323a4c8b5d1a1916"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "wgpu-hal",
 ]
@@ -1461,8 +1457,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f8e1a9e7a8512f276f7c62e018c7fa8d60954303fed2e5750114332049193f"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -1496,8 +1491,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59c654c483f058800972c3645e95388a7eca31bf9fe1933bc20e036588a0be02"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -1506,8 +1500,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9bcc31518a0e9735aefebedb5f7a9ef3ed1c42549c9f4c882fa9060ceaac639"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#1b3d38d6559871d11f6ff511c2ad245411234e9f"
 dependencies = [
  "bitflags",
  "bytemuck",

@@ -324,12 +324,39 @@ impl ActLayout {
 // ----- SPIR-V specialization-constant patcher --------------------------------
 
 /// Specialization-constant ID convention used by every shader in this crate.
-/// `SpecId` 0 is the adapter's `subgroup_min_size`; `SpecId` 1 is `MAX_CHUNKS`
-/// (= `ceil(max_seq` / `ATTN_CHUNK_SIZE`)); `SpecId` 2 is `N_EMBD_V4` (= `n_embd` / 4).
-/// Shaders that don't use a given slot simply ignore it.
-pub const SPEC_SUBGROUP_MIN_SIZE: u32 = 0;
+/// `SpecId` 0 is the effective per-pipeline subgroup size (the value the shader
+/// uses to compute `NUM_SUBGROUPS = ceil(WG / SUBGROUP_SIZE)`); `SpecId` 1 is
+/// `MAX_CHUNKS` (= `ceil(max_seq` / `ATTN_CHUNK_SIZE`)); `SpecId` 2 is
+/// `N_EMBD_V4` (= `n_embd` / 4). Shaders that don't use a given slot simply
+/// ignore it.
+pub const SPEC_SUBGROUP_SIZE: u32 = 0;
 pub const SPEC_MAX_CHUNKS: u32 = 1;
 pub const SPEC_N_EMBD_V4: u32 = 2;
+
+/// Pick a `SubgroupSize` request and the matching `SUBGROUP_SIZE` spec-const
+/// value for a pipeline whose workgroup is `wg` lanes wide.
+///
+/// The spec-const value is the *effective lane count* used by the shader's
+/// `NUM_SUBGROUPS = ceil(WG / SUBGROUP_SIZE)`:
+///
+/// * `wg <= sg_min` → `Varying`, spec = `wg`. The hardware subgroup is
+///   wider than the WG; only the first `wg` lanes are active. Subgroup
+///   reductions still see only the active lanes.
+/// * `wg < sg_max`  → `Fixed(wg)`, spec = `wg`. The WG fit in the supported range.
+/// * `wg >= sg_max` → `Full`, spec = `sg_max`. The WG spans
+///   `wg / sg_max` full subgroups (driver picks a single size).
+///
+/// Order matters — `wg < sg_min` must be tested first, since `Fixed(wg)` is
+/// invalid in that case (the requested size must lie in `[sg_min, sg_max]`).
+pub const fn pick_subgroup_config(wg: u32, sg_min: u32, sg_max: u32) -> (wgpu::SubgroupSize, u32) {
+    if wg <= sg_min {
+        (wgpu::SubgroupSize::Varying, wg)
+    } else if wg < sg_max {
+        (wgpu::SubgroupSize::Fixed(wg), wg)
+    } else {
+        (wgpu::SubgroupSize::Full, sg_max)
+    }
+}
 
 /// Patch the default value of an `OpSpecConstant` (32-bit type) in a SPIR-V
 /// module identified by its `SpecId` decoration. wgpu's passthrough shader
@@ -980,6 +1007,9 @@ impl Model {
         if !features.contains(wgpu::Features::SUBGROUP) {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
+        if !features.contains(wgpu::Features::SUBGROUP_SIZE_CONTROL) {
+            return Err(PotError::FeatureUnsupported("SUBGROUP_SIZE_CONTROL"));
+        }
         if !features.contains(wgpu::Features::IMMEDIATES) {
             return Err(PotError::FeatureUnsupported("IMMEDIATES"));
         }
@@ -1021,6 +1051,7 @@ impl Model {
 
         let required_features = wgpu::Features::SHADER_F16
             | wgpu::Features::SUBGROUP
+            | wgpu::Features::SUBGROUP_SIZE_CONTROL
             | wgpu::Features::IMMEDIATES
             | wgpu::Features::PASSTHROUGH_SHADERS
             | {
@@ -1172,13 +1203,11 @@ impl Model {
         }
 
         // ---- validate adapter subgroup range ----------------------------------
-        // wgpu-hal sets ALLOW_VARYING_SUBGROUP_SIZE on every compute pipeline
-        // when SUBGROUP is enabled, so the subgroup_size / subgroup_id /
-        // num_subgroups builtins are always correct. We do NOT probe the runtime
-        // size; instead shaders use these builtins at runtime and size their
-        // cross-subgroup shmem arrays for the worst case (WG / subgroup_min_size).
-        // The only hard requirement: subgroup_min_size >= 8, needed by the
-        // matvec subgroupShuffleXor(_, 1|2|4) butterfly.
+        // With SUBGROUP_SIZE_CONTROL we pin a concrete subgroup size per
+        // pipeline via PipelineCompilationOptions::subgroup_size and patch
+        // each shader's SPEC_SUBGROUP_SIZE so NUM_SUBGROUPS is constant after
+        // specialization. The only hard requirement on the adapter is
+        // sg_min >= 8 (matvec subgroupShuffleXor(_, 1|2|4) butterfly).
         let sg_min = info.subgroup_min_size;
         let sg_max = info.subgroup_max_size;
         if sg_min < 8 || sg_min & (sg_min - 1) != 0 {
@@ -1186,14 +1215,12 @@ impl Model {
                 "adapter subgroup_min_size must be a power-of-2 >= 8 (required by Q1_0 matvec butterfly)",
             ));
         }
-        let subgroup_min_size = sg_min;
         log::info!(
-            "adapter={} backend={:?} subgroup range={}..={} (shmem worst-case N_SG={})",
+            "adapter={} backend={:?} subgroup range={}..={}",
             info.name,
             info.backend,
             sg_min,
             sg_max,
-            64u32.div_ceil(sg_min),
         );
 
         // ---- load weight buffers from disk ---------------------------------
@@ -1380,21 +1407,35 @@ impl Model {
         };
 
         // ---- shaders & pipelines -------------------------------------------
-        // The three load-time-known constants that used to be `{{...}}` text
-        // substitutions in WGSL are now Vulkan specialization constants in
-        // the SPIR-V binaries. SUBGROUP_MIN_SIZE caps the worst-case
-        // cross-subgroup shmem size; MAX_CHUNKS is the attention split-K
+        // SUBGROUP_SIZE is the per-pipeline effective subgroup size (paired
+        // with PipelineCompilationOptions::subgroup_size via
+        // `pick_subgroup_config`); MAX_CHUNKS is the attention split-K
         // partial-buffer / weights_sh dimension; N_EMBD_V4 is the per-model
         // x_sh dimension in matvec_q1_0_fused_normed (sized exactly so the
         // LDS allocation matches one model's row, maximizing WG-occupancy on
         // AMD RDNA, which allocates LDS in 1 KiB granularity per WG).
         let max_chunks = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
 
+        // Per-shader subgroup choice + spec-const value, computed from each
+        // shader's WG width via `pick_subgroup_config`.
+        let (sg_choice_rms, sg_spec_rms) = pick_subgroup_config(512, sg_min, sg_max);
+        let (sg_choice_attn_prefill_tiled, sg_spec_attn_prefill_tiled) =
+            pick_subgroup_config(32, sg_min, sg_max);
+        let (sg_choice_attn_split, sg_spec_attn_split) = pick_subgroup_config(64, sg_min, sg_max);
+        let (sg_choice_attn_merge, sg_spec_attn_merge) = pick_subgroup_config(128, sg_min, sg_max);
+        let (sg_choice_matvec_fused_normed, sg_spec_matvec_fused_normed) =
+            pick_subgroup_config(128, sg_min, sg_max);
+        let (sg_choice_kv_writeback_fused, sg_spec_kv_writeback_fused) =
+            pick_subgroup_config(128, sg_min, sg_max);
+        let (sg_choice_q_norm_rope_fused, sg_spec_q_norm_rope_fused) =
+            pick_subgroup_config(128, sg_min, sg_max);
+        let (sg_choice_rms_q8, sg_spec_rms_q8) = pick_subgroup_config(256, sg_min, sg_max);
+        let (sg_choice_silu_q8, sg_spec_silu_q8) = pick_subgroup_config(256, sg_min, sg_max);
+
         // Pre-flight: check the attention_merge LDS budget before shader compile.
-        // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs SG_PARTIAL_MAX
-        // f32 slots = ceil(WG=64 / subgroup_min_size) in the worst case.
-        let merge_lds_bytes =
-            4 * u64::from(max_chunks) + 4 * u64::from(64u32.div_ceil(subgroup_min_size));
+        // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs NUM_SUBGROUPS f32 slots.
+        let merge_num_subgroups = 128u32.div_ceil(sg_spec_attn_merge);
+        let merge_lds_bytes = 4 * u64::from(max_chunks) + 4 * u64::from(merge_num_subgroups);
         if merge_lds_bytes > u64::from(device.limits().max_compute_workgroup_storage_size) {
             return Err(PotError::Config(
                 "max_seq exceeds attention_merge LDS budget; reduce --max-seq",
@@ -1403,7 +1444,7 @@ impl Model {
 
         // SAFETY: every kernel ships as a precompiled SPIR-V binary built by
         // `build.rs` from a hand-written GLSL source under `src/shaders/`. The
-        // three former WGSL text substitutions (`{{SUBGROUP_MIN_SIZE}}`,
+        // three former WGSL text substitutions (`{{SUBGROUP_SIZE}}`,
         // `{{MAX_CHUNKS}}`, `{{N_EMBD_V4}}`) are now Vulkan specialization
         // constants at SpecId 0, 1, 2; we patch their `OpSpecConstant`
         // defaults in the SPIR-V at load time and feed the result through
@@ -1429,33 +1470,53 @@ impl Model {
                 }
             }};
         }
-        // Common spec-const lists, named for readability at the load sites.
-        let sg_only: &[(u32, u32)] = &[(SPEC_SUBGROUP_MIN_SIZE, subgroup_min_size)];
-        let sg_and_max_chunks: &[(u32, u32)] = &[
-            (SPEC_SUBGROUP_MIN_SIZE, subgroup_min_size),
-            (SPEC_MAX_CHUNKS, max_chunks),
-        ];
-        let sg_and_n_embd_v4: &[(u32, u32)] = &[
-            (SPEC_SUBGROUP_MIN_SIZE, subgroup_min_size),
-            (SPEC_N_EMBD_V4, cfg.n_embd / 4),
-        ];
         let no_spec: &[(u32, u32)] = &[];
 
         let sh_embed = load_spirv!("embed.comp", no_spec);
-        let sh_rms = load_spirv!("rms_norm.comp", sg_only);
+        let sh_rms = load_spirv!("rms_norm.comp", &[(SPEC_SUBGROUP_SIZE, sg_spec_rms)]);
         let sh_matvec = load_spirv!("matvec_q1_0.comp", no_spec);
         let sh_matvec_silu = load_spirv!("matvec_q1_0_silu.comp", no_spec);
-        let sh_matvec_fused_normed = load_spirv!("matvec_q1_0_fused_normed.comp", sg_and_n_embd_v4);
+        let sh_matvec_fused_normed = load_spirv!(
+            "matvec_q1_0_fused_normed.comp",
+            &[
+                (SPEC_SUBGROUP_SIZE, sg_spec_matvec_fused_normed),
+                (SPEC_N_EMBD_V4, cfg.n_embd / 4),
+            ]
+        );
         let sh_matmul = load_spirv!("matmul_q1_0_q8_0.comp", no_spec);
-        let sh_attn_prefill_tiled = load_spirv!("attention_prefill_tiled.comp", sg_only);
-        let sh_attn_split = load_spirv!("attention_split.comp", sg_only);
-        let sh_attn_merge = load_spirv!("attention_merge.comp", sg_and_max_chunks);
-        let sh_rms_q8 = load_spirv!("rms_norm_q8_0.comp", sg_only);
-        let sh_silu_q8 = load_spirv!("silu_mul_q8_0.comp", sg_only);
+        let sh_attn_prefill_tiled = load_spirv!(
+            "attention_prefill_tiled.comp",
+            &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_prefill_tiled)]
+        );
+        let sh_attn_split = load_spirv!(
+            "attention_split.comp",
+            &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_split)]
+        );
+        let sh_attn_merge = load_spirv!(
+            "attention_merge.comp",
+            &[
+                (SPEC_SUBGROUP_SIZE, sg_spec_attn_merge),
+                (SPEC_MAX_CHUNKS, max_chunks),
+            ]
+        );
+        let sh_rms_q8 = load_spirv!(
+            "rms_norm_q8_0.comp",
+            &[(SPEC_SUBGROUP_SIZE, sg_spec_rms_q8)]
+        );
+        let sh_silu_q8 = load_spirv!(
+            "silu_mul_q8_0.comp",
+            &[(SPEC_SUBGROUP_SIZE, sg_spec_silu_q8)]
+        );
         let sh_topk_partial = load_spirv!("topk_partial.comp", no_spec);
         let sh_topk_merge = load_spirv!("topk_merge.comp", no_spec);
-        let sh_kv_writeback_fused = load_spirv!("kv_writeback_fused.comp", sg_only);
-        let sh_q_norm_rope_fused = load_spirv!("q_norm_rope_fused.comp", sg_only);
+        let sh_kv_writeback_fused = load_spirv!(
+            "kv_writeback_fused.comp",
+            &[(SPEC_SUBGROUP_SIZE, sg_spec_kv_writeback_fused)]
+        );
+        let sh_q_norm_rope_fused = load_spirv!(
+            "q_norm_rope_fused.comp",
+            &[(SPEC_SUBGROUP_SIZE, sg_spec_q_norm_rope_fused)]
+        );
 
         let make_bgl =
             |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {
@@ -1489,7 +1550,8 @@ impl Model {
         let mk_pipe = |layout: &wgpu::BindGroupLayout,
                        sh: &wgpu::ShaderModule,
                        label: &str,
-                       imm_size: u32|
+                       imm_size: u32,
+                       subgroup_size: wgpu::SubgroupSize|
          -> wgpu::ComputePipeline {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{label}_pl")),
@@ -1507,6 +1569,7 @@ impl Model {
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     zero_initialize_workgroup_memory: false,
+                    subgroup_size,
                     ..Default::default()
                 },
                 cache: None,
@@ -1518,90 +1581,105 @@ impl Model {
                 &sh_embed,
                 "embed",
                 size_of::<EmbedParams>() as u32,
+                wgpu::SubgroupSize::Varying,
             ),
             rms_norm: mk_pipe(
                 &bgls.rms_norm,
                 &sh_rms,
                 "rms_norm",
                 size_of::<RmsNormParams>() as u32,
+                sg_choice_rms,
             ),
             matvec: mk_pipe(
                 &bgls.matvec,
                 &sh_matvec,
                 "matvec",
                 size_of::<MatvecParams>() as u32,
+                wgpu::SubgroupSize::Varying,
             ),
             matvec_silu: mk_pipe(
                 &bgls.matvec,
                 &sh_matvec_silu,
                 "matvec_silu",
                 size_of::<MatvecSiluParams>() as u32,
+                wgpu::SubgroupSize::Varying,
             ),
             matvec_fused_normed: mk_pipe(
                 &bgls.matvec_fused_normed,
                 &sh_matvec_fused_normed,
                 "matvec_fused_normed",
                 size_of::<MatvecFusedNormedParams>() as u32,
+                sg_choice_matvec_fused_normed,
             ),
             matmul: mk_pipe(
                 &bgls.matmul,
                 &sh_matmul,
                 "matmul",
                 size_of::<MatmulParams>() as u32,
+                wgpu::SubgroupSize::Varying,
             ),
             attention_prefill_tiled: mk_pipe(
                 &bgls.attn_prefill_tiled,
                 &sh_attn_prefill_tiled,
                 "attention_prefill_tiled",
                 size_of::<AttnPrefillTiledParams>() as u32,
+                sg_choice_attn_prefill_tiled,
             ),
             attention_split: mk_pipe(
                 &bgls.attn_split,
                 &sh_attn_split,
                 "attention_split",
                 size_of::<AttnSplitParams>() as u32,
+                sg_choice_attn_split,
             ),
             attention_merge: mk_pipe(
                 &bgls.attn_merge,
                 &sh_attn_merge,
                 "attention_merge",
                 size_of::<AttnMergeParams>() as u32,
+                sg_choice_attn_merge,
             ),
             rms_norm_q8_0: mk_pipe(
                 &bgls.rms_norm_q8_0,
                 &sh_rms_q8,
                 "rms_norm_q8_0",
                 size_of::<RmsNormQ8Params>() as u32,
+                sg_choice_rms_q8,
             ),
             silu_mul_q8_0: mk_pipe(
                 &bgls.silu_mul_q8_0,
                 &sh_silu_q8,
                 "silu_mul_q8_0",
                 size_of::<SiluMulQ8Params>() as u32,
+                sg_choice_silu_q8,
             ),
             topk_partial: mk_pipe(
                 &bgls.topk_partial,
                 &sh_topk_partial,
                 "topk_partial",
                 size_of::<TopKPartialParams>() as u32,
+                wgpu::SubgroupSize::Varying,
             ),
             topk_merge: mk_pipe(
                 &bgls.topk_merge,
                 &sh_topk_merge,
                 "topk_merge",
                 size_of::<TopKMergeParams>() as u32,
+                wgpu::SubgroupSize::Varying,
             ),
             kv_writeback_fused: mk_pipe(
                 &bgls.kv_writeback_fused,
                 &sh_kv_writeback_fused,
                 "kv_writeback_fused",
                 size_of::<KvWritebackFusedParams>() as u32,
+                sg_choice_kv_writeback_fused,
             ),
             q_norm_rope_fused: mk_pipe(
                 &bgls.q_norm_rope_fused,
                 &sh_q_norm_rope_fused,
                 "q_norm_rope_fused",
                 size_of::<QNormRopeFusedParams>() as u32,
+                sg_choice_q_norm_rope_fused,
             ),
         };
 
@@ -2013,6 +2091,50 @@ mod tests {
     }
 
     #[test]
+    fn pick_subgroup_config_branches() {
+        use wgpu::SubgroupSize;
+        // wave32 hardware (NVIDIA, Apple, Intel Gen12+, AMD wave32)
+        assert_eq!(
+            super::pick_subgroup_config(32, 32, 32),
+            (SubgroupSize::Varying, 32)
+        );
+        assert_eq!(
+            super::pick_subgroup_config(128, 32, 32),
+            (SubgroupSize::Full, 32)
+        );
+        assert_eq!(
+            super::pick_subgroup_config(512, 32, 32),
+            (SubgroupSize::Full, 32)
+        );
+        // wave64 hardware (default RDNA): WG=32 → small-WG branch (Varying, spec=WG).
+        assert_eq!(
+            super::pick_subgroup_config(32, 64, 64),
+            (SubgroupSize::Varying, 32)
+        );
+        assert_eq!(
+            super::pick_subgroup_config(64, 64, 64),
+            (SubgroupSize::Varying, 64)
+        );
+        assert_eq!(
+            super::pick_subgroup_config(128, 64, 64),
+            (SubgroupSize::Full, 64)
+        );
+        // mixed wave32-and-64 hardware (e.g. Intel Gen11): RDNA with cswave32.
+        assert_eq!(
+            super::pick_subgroup_config(32, 32, 64),
+            (SubgroupSize::Varying, 32)
+        );
+        assert_eq!(
+            super::pick_subgroup_config(64, 32, 64),
+            (SubgroupSize::Full, 64)
+        );
+        assert_eq!(
+            super::pick_subgroup_config(128, 32, 64),
+            (SubgroupSize::Full, 64)
+        );
+    }
+
+    #[test]
     fn act_layout_offsets_monotonic() {
         let cfg = bonsai4b_cfg();
         let m = ActLayout::build(&cfg, 512);
@@ -2039,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn spirv_patcher_rewrites_rms_norm_subgroup_min_size_default() {
+    fn spirv_patcher_rewrites_rms_norm_subgroup_size_default() {
         // Sanity-check the runtime SPIR-V patcher against the precompiled
         // rms_norm SPIR-V: the build emits OpSpecConstant with the GLSL
         // default of 32 for SpecId 0; after patching to 64, the default

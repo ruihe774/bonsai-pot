@@ -16,7 +16,7 @@
 // while accumulating ssq; after the cross-WG ssq reduce gives `inv_rms`,
 // stage 2 quantizes the staged values to Q8_0; stage 3 runs the matmul.
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 // `K_V4` = n_embd / 4, baked at load time per model so the LDS arrays fit
 // the actual row exactly. SpecConstant array sizes are evaluated post-
 // specialization so x_sh / a_qs_sh land at the per-model size.
@@ -66,12 +66,12 @@ const uint WG_Y = 16u;
 const uint WG = WG_X * WG_Y;
 const uint ROWS_PER_WG = WG_Y;
 
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 shared f16vec4 x_sh[K_V4];
 shared uint a_qs_sh[K_V4]; // K bytes packed as u32 (= K_V4)
 shared float a_d_sh[(K_V4 << 2) / 32];
-shared float sg_partial[SG_PARTIAL_MAX];
+shared float sg_partial[NUM_SUBGROUPS];
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -103,7 +103,7 @@ void main() {
     // ---- Stage 1.5: workgroup-wide ssq sum ----
     float sg_sum = subgroupAdd(ssq);
     float total;
-    if (gl_NumSubgroups == 1u) {
+    if (NUM_SUBGROUPS == 1u) {
         total = sg_sum;
     } else {
         if (gl_SubgroupInvocationID == 0u)
@@ -111,7 +111,7 @@ void main() {
         barrier();
         if (gl_SubgroupID == 0u) {
             float c = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
                 c = sg_partial[gl_SubgroupInvocationID];
             float f = subgroupAdd(c);
             if (gl_SubgroupInvocationID == 0u)

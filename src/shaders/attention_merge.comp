@@ -14,7 +14,7 @@
 //      across threads → l_global (subgroupAdd).
 //   C) Per-thread o accumulation using the precomputed weights, then write.
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 // MAX_CHUNKS is sized to opts.max_seq / ATTN_CHUNK_SIZE (=8) at load time.
 // SpecConstant-sized shared arrays are evaluated post-specialization, so
 // `weights_sh` lands at exactly the per-model size.
@@ -32,23 +32,23 @@ layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
 layout(set = 0, binding = 1, std430) readonly buffer Partials { float partials[]; };
 
 const uint WG = 128u;
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 const uint ELEMS_PER_THREAD = 1u;
 const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
-shared float sg_partial[SG_PARTIAL_MAX];
+shared float sg_partial[NUM_SUBGROUPS];
 shared float weights_sh[MAX_CHUNKS];
 
 float wg_max(float local_v) {
     float sg_m = subgroupMax(local_v);
-    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u)
+    if (NUM_SUBGROUPS == 1u)
         return sg_m;
     if (gl_SubgroupInvocationID == 0u)
         sg_partial[gl_SubgroupID] = sg_m;
     barrier();
     if (gl_SubgroupID == 0u) {
         float combined = -1e30;
-        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
             combined = sg_partial[gl_SubgroupInvocationID];
         float final_m = subgroupMax(combined);
         if (gl_SubgroupInvocationID == 0u)
@@ -60,14 +60,14 @@ float wg_max(float local_v) {
 
 float wg_sum(float local_v) {
     float sg_s = subgroupAdd(local_v);
-    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u)
+    if (NUM_SUBGROUPS == 1u)
         return sg_s;
     if (gl_SubgroupInvocationID == 0u)
         sg_partial[gl_SubgroupID] = sg_s;
     barrier();
     if (gl_SubgroupID == 0u) {
         float combined = 0.0;
-        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
             combined = sg_partial[gl_SubgroupInvocationID];
         float final_s = subgroupAdd(combined);
         if (gl_SubgroupInvocationID == 0u)

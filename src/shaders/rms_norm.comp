@@ -5,21 +5,17 @@
 #extension GL_EXT_shader_16bit_storage : require
 
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * w
-// The cross-subgroup-merge shmem is sized using SUBGROUP_MIN_SIZE as a
-// specialization constant (SpecId 0). At pipeline creation we patch the
-// OpSpecConstant default to the adapter's actual subgroup_min_size, so this
-// single binary serves all hardware. The follow-on SPIR-V optimizer folds
-// the post-specialization expression for SG_PARTIAL_MAX so the array lands
-// at exactly the right size.
+// SUBGROUP_SIZE (SpecId 0) is the per-pipeline effective subgroup size,
+// patched at load time. NUM_SUBGROUPS is therefore constant after
+// specialization, and the cross-subgroup merge below folds dead on hardware
+// where the WG fits into a single subgroup.
 //
 // dispatch: (n_groups, 1, 1)
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 const uint WG = 512;
-// Worst-case number of subgroups per workgroup. Drives the cross-subgroup
-// shmem size. The actual subgroup count comes from gl_NumSubgroups at runtime.
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1) / SUBGROUP_SIZE;
 
 layout(push_constant) uniform Params {
     uint group_size;
@@ -35,7 +31,7 @@ layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
 
 layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w[]; };
 
-shared float sg_partial[SG_PARTIAL_MAX];
+shared float sg_partial[NUM_SUBGROUPS];
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
@@ -54,11 +50,11 @@ void main() {
         s += v * v;
     }
 
-    // Workgroup-wide sum: subgroupAdd within subgroup, then if num_subgroups > 1
+    // Workgroup-wide sum: subgroupAdd within subgroup, then if NUM_SUBGROUPS > 1
     // merge per-subgroup totals via shmem and a second subgroupAdd in sg 0.
     float sg_sum = subgroupAdd(s);
     float total;
-    if (gl_NumSubgroups == 1u) {
+    if (NUM_SUBGROUPS == 1u) {
         total = sg_sum;
     } else {
         if (gl_SubgroupInvocationID == 0u) {
@@ -67,7 +63,7 @@ void main() {
         barrier();
         if (gl_SubgroupID == 0u) {
             float combined = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups) {
+            if (gl_SubgroupInvocationID < NUM_SUBGROUPS) {
                 combined = sg_partial[gl_SubgroupInvocationID];
             }
             float final_sum = subgroupAdd(combined);
