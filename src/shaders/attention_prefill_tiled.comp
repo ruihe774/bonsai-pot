@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
 
 // Q-tiled + GQA-batched FlashAttention-2 prefill kernel.
 //
@@ -14,9 +15,11 @@
 // and reused across all Q_TILE * Q_PER_GROUP queries within the workgroup.
 //
 // Q_TILE is fixed at 2 and the per-query state (Q registers, output
-// accumulators, online-softmax m/l) is **manually unrolled** as ml0/ml1
-// sets of named variables rather than `array<…, Q_TILE>` with dynamic
-// indexing — dynamic indexing causes NVIDIA to spill to local memory.
+// accumulators, online-softmax m/l) is held in small arrays indexed
+// inside `[[unroll]]` for-loops. The unroll attribute causes the
+// SPIR-V loop unroller (run by `spirv-opt -O` in build.rs) to rewrite
+// every array index as a constant before the driver compiler sees it,
+// so the arrays stay in registers — equivalent to manual unrolling.
 //
 // **Output is Q8_0 written directly to `outbuf` (act_q8)**: the Wo matmul
 // reads it as Q8_0 input. Per-block max-abs reduction uses subgroupShuffleXor
@@ -167,108 +170,103 @@ void main() {
     uint q_base0 = p.q_offset + m_idx0 * q_stride + g * Q_PER_GROUP * hd;
     uint q_base1 = p.q_offset + m_idx1 * q_stride + g * Q_PER_GROUP * hd;
 
-    uint d0 = tid;
-    uint d1 = tid + WG;
+    uint d_lane[ELEMS_PER_THREAD];
+    d_lane[0] = tid;
+    d_lane[1] = tid + WG;
 
-    // Per-thread Q registers — manually unrolled.
-    float q0_0_0 = float(act[q_base0 + 0u * hd + d0]); float q0_0_1 = float(act[q_base0 + 0u * hd + d1]);
-    float q0_1_0 = float(act[q_base0 + 1u * hd + d0]); float q0_1_1 = float(act[q_base0 + 1u * hd + d1]);
-    float q0_2_0 = float(act[q_base0 + 2u * hd + d0]); float q0_2_1 = float(act[q_base0 + 2u * hd + d1]);
-    float q0_3_0 = float(act[q_base0 + 3u * hd + d0]); float q0_3_1 = float(act[q_base0 + 3u * hd + d1]);
-    float q1_0_0 = float(act[q_base1 + 0u * hd + d0]); float q1_0_1 = float(act[q_base1 + 0u * hd + d1]);
-    float q1_1_0 = float(act[q_base1 + 1u * hd + d0]); float q1_1_1 = float(act[q_base1 + 1u * hd + d1]);
-    float q1_2_0 = float(act[q_base1 + 2u * hd + d0]); float q1_2_1 = float(act[q_base1 + 2u * hd + d1]);
-    float q1_3_0 = float(act[q_base1 + 3u * hd + d0]); float q1_3_1 = float(act[q_base1 + 3u * hd + d1]);
+    uint q_base[Q_TILE];
+    q_base[0] = q_base0;
+    q_base[1] = q_base1;
 
-    vec4 m_run0 = vec4(NEG_INF);
-    vec4 m_run1 = vec4(NEG_INF);
-    vec4 l_run0 = vec4(0.0);
-    vec4 l_run1 = vec4(0.0);
+    uint m_idx[Q_TILE];
+    m_idx[0] = m_idx0;
+    m_idx[1] = m_idx1;
 
-    float o0_0_0 = 0.0, o0_0_1 = 0.0, o0_1_0 = 0.0, o0_1_1 = 0.0;
-    float o0_2_0 = 0.0, o0_2_1 = 0.0, o0_3_0 = 0.0, o0_3_1 = 0.0;
-    float o1_0_0 = 0.0, o1_0_1 = 0.0, o1_1_0 = 0.0, o1_1_1 = 0.0;
-    float o1_2_0 = 0.0, o1_2_1 = 0.0, o1_3_0 = 0.0, o1_3_1 = 0.0;
+    bool ml_valid[Q_TILE];
+    ml_valid[0] = true;
+    ml_valid[1] = valid1;
+
+    // Per-thread Q registers, online-softmax (m/l) state, and output accumulators.
+    // [[unroll]] on every loop indexed into these arrays makes the indices
+    // compile-time constants in SPIR-V, so the arrays stay in registers.
+    float q[Q_TILE][Q_PER_GROUP][ELEMS_PER_THREAD];
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+                q[ml][pg][e] = float(act[q_base[ml] + pg * hd + d_lane[e]]);
+            }
+        }
+    }
+
+    vec4 m_run[Q_TILE];
+    vec4 l_run[Q_TILE];
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+        m_run[ml] = vec4(NEG_INF);
+        l_run[ml] = vec4(0.0);
+    }
+
+    float o[Q_TILE][Q_PER_GROUP][ELEMS_PER_THREAD];
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+                o[ml][pg][e] = 0.0;
+            }
+        }
+    }
 
     for (uint t = 0u; t < t_max; ++t) {
-        float k0 = load_k(t, g_off + d0);
-        float k1 = load_k(t, g_off + d1);
+        float k_e[ELEMS_PER_THREAD];
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+            k_e[e] = load_k(t, g_off + d_lane[e]);
+        }
 
-        // --- ml=0 ---
-        vec4 local0;
-        local0.x = q0_0_0 * k0 + q0_0_1 * k1;
-        local0.y = q0_1_0 * k0 + q0_1_1 * k1;
-        local0.z = q0_2_0 * k0 + q0_2_1 * k1;
-        local0.w = q0_3_0 * k0 + q0_3_1 * k1;
-        vec4 dots0 = wg_sum_v4(local0);
-        vec4 scores0 = (t <= p.pos_base + m_idx0) ? (dots0 * p.scale) : vec4(NEG_INF);
-        vec4 m_new0 = max(m_run0, scores0);
-        vec4 corr0 = exp(m_run0 - m_new0);
-        vec4 w0 = exp(scores0 - m_new0);
-        l_run0 = l_run0 * corr0 + w0;
-        m_run0 = m_new0;
+        vec4 corr[Q_TILE];
+        vec4 w_attn[Q_TILE];
+        [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+            vec4 local_dots;
+            [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
+                float d_acc = 0.0;
+                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+                    d_acc += q[ml][pg][e] * k_e[e];
+                }
+                local_dots[pg] = d_acc;
+            }
+            vec4 dots = wg_sum_v4(local_dots);
+            bool causal_ok = ml_valid[ml] && (t <= p.pos_base + m_idx[ml]);
+            vec4 scores = causal_ok ? (dots * p.scale) : vec4(NEG_INF);
+            vec4 m_new = max(m_run[ml], scores);
+            corr[ml] = exp(m_run[ml] - m_new);
+            w_attn[ml] = exp(scores - m_new);
+            l_run[ml] = l_run[ml] * corr[ml] + w_attn[ml];
+            m_run[ml] = m_new;
+        }
 
-        // --- ml=1 ---
-        vec4 local1;
-        local1.x = q1_0_0 * k0 + q1_0_1 * k1;
-        local1.y = q1_1_0 * k0 + q1_1_1 * k1;
-        local1.z = q1_2_0 * k0 + q1_2_1 * k1;
-        local1.w = q1_3_0 * k0 + q1_3_1 * k1;
-        vec4 dots1 = wg_sum_v4(local1);
-        vec4 scores1 = (valid1 && (t <= p.pos_base + m_idx1)) ? (dots1 * p.scale) : vec4(NEG_INF);
-        vec4 m_new1 = max(m_run1, scores1);
-        vec4 corr1 = exp(m_run1 - m_new1);
-        vec4 w1 = exp(scores1 - m_new1);
-        l_run1 = l_run1 * corr1 + w1;
-        m_run1 = m_new1;
+        float v_e[ELEMS_PER_THREAD];
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+            v_e[e] = load_v(t, g_off + d_lane[e]);
+        }
 
-        // Apply correction.
-        o0_0_0 *= corr0.x; o0_0_1 *= corr0.x;
-        o0_1_0 *= corr0.y; o0_1_1 *= corr0.y;
-        o0_2_0 *= corr0.z; o0_2_1 *= corr0.z;
-        o0_3_0 *= corr0.w; o0_3_1 *= corr0.w;
-        o1_0_0 *= corr1.x; o1_0_1 *= corr1.x;
-        o1_1_0 *= corr1.y; o1_1_1 *= corr1.y;
-        o1_2_0 *= corr1.z; o1_2_1 *= corr1.z;
-        o1_3_0 *= corr1.w; o1_3_1 *= corr1.w;
-
-        float v0 = load_v(t, g_off + d0);
-        float v1 = load_v(t, g_off + d1);
-        o0_0_0 += w0.x * v0; o0_0_1 += w0.x * v1;
-        o0_1_0 += w0.y * v0; o0_1_1 += w0.y * v1;
-        o0_2_0 += w0.z * v0; o0_2_1 += w0.z * v1;
-        o0_3_0 += w0.w * v0; o0_3_1 += w0.w * v1;
-        o1_0_0 += w1.x * v0; o1_0_1 += w1.x * v1;
-        o1_1_0 += w1.y * v0; o1_1_1 += w1.y * v1;
-        o1_2_0 += w1.z * v0; o1_2_1 += w1.z * v1;
-        o1_3_0 += w1.w * v0; o1_3_1 += w1.w * v1;
+        [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+            [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
+                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+                    o[ml][pg][e] = o[ml][pg][e] * corr[ml][pg] + w_attn[ml][pg] * v_e[e];
+                }
+            }
+        }
     }
 
     // ---- Normalize and write Q8_0 directly to outbuf ----
-    uint half_id = tid >> 5;                       // 0 or 1 → block-pair selector for d0/d1
+    uint half_id = tid >> 5;                       // 0 or 1 → block-pair selector for d_lane[0]/d_lane[1]
     uint nb_per_token = p.n_head * hd / 32u;       // = q_dim / 32 = 128
 
-    vec4 inv0 = vec4(1.0) / l_run0;
-    uint block_base0 = m_idx0 * nb_per_token + g * Q_PER_GROUP * 4u;
-    write_block(o0_0_0 * inv0.x, block_base0 + 0u * 4u + half_id + 0u);
-    write_block(o0_0_1 * inv0.x, block_base0 + 0u * 4u + half_id + 2u);
-    write_block(o0_1_0 * inv0.y, block_base0 + 1u * 4u + half_id + 0u);
-    write_block(o0_1_1 * inv0.y, block_base0 + 1u * 4u + half_id + 2u);
-    write_block(o0_2_0 * inv0.z, block_base0 + 2u * 4u + half_id + 0u);
-    write_block(o0_2_1 * inv0.z, block_base0 + 2u * 4u + half_id + 2u);
-    write_block(o0_3_0 * inv0.w, block_base0 + 3u * 4u + half_id + 0u);
-    write_block(o0_3_1 * inv0.w, block_base0 + 3u * 4u + half_id + 2u);
-
-    if (valid1) {
-        vec4 inv1 = vec4(1.0) / l_run1;
-        uint block_base1 = m_idx1 * nb_per_token + g * Q_PER_GROUP * 4u;
-        write_block(o1_0_0 * inv1.x, block_base1 + 0u * 4u + half_id + 0u);
-        write_block(o1_0_1 * inv1.x, block_base1 + 0u * 4u + half_id + 2u);
-        write_block(o1_1_0 * inv1.y, block_base1 + 1u * 4u + half_id + 0u);
-        write_block(o1_1_1 * inv1.y, block_base1 + 1u * 4u + half_id + 2u);
-        write_block(o1_2_0 * inv1.z, block_base1 + 2u * 4u + half_id + 0u);
-        write_block(o1_2_1 * inv1.z, block_base1 + 2u * 4u + half_id + 2u);
-        write_block(o1_3_0 * inv1.w, block_base1 + 3u * 4u + half_id + 0u);
-        write_block(o1_3_1 * inv1.w, block_base1 + 3u * 4u + half_id + 2u);
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+        if (!ml_valid[ml]) continue;
+        vec4 inv = vec4(1.0) / l_run[ml];
+        uint block_base = m_idx[ml] * nb_per_token + g * Q_PER_GROUP * 4u;
+        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+                write_block(o[ml][pg][e] * inv[pg], block_base + pg * 4u + half_id + e * 2u);
+            }
+        }
     }
 }

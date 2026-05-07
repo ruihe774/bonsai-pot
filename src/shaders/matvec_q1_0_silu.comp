@@ -4,6 +4,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
 
 // Q1_0 matvec with the SiLU·gate × up activation fold + in-LDS Q8_0 quantize.
 // See `matvec_q1_0.comp` for the tile / shuffle layout — only the per-block
@@ -80,51 +81,32 @@ void main() {
             uint g_v4_off = (p.gate_offset + elem_base) >> 2;
             uint u_v4_off = (p.up_offset + elem_base) >> 2;
 
-            f16vec4 v0, v1, v2, v3, v4, v5, v6, v7;
+            f16vec4 v[8];
             float16_t max_abs_h = float16_t(0.0);
-
-            #define LOAD_SILU(i, vname) { \
-                uint gb = (g_v4_off + (i)) << 2; \
-                uint ub = (u_v4_off + (i)) << 2; \
-                vec4 g = vec4(float(act[gb]), float(act[gb+1u]), float(act[gb+2u]), float(act[gb+3u])); \
-                f16vec4 u = f16vec4(act[ub], act[ub+1u], act[ub+2u], act[ub+3u]); \
-                vec4 s = g / (vec4(1.0) + exp(-g)); \
-                vname = f16vec4(s) * u; \
-                f16vec4 af = abs(vname); \
-                max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w))); \
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint gb = (g_v4_off + i) << 2;
+                uint ub = (u_v4_off + i) << 2;
+                vec4 g = vec4(float(act[gb]), float(act[gb+1u]), float(act[gb+2u]), float(act[gb+3u]));
+                f16vec4 u = f16vec4(act[ub], act[ub+1u], act[ub+2u], act[ub+3u]);
+                vec4 s = g / (vec4(1.0) + exp(-g));
+                v[i] = f16vec4(s) * u;
+                f16vec4 af = abs(v[i]);
+                max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
             }
-            LOAD_SILU(0u, v0)
-            LOAD_SILU(1u, v1)
-            LOAD_SILU(2u, v2)
-            LOAD_SILU(3u, v3)
-            LOAD_SILU(4u, v4)
-            LOAD_SILU(5u, v5)
-            LOAD_SILU(6u, v6)
-            LOAD_SILU(7u, v7)
-            #undef LOAD_SILU
 
             float max_abs = float(max_abs_h);
             float d = max_abs * (1.0 / 127.0);
             a_d_sh[tid] = d;
             float inv_max = 127.0 / max(max_abs, 1.0e-30);
 
-            #define PACK_QV(i, vname) { \
-                vec4 q = clamp(round(vec4(vname) * inv_max), vec4(-128.0), vec4(127.0)); \
-                a_qs_sh[(i) * TILE_NB_Q8 + tid] = \
-                      (uint(int(q.x)) & 0xFFu) \
-                    | ((uint(int(q.y)) & 0xFFu) <<  8) \
-                    | ((uint(int(q.z)) & 0xFFu) << 16) \
-                    | ((uint(int(q.w)) & 0xFFu) << 24); \
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                vec4 q = clamp(round(vec4(v[i]) * inv_max), vec4(-128.0), vec4(127.0));
+                a_qs_sh[i * TILE_NB_Q8 + tid] =
+                      (uint(int(q.x)) & 0xFFu)
+                    | ((uint(int(q.y)) & 0xFFu) <<  8)
+                    | ((uint(int(q.z)) & 0xFFu) << 16)
+                    | ((uint(int(q.w)) & 0xFFu) << 24);
             }
-            PACK_QV(0u, v0)
-            PACK_QV(1u, v1)
-            PACK_QV(2u, v2)
-            PACK_QV(3u, v3)
-            PACK_QV(4u, v4)
-            PACK_QV(5u, v5)
-            PACK_QV(6u, v6)
-            PACK_QV(7u, v7)
-            #undef PACK_QV
         }
         barrier();
 
@@ -136,12 +118,12 @@ void main() {
                 uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
                 uint a_block_local_base = b_local * 4u;
                 float sub_acc = 0.0;
-                for (uint s = 0u; s < 4u; ++s) {
+                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
                     uint qword = weights[qs_word_base + s];
                     float a_d = a_d_sh[a_block_local_base + s];
                     uint block_l = a_block_local_base + s;
                     int sumi = 0;
-                    for (uint i = 0u; i < 8u; ++i) {
+                    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                         uint bits = (qword >> (i * 4u)) & 0xFu;
                         uint w_packed = expand_4_bits(bits);
                         uint a_packed = a_qs_sh[i * TILE_NB_Q8 + block_l];

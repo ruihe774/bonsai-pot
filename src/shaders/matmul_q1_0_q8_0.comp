@@ -2,6 +2,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
 
 // dotPacked4x8EXT matmul: Q1_0 weights × Q8_0 activations -> f16 output.
 //
@@ -69,7 +70,7 @@ void main() {
     uint ly = tid / WG_N;
 
     float acc[16];
-    for (uint i = 0u; i < 16u; ++i) acc[i] = 0.0;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) acc[i] = 0.0;
 
     // Bonsai's matmul callers guarantee tile alignment / activation buffer
     // padding; OOB loads stay in LDS slots only their owner consults, and
@@ -95,7 +96,7 @@ void main() {
             uint off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
             a_d_lds[s * 64u + m_local] = uintBitsToFloat(acts[off >> 2]);
         }
-        for (uint li = 0u; li < 8u; ++li) {
+        [[unroll]] for (uint li = 0u; li < 8u; ++li) {
             uint idx = li * WG + tid;
             uint m_local = idx / 32u;
             uint su = idx % 32u;
@@ -105,92 +106,49 @@ void main() {
         }
         barrier();
 
-        float wd0 = w_d_lds[lx * TN + 0u];
-        float wd1 = w_d_lds[lx * TN + 1u];
-        float wd2 = w_d_lds[lx * TN + 2u];
-        float wd3 = w_d_lds[lx * TN + 3u];
+        float wd[TN];
+        [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+            wd[tn] = w_d_lds[lx * TN + tn];
+        }
 
-        for (uint s = 0u; s < 4u; ++s) {
-            uint w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7;
-            uint w1_0, w1_1, w1_2, w1_3, w1_4, w1_5, w1_6, w1_7;
-            uint w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7;
-            uint w3_0, w3_1, w3_2, w3_3, w3_4, w3_5, w3_6, w3_7;
-            #define UNPACK_W(idx, w0, w1, w2, w3, w4, w5, w6, w7) { \
-                uint bw = w_bits_lds[s * 64u + lx * TN + (idx)]; \
-                w0 = expand_4_bits((bw      ) & 0xFu); \
-                w1 = expand_4_bits((bw >>  4) & 0xFu); \
-                w2 = expand_4_bits((bw >>  8) & 0xFu); \
-                w3 = expand_4_bits((bw >> 12) & 0xFu); \
-                w4 = expand_4_bits((bw >> 16) & 0xFu); \
-                w5 = expand_4_bits((bw >> 20) & 0xFu); \
-                w6 = expand_4_bits((bw >> 24) & 0xFu); \
-                w7 = expand_4_bits((bw >> 28) & 0xFu); \
+        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+            uint w[TN][8];
+            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                uint bw = w_bits_lds[s * 64u + lx * TN + tn];
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                    w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu);
+                }
             }
-            UNPACK_W(0u, w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7)
-            UNPACK_W(1u, w1_0, w1_1, w1_2, w1_3, w1_4, w1_5, w1_6, w1_7)
-            UNPACK_W(2u, w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7)
-            UNPACK_W(3u, w3_0, w3_1, w3_2, w3_3, w3_4, w3_5, w3_6, w3_7)
-            #undef UNPACK_W
 
-            for (uint tm = 0u; tm < TM; ++tm) {
+            [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
                 uint m_local = ly * TM + tm;
                 float a_d = a_d_lds[s * 64u + m_local];
                 uint a_base = m_local * 32u + s * 8u;
-                uint a0 = a_qs_lds[a_base + 0u];
-                uint a1 = a_qs_lds[a_base + 1u];
-                uint a2 = a_qs_lds[a_base + 2u];
-                uint a3 = a_qs_lds[a_base + 3u];
-                uint a4 = a_qs_lds[a_base + 4u];
-                uint a5 = a_qs_lds[a_base + 5u];
-                uint a6 = a_qs_lds[a_base + 6u];
-                uint a7 = a_qs_lds[a_base + 7u];
+                uint a[8];
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                    a[i] = a_qs_lds[a_base + i];
+                }
 
-                int sumi0 = dotPacked4x8EXT(int(w0_0), int(a0));
-                int sumi1 = dotPacked4x8EXT(int(w1_0), int(a0));
-                int sumi2 = dotPacked4x8EXT(int(w2_0), int(a0));
-                int sumi3 = dotPacked4x8EXT(int(w3_0), int(a0));
-                sumi0 = dotPacked4x8EXT(int(w0_1), int(a1)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_1), int(a1)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_1), int(a1)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_1), int(a1)) + sumi3;
-                sumi0 = dotPacked4x8EXT(int(w0_2), int(a2)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_2), int(a2)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_2), int(a2)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_2), int(a2)) + sumi3;
-                sumi0 = dotPacked4x8EXT(int(w0_3), int(a3)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_3), int(a3)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_3), int(a3)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_3), int(a3)) + sumi3;
-                sumi0 = dotPacked4x8EXT(int(w0_4), int(a4)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_4), int(a4)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_4), int(a4)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_4), int(a4)) + sumi3;
-                sumi0 = dotPacked4x8EXT(int(w0_5), int(a5)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_5), int(a5)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_5), int(a5)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_5), int(a5)) + sumi3;
-                sumi0 = dotPacked4x8EXT(int(w0_6), int(a6)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_6), int(a6)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_6), int(a6)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_6), int(a6)) + sumi3;
-                sumi0 = dotPacked4x8EXT(int(w0_7), int(a7)) + sumi0;
-                sumi1 = dotPacked4x8EXT(int(w1_7), int(a7)) + sumi1;
-                sumi2 = dotPacked4x8EXT(int(w2_7), int(a7)) + sumi2;
-                sumi3 = dotPacked4x8EXT(int(w3_7), int(a7)) + sumi3;
+                int sumi[TN];
+                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) sumi[tn] = 0;
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                    [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                        sumi[tn] = dotPacked4x8EXT(int(w[tn][i]), int(a[i])) + sumi[tn];
+                    }
+                }
 
-                acc[tm * TN + 0u] += a_d * wd0 * float(sumi0);
-                acc[tm * TN + 1u] += a_d * wd1 * float(sumi1);
-                acc[tm * TN + 2u] += a_d * wd2 * float(sumi2);
-                acc[tm * TN + 3u] += a_d * wd3 * float(sumi3);
+                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                    acc[tm * TN + tn] += a_d * wd[tn] * float(sumi[tn]);
+                }
             }
         }
         barrier();
     }
 
-    for (uint tm = 0u; tm < TM; ++tm) {
+    [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
         uint m_idx = m_base + ly * TM + tm;
         if (m_idx >= p.m) continue;
-        for (uint tn = 0u; tn < TN; ++tn) {
+        [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
             uint n_idx = n_base + lx * TN + tn;
             if (n_idx >= p.n) continue;
             uint yi = p.out_offset + m_idx * p.n + n_idx;
