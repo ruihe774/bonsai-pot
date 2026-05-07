@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_control_flow_attributes2 : require
 
 // Multi-WG pass-1 of top-K reduction. Each workgroup processes a
 // `[wg.x * n_per_wg, min((wg.x+1)*n_per_wg, n))` slice of the f16 logits and
@@ -44,6 +46,8 @@ const float16_t NEG_INF_H = float16_t(-65504.0);
 
 void sift_down(uint base) {
     uint i = 0u;
+    // Heap depth is ceil(log2(K_MAX)) = 5; one extra iter for the early-out.
+    [[unroll, min_iterations(1), max_iterations(6), dependency_length(1)]]
     while (true) {
         uint l = 2u * i + 1u;
         uint r = l + 1u;
@@ -72,7 +76,7 @@ void main() {
     uint w_hi = (i_hi + 1u) >> 1;     // round up so we don't drop a trailing odd element
 
     // ---- Phase 1: build per-thread top-K min-heap.
-    for (uint i = 0u; i < K_MAX; ++i) {
+    [[unroll]] for (uint i = 0u; i < K_MAX; ++i) {
         sh_val[base + i] = NEG_INF_H;
         sh_idx[base + i] = 0u;
     }
@@ -99,11 +103,13 @@ void main() {
     }
 
     // ---- Phase 2a: heap-sort to descending. ----
+    [[unroll, min_iterations(31), max_iterations(31), dependency_length(1)]]
     for (uint active_minus1 = K_MAX - 1u; active_minus1 > 0u; --active_minus1) {
         uint last = base + active_minus1;
         float16_t tv = sh_val[base]; sh_val[base] = sh_val[last]; sh_val[last] = tv;
         uint ti = sh_idx[base]; sh_idx[base] = sh_idx[last]; sh_idx[last] = ti;
         uint i = 0u;
+        [[unroll, min_iterations(1), max_iterations(6), dependency_length(1)]]
         while (true) {
             uint l = 2u * i + 1u;
             uint r = l + 1u;
@@ -120,6 +126,8 @@ void main() {
 
     // ---- Phase 2b: parallel pairwise bitonic merge across all WG threads. ----
     uint s = WG / 2u;
+    // s halves each iter, so iter count = log2(WG/2) = 6 for WG=128.
+    [[unroll, min_iterations(6), max_iterations(6), dependency_length(1)]]
     while (s > 0u) {
         uint n_stage0 = s * K_MAX;
         for (uint k = tid; k < n_stage0; k += WG) {
@@ -139,6 +147,8 @@ void main() {
 
         uint n_perstage = s * (K_MAX / 2u);
         uint stride = K_MAX / 2u;
+        // stride halves each iter; K_MAX=32 so iter count = log2(K_MAX/2) = 4.
+        [[unroll, min_iterations(4), max_iterations(4), dependency_length(1)]]
         while (stride > 0u) {
             for (uint k = tid; k < n_perstage; k += WG) {
                 uint pair_id = k / (K_MAX / 2u);

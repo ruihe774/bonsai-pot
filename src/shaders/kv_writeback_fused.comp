@@ -4,6 +4,8 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_control_flow_attributes2 : require
 
 // Fused per-layer K-side pre-KV pipeline:
 //   rms_norm(K head) -> *w_k_norm -> NEOX-RoPE -> Q8_0 quantize -> write kv_k.
@@ -147,6 +149,8 @@ void main() {
         uint g_base = group_id * per_group;
         float mk = 0.0;
         float mv = 0.0;
+        // per_group is 4 for sg_size=8, 2 for sg_size=16 — both small.
+        [[unroll, min_iterations(2), max_iterations(4), dependency_length(1)]]
         for (uint i = 0u; i < per_group; ++i) {
             vec2 m = sg_partial[g_base + i];
             mk = max(mk, m.x);

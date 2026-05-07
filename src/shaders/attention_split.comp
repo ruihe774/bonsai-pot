@@ -3,6 +3,8 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_control_flow_attributes2 : require
 
 // Split-K + GQA-batched attention chunk pass for the matvec (m_tokens=1) path.
 //
@@ -117,12 +119,18 @@ void main() {
     float o1[ELEMS_PER_THREAD];
     float o2[ELEMS_PER_THREAD];
     float o3[ELEMS_PER_THREAD];
-    for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) { o0[i] = 0.0; o1[i] = 0.0; o2[i] = 0.0; o3[i] = 0.0; }
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) { o0[i] = 0.0; o1[i] = 0.0; o2[i] = 0.0; o3[i] = 0.0; }
     vec4 m = vec4(-1e30);
     vec4 l = vec4(0.0);
 
+    // t loop: at most CHUNK_SIZE=8 iterations (chunk_end - chunk_start <= 8).
+    // m/l/o[] are length-1 loop-carried.
+    [[unroll, min_iterations(1), max_iterations(8), dependency_length(1)]]
     for (uint t = chunk_start; t < chunk_end; ++t) {
         vec4 local_v = vec4(0.0);
+        // d loop: head_dim=128 elements with WG=64 stride → exactly 2 iters
+        // (= ELEMS_PER_THREAD). Pure reduction into local_v.
+        [[unroll, min_iterations(2), max_iterations(2), dependency_length(1)]]
         for (uint d = tid; d < hd; d += WG) {
             float k = load_k(t, g_off + d);
             float q0 = float(act[q_base0 + d]);
@@ -140,7 +148,7 @@ void main() {
         l = l * correction + weight;
         m = m_new;
 
-        for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+        [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
             uint d = tid + i * WG;
             float v = load_v(t, g_off + d);
             o0[i] = o0[i] * correction.x + weight.x * v;
@@ -159,7 +167,7 @@ void main() {
     uint base1 = h1 * stride_h + chunk * PARTIAL_STRIDE;
     uint base2 = h2 * stride_h + chunk * PARTIAL_STRIDE;
     uint base3 = h3 * stride_h + chunk * PARTIAL_STRIDE;
-    for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
         uint d = tid + i * WG;
         partials[base0 + d] = o0[i];
         partials[base1 + d] = o1[i];

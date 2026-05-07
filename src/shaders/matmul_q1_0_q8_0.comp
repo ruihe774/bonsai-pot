@@ -3,6 +3,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_control_flow_attributes2 : require
 
 // dotPacked4x8EXT matmul: Q1_0 weights × Q8_0 activations -> f16 output.
 //
@@ -75,6 +76,12 @@ void main() {
     // Bonsai's matmul callers guarantee tile alignment / activation buffer
     // padding; OOB loads stay in LDS slots only their owner consults, and
     // final writes are gated by m_idx < p.m.
+    //
+    // Loop hints: every Bonsai matmul caller picks K as a multiple of 512
+    // (n_embd=2560/3072, q_dim=2048, ffn=9728), so nb_q1 = K/128 is always a
+    // multiple of 4 and at least 16 (smallest case is Wo on 4B). The acc[]
+    // update is a length-1 loop carry (associative reduction).
+    [[unroll, min_iterations(16), iteration_multiple(4), dependency_length(1)]]
     for (uint b = 0u; b < nb_q1; ++b) {
         // ---- Cooperative loads ----
         if (tid < 64u) {

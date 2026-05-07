@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_control_flow_attributes2 : require
 
 // Pass-2 of the multi-WG top-K reduction. Reads `num_partials * K_MAX`
 // already-sorted-descending (f32 value, u32 index) pairs that pass-1
@@ -43,12 +45,12 @@ void main() {
 
     if (tid < p.num_partials) {
         uint slot_base = p.partials_off + tid * (2u * K_MAX);
-        for (uint i = 0u; i < K_MAX; ++i) {
+        [[unroll]] for (uint i = 0u; i < K_MAX; ++i) {
             sh_val[base + i] = float16_t(uintBitsToFloat(result[slot_base + i]));
             sh_idx[base + i] = result[slot_base + K_MAX + i];
         }
     } else {
-        for (uint i = 0u; i < K_MAX; ++i) {
+        [[unroll]] for (uint i = 0u; i < K_MAX; ++i) {
             sh_val[base + i] = NEG_INF_H;
             sh_idx[base + i] = 0u;
         }
@@ -57,6 +59,8 @@ void main() {
 
     // ---- Parallel pairwise bitonic merge across all WG threads. ----
     uint s = WG / 2u;
+    // s halves each iter; WG=64 → log2(WG/2) = 5 iters.
+    [[unroll, min_iterations(5), max_iterations(5), dependency_length(1)]]
     while (s > 0u) {
         uint n_stage0 = s * K_MAX;
         for (uint k = tid; k < n_stage0; k += WG) {
@@ -76,6 +80,8 @@ void main() {
 
         uint n_perstage = s * (K_MAX / 2u);
         uint stride = K_MAX / 2u;
+        // stride halves each iter; K_MAX=32 → log2(K_MAX/2) = 4 iters.
+        [[unroll, min_iterations(4), max_iterations(4), dependency_length(1)]]
         while (stride > 0u) {
             for (uint k = tid; k < n_perstage; k += WG) {
                 uint pair_id = k / (K_MAX / 2u);
@@ -103,6 +109,7 @@ void main() {
     // ---- Write top-K to result, descending by value. ----
     if (tid == 0u) {
         uint kk = min(p.k, K_MAX);
+        [[unroll, min_iterations(1), max_iterations(32), dependency_length(1)]]
         for (uint i = 0u; i < kk; ++i) {
             // CPU sampler reads f32; widen at the boundary.
             result[p.out_offset + i]      = floatBitsToUint(float(sh_val[i]));
