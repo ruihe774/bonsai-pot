@@ -17,7 +17,7 @@
 //
 // dispatch: (m, 1, 1) — one workgroup per token.
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout(push_constant) uniform Params {
     uint k;             // input dim, multiple of 256
@@ -36,22 +36,22 @@ layout(set = 0, binding = 2, std430) buffer OutBuf { uint outbuf[]; };
 const uint WG = 256u;
 const uint BLOCK_SIZE = 32u;
 const uint BLOCKS_PER_ITER = WG / BLOCK_SIZE; // 8
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
-shared float sg_partial[SG_PARTIAL_MAX];
+shared float sg_partial[NUM_SUBGROUPS];
 shared float inv_h_sh;
 shared uint qv_sh[256];
 
 float wg_sum_f32(float local_v) {
     float sg_sum = subgroupAdd(local_v);
-    if (gl_NumSubgroups == 1u)
+    if (NUM_SUBGROUPS == 1u)
         return sg_sum;
     if (gl_SubgroupInvocationID == 0u)
         sg_partial[gl_SubgroupID] = sg_sum;
     barrier();
     if (gl_SubgroupID == 0u) {
         float c = 0.0;
-        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
             c = sg_partial[gl_SubgroupInvocationID];
         float f = subgroupAdd(c);
         if (gl_SubgroupInvocationID == 0u)
@@ -108,7 +108,7 @@ void main() {
 
         // Pack 4 bytes per u32 (subgroup-shuffle path or LDS-staging fallback).
         uint packed;
-        if (SUBGROUP_MIN_SIZE >= 32u) {
+        if (SUBGROUP_SIZE >= 32u) {
             uint group4_in_block = lane_in_block & ~3u;
             uint tgt = sg_block_base | group4_in_block;
             packed = subgroupShuffle(qv, tgt + 0u) | (subgroupShuffle(qv, tgt + 1u) << 8) |

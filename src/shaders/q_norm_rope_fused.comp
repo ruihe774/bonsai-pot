@@ -12,7 +12,7 @@
 // Workgroup = head_dim (128). One workgroup per (head, token) processes one
 // Q head. Dispatch (n_head, m_tokens, 1).
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout(push_constant) uniform Params {
     uint q_off;        // f16 element offset of Q in act (q region base)
@@ -31,14 +31,14 @@ layout(set = 0, binding = 2, std430) readonly buffer RopeBuf { float16_t rope_cs
 const uint HEAD_DIM = 128u;
 const uint HALF_DIM = 64u;
 const uint WG = 128u;
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 // q_sh holds normed-and-weighted Q so RoPE can fetch each thread's pair partner
 // across the head-half boundary (partners always cross a subgroup boundary at
 // WG=128). After RoPE the rotated value lives in a register; q_sh is dead.
 shared float16_t q_sh[128];
-// Cross-subgroup merge slot for the RMS reduction (used only when num_subgroups > 1).
-shared float sg_partial[SG_PARTIAL_MAX];
+// Cross-subgroup merge slot for the RMS reduction (used only when NUM_SUBGROUPS > 1).
+shared float sg_partial[NUM_SUBGROUPS];
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -54,7 +54,7 @@ void main() {
     // ---- RMS-norm reduction over the Q head (sum of squares) ----
     float sg_sum = subgroupAdd(q_raw * q_raw);
     float total;
-    if (gl_NumSubgroups == 1u) {
+    if (NUM_SUBGROUPS == 1u) {
         total = sg_sum;
     } else {
         if (gl_SubgroupInvocationID == 0u)
@@ -62,7 +62,7 @@ void main() {
         barrier();
         if (gl_SubgroupID == 0u) {
             float c = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
                 c = sg_partial[gl_SubgroupInvocationID];
             float f = subgroupAdd(c);
             if (gl_SubgroupInvocationID == 0u)

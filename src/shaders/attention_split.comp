@@ -18,7 +18,7 @@
 // num_subgroups == 1 (e.g. RDNA wave64 with WG=64) and runs a runtime
 // cross-subgroup merge otherwise.
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout(push_constant) uniform Params {
     uint head_dim;
@@ -42,17 +42,17 @@ layout(set = 0, binding = 2, std430) readonly buffer VCache { uint v_cache[]; };
 layout(set = 0, binding = 3, std430) buffer Partials { float partials[]; };
 
 const uint WG = 64u;
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 const uint Q_PER_GROUP = 4u;
 const uint ELEMS_PER_THREAD = 2u; // head_dim (128) / WG (64)
 const uint CHUNK_SIZE = 8u;
 const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
-shared vec4 sg_partial4[SG_PARTIAL_MAX];
+shared vec4 sg_partial4[NUM_SUBGROUPS];
 
 vec4 wg_sum_v4(vec4 local_v) {
     vec4 sg_sum = subgroupAdd(local_v);
-    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) {
+    if (NUM_SUBGROUPS == 1u) {
         return sg_sum;
     }
     if (gl_SubgroupInvocationID == 0u)
@@ -60,7 +60,7 @@ vec4 wg_sum_v4(vec4 local_v) {
     barrier();
     if (gl_SubgroupID == 0u) {
         vec4 combined = vec4(0.0);
-        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
             combined = sg_partial4[gl_SubgroupInvocationID];
         vec4 final_sum = subgroupAdd(combined);
         if (gl_SubgroupInvocationID == 0u)

@@ -35,7 +35,7 @@ bench-internals = ["dep:env_logger"]
 
 [dependencies]
 # Library deps.
-wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "vulkan"] }
+wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "subgroup_control_v39", default-features = false, features = ["std", "parking_lot", "vulkan"] }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
@@ -68,6 +68,7 @@ expect_used = "warn"
 float_cmp = "allow"
 many_single_char_names = "allow"
 panic = "warn"
+similar_names = "allow"
 too_many_arguments = "allow"
 too_many_lines = "allow"
 unused_trait_names = "warn"

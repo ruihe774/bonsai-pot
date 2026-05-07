@@ -16,7 +16,7 @@
 // Workgroup = head_dim (128). One workgroup per (kv_head, token) writes one
 // head's worth of K and V into the cache. Dispatch (n_kv_head, m_tokens, 1).
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout(push_constant) uniform Params {
     uint k_cur_off;          // f16 element offset of K_cur in act
@@ -42,15 +42,15 @@ const uint HEAD_DIM = 128u;
 const uint HALF_DIM = 64u;
 const uint NB_PER_HEAD = HEAD_DIM / 32u;
 const uint WG = 128u;
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 // k_sh holds normed-and-weighted K so RoPE can fetch the pair partner across
 // the head-half boundary.
 shared float16_t k_sh[128];
-// Used by the RMS cross-subgroup merge (slot 0..num_subgroups; only .x), and
+// Used by the RMS cross-subgroup merge (slot 0..NUM_SUBGROUPS; only .x), and
 // by the amax cross-cluster merge (writes both .x=K, .y=V) when
-// SUBGROUP_MIN_SIZE < 32.
-shared vec2 sg_partial[SG_PARTIAL_MAX];
+// SUBGROUP_SIZE < 32.
+shared vec2 sg_partial[NUM_SUBGROUPS];
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -58,7 +58,6 @@ void main() {
     uint head = gl_WorkGroupID.x;
     uint tok = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
-    uint sg_size = gl_SubgroupSize;
 
     uint kv_token_off = tok * p.kv_dim + head * HEAD_DIM;
     float k_raw = float(act[p.k_cur_off + kv_token_off + tid]);
@@ -67,7 +66,7 @@ void main() {
     // ---- RMS-norm reduction over the K head (sum of squares) ----
     float sg_sum = subgroupAdd(k_raw * k_raw);
     float total;
-    if (gl_NumSubgroups == 1u) {
+    if (NUM_SUBGROUPS == 1u) {
         total = sg_sum;
     } else {
         if (gl_SubgroupInvocationID == 0u)
@@ -75,7 +74,7 @@ void main() {
         barrier();
         if (gl_SubgroupID == 0u) {
             float c = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
                 c = sg_partial[gl_SubgroupInvocationID].x;
             float f = subgroupAdd(c);
             if (gl_SubgroupInvocationID == 0u)
@@ -107,10 +106,10 @@ void main() {
     float k_post = float(k_post_h);
 
     // ---- Per-32-block amax for K and V via subgroup butterfly ----
-    // Masks 1/2/4 are always safe (subgroup_min_size >= 8 enforced at load
-    // time); 8/16 are gated by the larger of the baked min size and the
-    // runtime subgroup size. The stitch path runs only when no cluster
-    // covers a full 32-block.
+    // Masks 1/2/4 are always safe (SUBGROUP_SIZE >= 8 enforced at load time);
+    // 8/16 are gated by SUBGROUP_SIZE (folded after specialization). The
+    // stitch path runs only when SUBGROUP_SIZE < 32 (no cluster covers a
+    // full 32-block).
     float ak = abs(k_post);
     float av = abs(v_raw);
 
@@ -120,30 +119,30 @@ void main() {
     av = max(av, subgroupShuffleXor(av, 2u));
     ak = max(ak, subgroupShuffleXor(ak, 4u));
     av = max(av, subgroupShuffleXor(av, 4u));
-    if (SUBGROUP_MIN_SIZE >= 16u || sg_size >= 16u) {
+    if (SUBGROUP_SIZE >= 16u) {
         ak = max(ak, subgroupShuffleXor(ak, 8u));
         av = max(av, subgroupShuffleXor(av, 8u));
     }
-    if (SUBGROUP_MIN_SIZE >= 32u || sg_size >= 32u) {
+    if (SUBGROUP_SIZE >= 32u) {
         ak = max(ak, subgroupShuffleXor(ak, 16u));
         av = max(av, subgroupShuffleXor(av, 16u));
     }
-    if (SUBGROUP_MIN_SIZE < 32u && sg_size < 32u) {
+    if (SUBGROUP_SIZE < 32u) {
         // Stitch the in-subgroup partials into per-32 blocks. Each cluster of
-        // sg_size lanes contributes one entry; a 32-block spans 32/sg_size
-        // entries (2 for sg_size=16, 4 for sg_size=8).
-        uint sg_lane = tid % sg_size;
-        uint cluster_id = tid / sg_size;
+        // SUBGROUP_SIZE lanes contributes one entry; a 32-block spans
+        // 32/SUBGROUP_SIZE entries (2 for SUBGROUP_SIZE=16, 4 for =8).
+        uint sg_lane = tid % SUBGROUP_SIZE;
+        uint cluster_id = tid / SUBGROUP_SIZE;
         if (sg_lane == 0u) {
             sg_partial[cluster_id] = vec2(ak, av);
         }
         barrier();
         uint group_id = tid >> 5;
-        uint per_group = 32u / sg_size;
+        uint per_group = 32u / SUBGROUP_SIZE;
         uint g_base = group_id * per_group;
         float mk = 0.0;
         float mv = 0.0;
-        // per_group is 4 for sg_size=8, 2 for sg_size=16 — both small.
+        // per_group is 4 for SUBGROUP_SIZE=8, 2 for SUBGROUP_SIZE=16 — both small.
         [[unroll, min_iterations(2), max_iterations(4), dependency_length(1)]]
         for (uint i = 0u; i < per_group; ++i) {
             vec2 m = sg_partial[g_base + i];
@@ -165,7 +164,7 @@ void main() {
 
     // ---- Pack 4 bytes into one u32 via subgroup shuffle, write to cache ----
     // 4-lane clusters (tid % 4 == 0 lanes are the leaders) live entirely
-    // within one subgroup since SUBGROUP_MIN_SIZE >= 8, so subgroupShuffle can
+    // within one subgroup since SUBGROUP_SIZE >= 8, so subgroupShuffle can
     // gather the partner bytes without going through shmem. Shuffles are
     // unconditional (uniform CF requirement); only the leader writes.
     uint cluster_base = gl_SubgroupInvocationID & ~3u;

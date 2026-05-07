@@ -18,7 +18,7 @@
 // dispatch: (m, 1, 1) — one workgroup per token. Caller must guarantee
 // `(k/32) % 8 == 0`, which holds for k = n_ff = 9728 on Bonsai 4B/8B.
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout(push_constant) uniform Params {
     uint k;           // n_ff, multiple of 256
@@ -74,11 +74,11 @@ void main() {
         // Pack 4 bytes per u32. Two paths:
         //   - subgroup_size >= 32: subgroupShuffle within the 32-lane block.
         //   - else (Intel-class < 32): LDS staging.
-        // The constant_id-based SUBGROUP_MIN_SIZE is a specialization constant;
+        // The constant_id-based SUBGROUP_SIZE is a specialization constant;
         // glslc/SPIR-V tools fold the dead branch at pipeline create time once
         // the host patches the default operand to the adapter's actual value.
         uint packed;
-        if (SUBGROUP_MIN_SIZE >= 32u) {
+        if (SUBGROUP_SIZE >= 32u) {
             uint group4_in_block = lane_in_block & ~3u;
             uint tgt = sg_block_base | group4_in_block;
             packed = subgroupShuffle(qv, tgt + 0u) | (subgroupShuffle(qv, tgt + 1u) << 8) |

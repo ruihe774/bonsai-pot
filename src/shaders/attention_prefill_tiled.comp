@@ -44,7 +44,7 @@
 //   - n_head == n_kv_head * Q_PER_GROUP   (Q_PER_GROUP=4 for Bonsai 4B/8B)
 //   - subgroup_size >= 32                 (Q8_0 quantize butterfly)
 
-layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout(push_constant) uniform Params {
     uint head_dim;
@@ -70,17 +70,17 @@ layout(set = 0, binding = 2, std430) readonly buffer VCache { uint v_cache[]; };
 layout(set = 0, binding = 3, std430) buffer OutBuf { uint outbuf[]; };
 
 const uint WG = 32u;
-const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 const uint Q_PER_GROUP = 4u;
 const uint ELEMS_PER_THREAD = 4u;
 const uint Q_TILE = 2u;
 const float NEG_INF = -1.0e30;
 
-shared vec4 sg_partial4[SG_PARTIAL_MAX];
+shared vec4 sg_partial4[NUM_SUBGROUPS];
 
 vec4 wg_sum_v4(vec4 local_v) {
     vec4 sg_sum = subgroupAdd(local_v);
-    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) {
+    if (NUM_SUBGROUPS == 1u) {
         return sg_sum;
     }
     if (gl_SubgroupInvocationID == 0u)
@@ -88,7 +88,7 @@ vec4 wg_sum_v4(vec4 local_v) {
     barrier();
     if (gl_SubgroupID == 0u) {
         vec4 combined = vec4(0.0);
-        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
             combined = sg_partial4[gl_SubgroupInvocationID];
         vec4 final_sum = subgroupAdd(combined);
         if (gl_SubgroupInvocationID == 0u)
