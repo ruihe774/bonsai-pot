@@ -1447,7 +1447,7 @@ impl Model {
         let sh_matvec_silu = load_spirv!("matvec_q1_0_silu.comp", no_spec);
         let sh_matvec_fused_normed = load_spirv!("matvec_q1_0_fused_normed.comp", sg_and_n_embd_v4);
         let sh_matmul = load_spirv!("matmul_q1_0_q8_0.comp", no_spec);
-        let sh_attn_prefill_tiled = load_spirv!("attention_prefill_tiled.comp", no_spec);
+        let sh_attn_prefill_tiled = load_spirv!("attention_prefill_tiled.comp", sg_only);
         let sh_attn_split = load_spirv!("attention_split.comp", sg_only);
         let sh_attn_merge = load_spirv!("attention_merge.comp", sg_and_max_chunks);
         let sh_rms_q8 = load_spirv!("rms_norm_q8_0.comp", sg_only);
