@@ -119,10 +119,10 @@ Bonsai-4B / RX 9070 (RDNA4, default wave64), post-rewrite reference numbers:
 
 | test         | wall t/s | gpu t/s |
 |--------------|---------:|--------:|
-| pp512        |   ~2522  |  ~2555  |
-| tg128        |   ~253   |  ~325   |
-| e2e_pp632    |   ~2277  |    —    |
-| e2e_tg128    |   ~368   |    —    |
+| pp512        |   ~2510  |  ~2532  |
+| tg128        |   ~323   |  ~404   |
+| e2e_pp632    |   ~2284  |    —    |
+| e2e_tg128    |   ~385   |    —    |
 
 (For reference, the pre-rewrite pp512 was ≈ 2477 with std ±42; the means here differ by less than one combined standard deviation. Note also that `tg128` exercises `attention_split` / `attention_merge`, not `attention_prefill_tiled`, so any tg128 delta across this commit is unrelated to the kernel that was actually changed.)
 

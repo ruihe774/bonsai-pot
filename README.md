@@ -12,12 +12,12 @@ End-to-end throughput from `--mode bench --pp 512 --tg 128` (5 timed reps after 
 
 | GPU                         | model     | e2e_pp632 t/s        | e2e_tg128 t/s     |
 |-----------------------------|-----------|---------------------:|------------------:|
-| AMD RX 9070 (RDNA4, wave64) | Bonsai-4B | **1767.08** ± 6.40   | **308.06** ± 2.64 |
-| AMD RX 9070 (RDNA4, wave64) | Bonsai-8B |  993.42 ± 1.54       |  203.40 ± 1.89    |
+| AMD RX 9070 (RDNA4, wave64) | Bonsai-4B | **2283.52** ± 2.76   | **384.82** ± 1.09 |
+| AMD RX 9070 (RDNA4, wave64) | Bonsai-8B |  1293.56 ± 1.70      |  256.18 ± 1.17    |
 | NVIDIA GB10 (Blackwell, 32) | Bonsai-4B | 1595.47 ± 4.90       |  173.13 ± 1.76    |
 | NVIDIA GB10 (Blackwell, 32) | Bonsai-8B |  976.51 ± 8.22       |  121.46 ± 1.10    |
 
-`e2e_pp632` runs `Session::prefill` on a 632-token ChatML-wrapped prompt — long enough to exceed the `m_max=512` chunk cap and exercise the cross-chunk `pos_base` advancement. `e2e_tg128` runs `Session::generate` end-to-end with **stochastic top-K=32 sampling** (the GPU top-K reduction is the implicit top-K cap; the CPU does temperature → softmax → multinomial over those 32 candidates) and **encode pipelining** — the next step's command buffer is encoded on the CPU while the GPU drains the current step. So these are realistic chat-time numbers, not bare-forward microbenches. Both holds up at long context: on RX 9070, `e2e_tg1024` is ~272 t/s for 4B and ~187 t/s for 8B (~12% / ~8% drop vs `e2e_tg128`); bare-forward prefill (`--mode bench`, no sampler / no readback) goes pp512 ~1974, pp1024 ~1799, pp4096 ~1257 t/s, held together by the Q-tiled + GQA-batched FA-2 prefill kernel ([Attention](#attention)) — Q_TILE=2 × Q_PER_GROUP=4 means a single K[t] load is reused across 8 queries inside the workgroup, instead of being re-loaded once per Q-head per query.
+`e2e_pp632` runs `Session::prefill` on a 632-token ChatML-wrapped prompt — long enough to exceed the `m_max=512` chunk cap and exercise the cross-chunk `pos_base` advancement. `e2e_tg128` runs `Session::generate` end-to-end with **stochastic top-K=32 sampling** (the GPU top-K reduction is the implicit top-K cap; the CPU does temperature → softmax → multinomial over those 32 candidates) and **encode pipelining** — the next step's command buffer is encoded on the CPU while the GPU drains the current step. So these are realistic chat-time numbers, not bare-forward microbenches. Both holds up at long context: on RX 9070, `e2e_tg1024` is ~332 t/s for 4B and ~232 t/s for 8B (~14% / ~9% drop vs `e2e_tg128`); bare-forward prefill (`--mode bench`, no sampler / no readback) goes pp512 ~2510, pp1024 ~2300, pp4096 ~1564 t/s, held together by the Q-tiled + GQA-batched FA-2 prefill kernel ([Attention](#attention)) — Q_TILE=2 × Q_PER_GROUP=4 means a single K[t] load is reused across 8 queries inside the workgroup, instead of being re-loaded once per Q-head per query.
 
 ## What's in here
 
