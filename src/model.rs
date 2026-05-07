@@ -1058,16 +1058,27 @@ impl Model {
             };
             let pd = hal_adapter.raw_physical_device();
             let instance = hal_adapter.shared_instance().raw_instance();
-            let families = instance.get_physical_device_queue_family_properties(pd);
             // Prefer a compute-only family (no GRAPHICS bit) — the async
             // compute queue on AMD.  Fall back to family 0 if none found.
-            let family_idx: u32 = families
-                .iter()
-                .position(|p| {
-                    p.queue_flags.contains(vk::QueueFlags::COMPUTE)
-                        && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                })
-                .map_or(0, |i| i as u32);
+            // Under `bench-internals`, force family 0 because Nsight Graphics
+            // only profiles the graphics queue.
+            #[cfg(not(feature = "bench-internals"))]
+            let family_idx: u32 = {
+                let families = instance.get_physical_device_queue_family_properties(pd);
+                families
+                    .iter()
+                    .position(|p| {
+                        p.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                            && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                    })
+                    .map_or(0, |i| i as u32)
+            };
+            #[cfg(feature = "bench-internals")]
+            let family_idx: u32 = {
+                let _ = pd;
+                let _ = instance;
+                0
+            };
             log::info!(
                 "vk queue family {} (async_compute={})",
                 family_idx,
