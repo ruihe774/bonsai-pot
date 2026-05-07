@@ -342,6 +342,70 @@ impl ActLayout {
     }
 }
 
+// ----- SPIR-V specialization-constant patcher --------------------------------
+
+/// Specialization-constant ID convention used by every shader in this crate.
+/// `SpecId` 0 is the adapter's `subgroup_min_size`; `SpecId` 1 is `MAX_CHUNKS`
+/// (= `ceil(max_seq` / `ATTN_CHUNK_SIZE`)); `SpecId` 2 is `N_EMBD_V4` (= `n_embd` / 4).
+/// Shaders that don't use a given slot simply ignore it.
+pub const SPEC_SUBGROUP_MIN_SIZE: u32 = 0;
+pub const SPEC_MAX_CHUNKS: u32 = 1;
+pub const SPEC_N_EMBD_V4: u32 = 2;
+
+/// Patch the default value of an `OpSpecConstant` (32-bit type) in a SPIR-V
+/// module identified by its `SpecId` decoration. wgpu's passthrough shader
+/// path doesn't expose `VkSpecializationInfo` to the application, so we bake
+/// the runtime value into the SPIR-V's default operand instead — the result
+/// is observably equivalent because the spec constant is then used unchanged
+/// by every pipeline created from this module.
+///
+/// Encoding reference: SPIR-V spec §3, instruction stream is `(length<<16 |
+/// opcode)` words; `OpDecorate` is opcode 71 with the `SpecId` decoration
+/// numbered 1; `OpSpecConstant` is opcode 50 with layout `<type-id>
+/// <result-id> <literal…>`.
+#[allow(clippy::panic, reason = "shaders are compiled by us")]
+fn spirv_set_spec_const_u32(words: &mut [u32], spec_id: u32, value: u32) {
+    const MAGIC: u32 = 0x0723_0203;
+    const OP_DECORATE: u32 = 71;
+    const OP_SPEC_CONSTANT: u32 = 50;
+    const DEC_SPEC_ID: u32 = 1;
+
+    assert_eq!(words[0], MAGIC, "bad SPIR-V magic");
+    assert!(words.len() >= 5, "truncated SPIR-V header");
+
+    // Pass 1: locate the result-id decorated `SpecId <spec_id>`.
+    let mut target_id: Option<u32> = None;
+    let mut i = 5usize;
+    while i < words.len() {
+        let header = words[i];
+        let len = (header >> 16) as usize;
+        assert!(len > 0 && i + len <= words.len(), "malformed SPIR-V");
+        if (header & 0xFFFF) == OP_DECORATE
+            && len >= 4
+            && words[i + 2] == DEC_SPEC_ID
+            && words[i + 3] == spec_id
+        {
+            target_id = Some(words[i + 1]);
+            break;
+        }
+        i += len;
+    }
+    let target_id = target_id.unwrap_or_else(|| panic!("SpecId {spec_id} not found in SPIR-V"));
+
+    // Pass 2: find the matching OpSpecConstant and patch its default literal.
+    let mut i = 5usize;
+    while i < words.len() {
+        let header = words[i];
+        let len = (header >> 16) as usize;
+        if (header & 0xFFFF) == OP_SPEC_CONSTANT && len == 4 && words[i + 2] == target_id {
+            words[i + 3] = value;
+            return;
+        }
+        i += len;
+    }
+    panic!("OpSpecConstant for SpecId {spec_id} not found");
+}
+
 // ----- the model ------------------------------------------------------------
 
 pub struct Pipelines {
@@ -523,7 +587,7 @@ const STAGING_CHUNK: u64 = (M_MAX as u64 * 4).next_power_of_two();
 #[cfg(feature = "bench-internals")]
 pub const BENCH_QS_SLOTS: u32 = 2048;
 /// Cache positions per workgroup in the split-K attention pass. Must match
-/// `CHUNK_SIZE` in `attention_split.wgsl`.
+/// `CHUNK_SIZE` in `attention_split.comp`.
 pub const ATTN_CHUNK_SIZE: u32 = 8;
 /// System-wide GPU queue scheduling priority, passed via `VK_EXT_global_priority`.
 ///
@@ -930,24 +994,25 @@ impl Model {
         };
         log::info!("adapter: {:?}", adapter.get_info());
 
-        if !adapter.features().contains(wgpu::Features::SHADER_F16) {
+        let features = adapter.features();
+        if !features.contains(wgpu::Features::SHADER_F16) {
             return Err(PotError::FeatureUnsupported("SHADER_F16"));
         }
-        if !adapter.features().contains(wgpu::Features::SUBGROUP) {
+        if !features.contains(wgpu::Features::SUBGROUP) {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
-        if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
+        if !features.contains(wgpu::Features::IMMEDIATES) {
             return Err(PotError::FeatureUnsupported("IMMEDIATES"));
         }
+        if !features.contains(wgpu::Features::PASSTHROUGH_SHADERS) {
+            return Err(PotError::FeatureUnsupported("PASSTHROUGH_SHADERS"));
+        }
         #[cfg(feature = "bench-internals")]
-        if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+        if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
             return Err(PotError::FeatureUnsupported("TIMESTAMP_QUERY"));
         }
         #[cfg(feature = "bench-internals")]
-        if !adapter
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
-        {
+        if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
             return Err(PotError::FeatureUnsupported(
                 "TIMESTAMP_QUERY_INSIDE_PASSES",
             ));
@@ -975,8 +1040,11 @@ impl Model {
         // (MatvecFusedNormedParams, 72 bytes) with generous headroom.
         limits.max_immediate_size = limits.max_immediate_size.max(128);
 
-        let required_features =
-            wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP | wgpu::Features::IMMEDIATES | {
+        let required_features = wgpu::Features::SHADER_F16
+            | wgpu::Features::SUBGROUP
+            | wgpu::Features::IMMEDIATES
+            | wgpu::Features::PASSTHROUGH_SHADERS
+            | {
                 #[cfg(feature = "bench-internals")]
                 {
                     wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
@@ -1193,7 +1261,7 @@ impl Model {
         }
         if cfg.head_dim != 128 {
             return Err(PotError::Config(
-                "kv_writeback_fused.wgsl / q_norm_rope_fused.wgsl assume head_dim == 128",
+                "kv_writeback_fused.comp / q_norm_rope_fused.comp assume head_dim == 128",
             ));
         }
         let nb_per_row = u64::from(cfg.kv_dim / 32);
@@ -1334,19 +1402,15 @@ impl Model {
         };
 
         // ---- shaders & pipelines -------------------------------------------
-        // `{{SUBGROUP_MIN_SIZE}}` and `{{MAX_CHUNKS}}` are substituted with
-        // runtime values at load time; shaders that don't reference them get a
-        // pass-through `replace`. SUBGROUP_MIN_SIZE is used as a compile-time
-        // worst-case for cross-subgroup shmem sizing; actual subgroup counts
-        // are read from @builtin(num_subgroups) at runtime.
-        let subgroup_min_size_str = subgroup_min_size.to_string();
+        // The three load-time-known constants that used to be `{{...}}` text
+        // substitutions in WGSL are now Vulkan specialization constants in
+        // the SPIR-V binaries. SUBGROUP_MIN_SIZE caps the worst-case
+        // cross-subgroup shmem size; MAX_CHUNKS is the attention split-K
+        // partial-buffer / weights_sh dimension; N_EMBD_V4 is the per-model
+        // x_sh dimension in matvec_q1_0_fused_normed (sized exactly so the
+        // LDS allocation matches one model's row, maximizing WG-occupancy on
+        // AMD RDNA, which allocates LDS in 1 KiB granularity per WG).
         let max_chunks = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
-        let max_chunks_str = max_chunks.to_string();
-        // n_embd is baked into matvec_q1_0_fused_normed.wgsl so the in-LDS
-        // x_sh array is sized exactly to this model (5 KiB at 4B / 8 KiB at 8B)
-        // — this maximizes WG-occupancy on AMD RDNA, which allocates LDS in
-        // 1 KiB granularity per WG.
-        let n_embd_v4_str = (cfg.n_embd / 4).to_string();
 
         // Pre-flight: check the attention_merge LDS budget before shader compile.
         // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs SG_PARTIAL_MAX
@@ -1359,46 +1423,61 @@ impl Model {
             ));
         }
 
-        // SAFETY: all WGSL below is hand-written, statically validated by naga
-        // (wgpu still parses + validates with `bounds_checks=false`; only the
-        // *injection* of clamps into the emitted SPIR-V is skipped). The
-        // shaders are audited to never index out of bounds — every dynamic
-        // index is masked or clamped in WGSL before use, and every loop has a
-        // statically-bounded count. See the docs on
-        // `ShaderRuntimeChecks::unchecked` for the safety contract.
-        macro_rules! load_shader {
-            ($file:expr) => {{
-                let src: &str = include_str!(concat!("shaders/", $file));
-                let templated = src
-                    .replace("{{SUBGROUP_MIN_SIZE}}", &subgroup_min_size_str)
-                    .replace("{{MAX_CHUNKS}}", &max_chunks_str)
-                    .replace("{{N_EMBD_V4}}", &n_embd_v4_str);
+        // SAFETY: every kernel ships as a precompiled SPIR-V binary built by
+        // `build.rs` from a hand-written GLSL source under `src/shaders/`. The
+        // three former WGSL text substitutions (`{{SUBGROUP_MIN_SIZE}}`,
+        // `{{MAX_CHUNKS}}`, `{{N_EMBD_V4}}`) are now Vulkan specialization
+        // constants at SpecId 0, 1, 2; we patch their `OpSpecConstant`
+        // defaults in the SPIR-V at load time and feed the result through
+        // `create_shader_module_passthrough`, which bypasses naga entirely.
+        // The shaders are audited to never index out of bounds — every
+        // dynamic index is masked or clamped before use, and every loop has
+        // a statically-bounded count.
+        macro_rules! load_spirv {
+            ($name:expr, $spec_consts:expr) => {{
+                const SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+                let mut words: Vec<u32> = bytemuck::pod_collect_to_vec(SPV);
+                for &(id, value) in $spec_consts as &[(u32, u32)] {
+                    spirv_set_spec_const_u32(&mut words, id, value);
+                }
                 unsafe {
-                    device.create_shader_module_trusted(
-                        wgpu::ShaderModuleDescriptor {
-                            label: Some($file),
-                            source: wgpu::ShaderSource::Wgsl(templated.into()),
+                    device.create_shader_module_passthrough(
+                        wgpu::ShaderModuleDescriptorPassthrough {
+                            label: Some($name),
+                            spirv: Some(std::borrow::Cow::Owned(words)),
+                            ..Default::default()
                         },
-                        wgpu::ShaderRuntimeChecks::unchecked(),
                     )
                 }
             }};
         }
-        let sh_embed = load_shader!("embed.wgsl");
-        let sh_rms = load_shader!("rms_norm.wgsl");
-        let sh_matvec = load_shader!("matvec_q1_0.wgsl");
-        let sh_matvec_silu = load_shader!("matvec_q1_0_silu.wgsl");
-        let sh_matvec_fused_normed = load_shader!("matvec_q1_0_fused_normed.wgsl");
-        let sh_matmul = load_shader!("matmul_q1_0_q8_0.wgsl");
-        let sh_attn_prefill_tiled = load_shader!("attention_prefill_tiled.wgsl");
-        let sh_attn_split = load_shader!("attention_split.wgsl");
-        let sh_attn_merge = load_shader!("attention_merge.wgsl");
-        let sh_rms_q8 = load_shader!("rms_norm_q8_0.wgsl");
-        let sh_silu_q8 = load_shader!("silu_mul_q8_0.wgsl");
-        let sh_topk_partial = load_shader!("topk_partial.wgsl");
-        let sh_topk_merge = load_shader!("topk_merge.wgsl");
-        let sh_kv_writeback_fused = load_shader!("kv_writeback_fused.wgsl");
-        let sh_q_norm_rope_fused = load_shader!("q_norm_rope_fused.wgsl");
+        // Common spec-const lists, named for readability at the load sites.
+        let sg_only: &[(u32, u32)] = &[(SPEC_SUBGROUP_MIN_SIZE, subgroup_min_size)];
+        let sg_and_max_chunks: &[(u32, u32)] = &[
+            (SPEC_SUBGROUP_MIN_SIZE, subgroup_min_size),
+            (SPEC_MAX_CHUNKS, max_chunks),
+        ];
+        let sg_and_n_embd_v4: &[(u32, u32)] = &[
+            (SPEC_SUBGROUP_MIN_SIZE, subgroup_min_size),
+            (SPEC_N_EMBD_V4, cfg.n_embd / 4),
+        ];
+        let no_spec: &[(u32, u32)] = &[];
+
+        let sh_embed = load_spirv!("embed.comp", no_spec);
+        let sh_rms = load_spirv!("rms_norm.comp", sg_only);
+        let sh_matvec = load_spirv!("matvec_q1_0.comp", no_spec);
+        let sh_matvec_silu = load_spirv!("matvec_q1_0_silu.comp", no_spec);
+        let sh_matvec_fused_normed = load_spirv!("matvec_q1_0_fused_normed.comp", sg_and_n_embd_v4);
+        let sh_matmul = load_spirv!("matmul_q1_0_q8_0.comp", no_spec);
+        let sh_attn_prefill_tiled = load_spirv!("attention_prefill_tiled.comp", sg_only);
+        let sh_attn_split = load_spirv!("attention_split.comp", sg_only);
+        let sh_attn_merge = load_spirv!("attention_merge.comp", sg_and_max_chunks);
+        let sh_rms_q8 = load_spirv!("rms_norm_q8_0.comp", sg_only);
+        let sh_silu_q8 = load_spirv!("silu_mul_q8_0.comp", sg_only);
+        let sh_topk_partial = load_spirv!("topk_partial.comp", no_spec);
+        let sh_topk_merge = load_spirv!("topk_merge.comp", no_spec);
+        let sh_kv_writeback_fused = load_spirv!("kv_writeback_fused.comp", sg_only);
+        let sh_q_norm_rope_fused = load_spirv!("q_norm_rope_fused.comp", sg_only);
 
         let make_bgl =
             |label: &'static str, n_storage: u32, rw_mask: u32| -> wgpu::BindGroupLayout {
@@ -1979,6 +2058,43 @@ mod tests {
                 && m.gate < m.up
                 && m.up < m.logits
         );
+    }
+
+    #[test]
+    fn spirv_patcher_rewrites_rms_norm_subgroup_min_size_default() {
+        // Sanity-check the runtime SPIR-V patcher against the precompiled
+        // rms_norm SPIR-V: the build emits OpSpecConstant with the GLSL
+        // default of 32 for SpecId 0; after patching to 64, the default
+        // operand should read 64.
+        const RMS_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.comp.spv"));
+        let mut words: Vec<u32> = bytemuck::pod_collect_to_vec(RMS_SPV);
+        super::spirv_set_spec_const_u32(&mut words, 0, 64);
+
+        // Locate OpDecorate(SpecId, 0) → result-id, then the matching OpSpecConstant.
+        let mut target_id = None;
+        let mut i = 5;
+        while i < words.len() {
+            let header = words[i];
+            let len = (header >> 16) as usize;
+            if (header & 0xFFFF) == 71 && len >= 4 && words[i + 2] == 1 && words[i + 3] == 0 {
+                target_id = Some(words[i + 1]);
+                break;
+            }
+            i += len;
+        }
+        let target_id = target_id.expect("SpecId 0 decoration");
+        let mut i = 5;
+        let mut patched = None;
+        while i < words.len() {
+            let header = words[i];
+            let len = (header >> 16) as usize;
+            if (header & 0xFFFF) == 50 && len == 4 && words[i + 2] == target_id {
+                patched = Some(words[i + 3]);
+                break;
+            }
+            i += len;
+        }
+        assert_eq!(patched, Some(64));
     }
 
     #[test]

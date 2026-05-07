@@ -1,0 +1,196 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+
+// Multi-range Q1_0 matvec **fused with the preceding RMS-norm + scale**:
+// one dispatch produces output rows for 2 or 3 separate weight tensors that
+// share the same K dimension and the same input activation. Used for the
+// matvec single-token (tg) path's fused QKV (3 ranges) and gate+up (2 ranges).
+//
+// Inner matmul uses dotPacked4x8EXT: stage 1 stages `x*w_norm` to f16 LDS
+// while accumulating ssq; after the cross-WG ssq reduce gives `inv_rms`,
+// stage 2 quantizes the staged values to Q8_0; stage 3 runs the matmul.
+
+layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+// `K_V4` = n_embd / 4, baked at load time per model so the LDS arrays fit
+// the actual row exactly. SpecConstant array sizes are evaluated post-
+// specialization so x_sh / a_qs_sh land at the per-model size.
+layout(constant_id = 2) const uint K_V4 = 640;
+
+layout(push_constant) uniform Params {
+    uint k;
+    uint n_total;
+    uint input_offset;
+    uint dispatch_x_dim;
+    uint w_norm_off;
+    float eps;
+    uint d_offset_0; uint qs_offset_0; uint n_0; uint output_offset_0;
+    uint d_offset_1; uint qs_offset_1; uint n_1; uint output_offset_1;
+    uint d_offset_2; uint qs_offset_2; uint n_2; uint output_offset_2;
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf {
+    uint weights[];
+};
+layout(set = 0, binding = 1, std430) buffer ActBuf {
+    float16_t act[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer NormBuf {
+    float16_t w_norms[];
+};
+
+float load_f16_at(uint b_offset) {
+    uint word = weights[b_offset >> 2];
+    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
+    return unpackFloat2x16(half_bits).x;
+}
+
+uint expand_4_bits(uint bits) {
+    uint spread = (bits & 1u)
+                | ((bits & 2u) <<  7)
+                | ((bits & 4u) << 14)
+                | ((bits & 8u) << 21);
+    return ~(spread * 0xFEu);
+}
+
+const uint WG_X = 8u;
+const uint WG_Y = 16u;
+const uint WG = WG_X * WG_Y;
+const uint ROWS_PER_WG = WG_Y;
+
+const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+
+shared f16vec4 x_sh[K_V4];
+shared uint    a_qs_sh[K_V4];           // K bytes packed as u32 (= K_V4)
+shared float   a_d_sh[(K_V4 << 2) / 32];
+shared float   sg_partial[SG_PARTIAL_MAX];
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint K = K_V4 << 2;
+    uint NB_Q8 = K >> 5;
+    uint wg_idx = gl_WorkGroupID.y * p.dispatch_x_dim + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationIndex;
+    uint ty = tid / WG_X;
+    uint tx = tid % WG_X;
+    uint global_row = wg_idx * ROWS_PER_WG + ty;
+    bool valid = global_row < p.n_total;
+    uint nb_q1 = K / 128u;
+
+    // ---- Stage 1: load x and w_norm; stage `x * w_norm` into x_sh; accumulate ssq.
+    uint in_v4_off = p.input_offset >> 2;
+    uint w_v4_off = p.w_norm_off >> 2;
+    float ssq = 0.0;
+    for (uint v = tid; v < K_V4; v += WG) {
+        uint base = (in_v4_off + v) << 2;
+        f16vec4 xv4 = f16vec4(act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u]);
+        vec4 xv4f = vec4(xv4);
+        ssq += xv4f.x * xv4f.x + xv4f.y * xv4f.y + xv4f.z * xv4f.z + xv4f.w * xv4f.w;
+        uint w_base = (w_v4_off + v) << 2;
+        f16vec4 wv4 = f16vec4(w_norms[w_base + 0u], w_norms[w_base + 1u],
+                              w_norms[w_base + 2u], w_norms[w_base + 3u]);
+        x_sh[v] = xv4 * wv4;
+    }
+
+    // ---- Stage 1.5: workgroup-wide ssq sum ----
+    float sg_sum = subgroupAdd(ssq);
+    float total;
+    if (gl_NumSubgroups == 1u) {
+        total = sg_sum;
+    } else {
+        if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_sum;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float c = 0.0;
+            if (gl_SubgroupInvocationID < gl_NumSubgroups) c = sg_partial[gl_SubgroupInvocationID];
+            float f = subgroupAdd(c);
+            if (gl_SubgroupInvocationID == 0u) sg_partial[0] = f;
+        }
+        barrier();
+        total = sg_partial[0];
+    }
+    float inv_rms = inversesqrt(total / float(K) + p.eps);
+    barrier();
+
+    // ---- Stage 2: quantize each Q8_0 block (8 f16vec4) to Q8_0 ----
+    if (tid < NB_Q8) {
+        uint block_v4_base = tid * 8u;
+        float16_t max_abs_h = float16_t(0.0);
+        for (uint i = 0u; i < 8u; ++i) {
+            f16vec4 af = abs(x_sh[block_v4_base + i]);
+            max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
+        }
+        float max_abs = float(max_abs_h);
+        float d = max_abs * inv_rms * (1.0 / 127.0);
+        a_d_sh[tid] = d;
+        float inv_max = 127.0 / max(max_abs, 1.0e-30);
+        for (uint i = 0u; i < 8u; ++i) {
+            vec4 v = vec4(x_sh[block_v4_base + i]);
+            vec4 q = clamp(round(v * inv_max), vec4(-128.0), vec4(127.0));
+            uint q0 = uint(int(q.x)) & 0xFFu;
+            uint q1 = uint(int(q.y)) & 0xFFu;
+            uint q2 = uint(int(q.z)) & 0xFFu;
+            uint q3 = uint(int(q.w)) & 0xFFu;
+            a_qs_sh[i * NB_Q8 + tid] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+        }
+    }
+    barrier();
+
+    // ---- Stage 3: matvec inner loop ----
+    uint d_off = 0u;
+    uint qs_off = 0u;
+    uint out_off = 0u;
+    uint local_row = 0u;
+    if (valid) {
+        if (global_row < p.n_0) {
+            d_off = p.d_offset_0; qs_off = p.qs_offset_0;
+            out_off = p.output_offset_0; local_row = global_row;
+        } else if (global_row < p.n_0 + p.n_1) {
+            d_off = p.d_offset_1; qs_off = p.qs_offset_1;
+            out_off = p.output_offset_1; local_row = global_row - p.n_0;
+        } else {
+            d_off = p.d_offset_2; qs_off = p.qs_offset_2;
+            out_off = p.output_offset_2; local_row = global_row - p.n_0 - p.n_1;
+        }
+    }
+
+    uint row_d_byte  = d_off  + local_row * nb_q1 * 2u;
+    uint row_qs_byte = qs_off + local_row * nb_q1 * 16u;
+
+    float acc = 0.0;
+    if (valid) {
+        for (uint b = tx; b < nb_q1; b += WG_X) {
+            float d_w = load_f16_at(row_d_byte + b * 2u);
+            uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
+            uint a_block_base = b * 4u;
+            float sub_acc = 0.0;
+            for (uint s = 0u; s < 4u; ++s) {
+                uint qword = weights[qs_word_base + s];
+                float a_d = a_d_sh[a_block_base + s];
+                uint block_l = a_block_base + s;
+                int sumi = 0;
+                for (uint i = 0u; i < 8u; ++i) {
+                    uint bits = (qword >> (i * 4u)) & 0xFu;
+                    uint w_packed = expand_4_bits(bits);
+                    uint a_packed = a_qs_sh[i * NB_Q8 + block_l];
+                    sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;
+                }
+                sub_acc += a_d * float(sumi);
+            }
+            acc += d_w * sub_acc;
+        }
+    }
+
+    acc += subgroupShuffleXor(acc, 1u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 4u);
+    if (tx == 0u && valid) {
+        uint yi = out_off + local_row;
+        act[yi] = float16_t(acc);  // fused matvecs don't accumulate
+    }
+}

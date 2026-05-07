@@ -1,0 +1,121 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Combines per-chunk (m, l, o) partials produced by attention_split.comp into
+// the final attention output via a flash-attention-style log-sum-exp merge.
+//
+// dispatch: (n_head, 1, 1). One workgroup per Q head. Three phases:
+//   A) Parallel chunk-max reduction across threads → m_global (subgroupMax).
+//   B) Parallel weight precompute into shmem + parallel sum of l_c*weight
+//      across threads → l_global (subgroupAdd).
+//   C) Per-thread o accumulation using the precomputed weights, then write.
+
+layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+// MAX_CHUNKS is sized to opts.max_seq / ATTN_CHUNK_SIZE (=8) at load time.
+// SpecConstant-sized shared arrays are evaluated post-specialization, so
+// `weights_sh` lands at exactly the per-model size.
+layout(constant_id = 1) const uint MAX_CHUNKS = 128;
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint n_head;
+    uint out_offset;
+    uint n_chunks_active;
+} p;
+
+layout(set = 0, binding = 0, std430) buffer ActBuf {
+    float16_t act[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer Partials {
+    float partials[];
+};
+
+const uint WG = 128u;
+const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint ELEMS_PER_THREAD = 1u;
+const uint PARTIAL_STRIDE = 130u;  // head_dim + 2
+
+shared float sg_partial[SG_PARTIAL_MAX];
+shared float weights_sh[MAX_CHUNKS];
+
+float wg_max(float local_v) {
+    float sg_m = subgroupMax(local_v);
+    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) return sg_m;
+    if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_m;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float combined = -1e30;
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial[gl_SubgroupInvocationID];
+        float final_m = subgroupMax(combined);
+        if (gl_SubgroupInvocationID == 0u) sg_partial[0] = final_m;
+    }
+    barrier();
+    return sg_partial[0];
+}
+
+float wg_sum(float local_v) {
+    float sg_s = subgroupAdd(local_v);
+    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) return sg_s;
+    if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_s;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float combined = 0.0;
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial[gl_SubgroupInvocationID];
+        float final_s = subgroupAdd(combined);
+        if (gl_SubgroupInvocationID == 0u) sg_partial[0] = final_s;
+    }
+    barrier();
+    return sg_partial[0];
+}
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= p.n_head) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = p.head_dim;
+    uint n = p.n_chunks_active;
+    uint head_base = h * n * PARTIAL_STRIDE;
+
+    // Phase A: parallel max over chunk-local m's.
+    float m_local = -1e30;
+    for (uint c = tid; c < n; c += WG) {
+        m_local = max(m_local, partials[head_base + c * PARTIAL_STRIDE + hd]);
+    }
+    float m_global = wg_max(m_local);
+
+    // Phase B: parallel weight precompute + parallel l_global reduction.
+    float l_local = 0.0;
+    for (uint c = tid; c < n; c += WG) {
+        uint pb = head_base + c * PARTIAL_STRIDE;
+        float m_c = partials[pb + hd];
+        float l_c = partials[pb + hd + 1u];
+        float w = exp(m_c - m_global);
+        weights_sh[c] = w;
+        l_local += l_c * w;
+    }
+    float l_global = wg_sum(l_local);
+
+    // Phase C: per-thread o accumulation using precomputed weights.
+    float o[ELEMS_PER_THREAD];
+    for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) o[i] = 0.0;
+    for (uint c = 0u; c < n; ++c) {
+        uint pb = head_base + c * PARTIAL_STRIDE;
+        float weight = weights_sh[c];
+        for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+            uint d = tid + i * WG;
+            o[i] += partials[pb + d] * weight;
+        }
+    }
+
+    float inv_l = 1.0 / l_global;
+    uint out_base = p.out_offset + h * hd;
+    for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+        uint d = tid + i * WG;
+        act[out_base + d] = float16_t(o[i] * inv_l);
+    }
+}

@@ -1,0 +1,109 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Fused: y = silu(gate) * up  →  Q8_0 quantize  →  write to act_q8.
+//
+// Replaces the prefill-path pair `silu_mul` (writes act.ffn_in) +
+// `quantize_q8_0` (reads act.ffn_in, writes act_q8). The fused version keeps
+// each silu*up product in registers, computes per-32-block max-abs, and
+// writes Q8_0 directly.
+//
+// Output layout (matches `quantize_q8_0`):
+//   d (f32):  outbuf[d_offset/4 + token*nb_q8 + b]
+//   qs (i8):  outbuf[qs_offset/4 + (token*k + b*32)/4 + sub] for sub in 0..8
+//
+// dispatch: (m, 1, 1) — one workgroup per token. Caller must guarantee
+// `(k/32) % 8 == 0`, which holds for k = n_ff = 9728 on Bonsai 4B/8B.
+
+layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+
+layout(push_constant) uniform Params {
+    uint k;             // n_ff, multiple of 256
+    uint gate_offset;   // f16 elements
+    uint up_offset;     // f16 elements
+    uint d_offset;      // bytes (Q8_0 d-section, FP32 scales)
+    uint qs_offset;     // bytes (Q8_0 qs-section, packed i8)
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf {
+    float16_t act[];
+};
+layout(set = 0, binding = 1, std430) buffer OutBuf {
+    uint outbuf[];
+};
+
+const uint WG = 256u;
+const uint BLOCK_SIZE = 32u;
+const uint BLOCKS_PER_ITER = WG / BLOCK_SIZE;  // 8
+
+shared uint qv_sh[256];
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint token_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint nb_q8 = p.k / BLOCK_SIZE;
+    uint g_base = p.gate_offset + token_idx * p.k;
+    uint u_base = p.up_offset + token_idx * p.k;
+    uint qs_token_byte = p.qs_offset + token_idx * p.k;
+    uint d_token_word = (p.d_offset >> 2) + token_idx * nb_q8;
+
+    uint lane_in_block = tid & 31u;
+    uint block_within_iter = tid >> 5;
+    uint sg_block_base = gl_SubgroupInvocationID & ~31u;
+
+    uint n_iters = nb_q8 / BLOCKS_PER_ITER;
+    for (uint it = 0u; it < n_iters; ++it) {
+        uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
+        uint elem_idx = it * WG + tid;
+        float g = float(act[g_base + elem_idx]);
+        float silu = g / (1.0 + exp(-g));
+        float v = silu * float(act[u_base + elem_idx]);
+
+        float m = abs(v);
+        m = max(m, subgroupShuffleXor(m, 1u));
+        m = max(m, subgroupShuffleXor(m, 2u));
+        m = max(m, subgroupShuffleXor(m, 4u));
+        m = max(m, subgroupShuffleXor(m, 8u));
+        m = max(m, subgroupShuffleXor(m, 16u));
+        float d = m / 127.0;
+        float id_inv = (d > 0.0) ? (1.0 / d) : 0.0;
+        uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
+
+        // Pack 4 bytes per u32. Two paths:
+        //   - subgroup_size >= 32: subgroupShuffle within the 32-lane block.
+        //   - else (Intel-class < 32): LDS staging.
+        // The constant_id-based SUBGROUP_MIN_SIZE is a specialization constant;
+        // glslc/SPIR-V tools fold the dead branch at pipeline create time once
+        // the host patches the default operand to the adapter's actual value.
+        uint packed;
+        if (SUBGROUP_MIN_SIZE >= 32u) {
+            uint group4_in_block = lane_in_block & ~3u;
+            uint tgt = sg_block_base | group4_in_block;
+            packed = subgroupShuffle(qv, tgt + 0u)
+                   | (subgroupShuffle(qv, tgt + 1u) <<  8)
+                   | (subgroupShuffle(qv, tgt + 2u) << 16)
+                   | (subgroupShuffle(qv, tgt + 3u) << 24);
+        } else {
+            qv_sh[tid] = qv;
+            barrier();
+            uint base = (block_within_iter * 32u) + (lane_in_block & ~3u);
+            packed = qv_sh[base + 0u]
+                   | (qv_sh[base + 1u] <<  8)
+                   | (qv_sh[base + 2u] << 16)
+                   | (qv_sh[base + 3u] << 24);
+            barrier();
+        }
+        if ((lane_in_block & 3u) == 0u) {
+            uint qs_byte = qs_token_byte + block_global * 32u + lane_in_block;
+            outbuf[qs_byte >> 2] = packed;
+        }
+        if (lane_in_block == 0u) {
+            outbuf[d_token_word + block_global] = floatBitsToUint(d);
+        }
+    }
+}

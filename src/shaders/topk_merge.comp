@@ -1,0 +1,112 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Pass-2 of the multi-WG top-K reduction. Reads `num_partials * K_MAX`
+// already-sorted-descending (f32 value, u32 index) pairs that pass-1
+// (`topk_partial`) wrote into a scratch region of `result`, and produces the
+// global top-K.
+//
+// Each thread directly loads one partial slot into its own K_MAX-entry shmem
+// region (or `-inf` filler if `tid >= num_partials`), then runs the same
+// parallel pairwise bitonic merge tree as pass-1's phase 2b. Skipping the
+// per-thread heap-build/heap-sort phases is sound because each partial is
+// *already* descending — pass-1 emitted it that way.
+//
+// dispatch: (1, 1, 1)
+
+layout(push_constant) uniform Params {
+    uint partials_off;  // u32 word offset into `result` where pass-1 wrote
+    uint num_partials;  // # partial slots; <= WG
+    uint out_offset;    // u32 word offset for the final top-K output in `result`
+    uint k;
+} p;
+
+layout(set = 0, binding = 0, std430) buffer ResultBuf {
+    uint result[];
+};
+
+const uint WG = 64u;
+const uint K_MAX = 32u;
+
+// Logits enter at f16; demote to f16 in shmem (lossless; halves LDS: 8 KiB → 4 KiB).
+shared float16_t sh_val[2048];   // WG * K_MAX
+shared uint      sh_idx[2048];
+
+const float16_t NEG_INF_H = float16_t(-65504.0);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint base = tid * K_MAX;
+
+    if (tid < p.num_partials) {
+        uint slot_base = p.partials_off + tid * (2u * K_MAX);
+        for (uint i = 0u; i < K_MAX; ++i) {
+            sh_val[base + i] = float16_t(uintBitsToFloat(result[slot_base + i]));
+            sh_idx[base + i] = result[slot_base + K_MAX + i];
+        }
+    } else {
+        for (uint i = 0u; i < K_MAX; ++i) {
+            sh_val[base + i] = NEG_INF_H;
+            sh_idx[base + i] = 0u;
+        }
+    }
+    barrier();
+
+    // ---- Parallel pairwise bitonic merge across all WG threads. ----
+    uint s = WG / 2u;
+    while (s > 0u) {
+        uint n_stage0 = s * K_MAX;
+        for (uint k = tid; k < n_stage0; k += WG) {
+            uint pair_id = k / K_MAX;
+            uint i = k % K_MAX;
+            uint a_base = pair_id * K_MAX;
+            uint b_base = (pair_id + s) * K_MAX;
+            uint bi = K_MAX - 1u - i;
+            float16_t av = sh_val[a_base + i];
+            float16_t bv = sh_val[b_base + bi];
+            if (bv > av) {
+                sh_val[a_base + i] = bv;
+                sh_idx[a_base + i] = sh_idx[b_base + bi];
+            }
+        }
+        barrier();
+
+        uint n_perstage = s * (K_MAX / 2u);
+        uint stride = K_MAX / 2u;
+        while (stride > 0u) {
+            for (uint k = tid; k < n_perstage; k += WG) {
+                uint pair_id = k / (K_MAX / 2u);
+                uint local_k = k % (K_MAX / 2u);
+                uint lo = ((local_k & ~(stride - 1u)) << 1) | (local_k & (stride - 1u));
+                uint hi = lo | stride;
+                uint a_base = pair_id * K_MAX;
+                float16_t vlo = sh_val[a_base + lo];
+                float16_t vhi = sh_val[a_base + hi];
+                if (vhi > vlo) {
+                    uint ilo = sh_idx[a_base + lo];
+                    sh_val[a_base + lo] = vhi;
+                    sh_val[a_base + hi] = vlo;
+                    sh_idx[a_base + lo] = sh_idx[a_base + hi];
+                    sh_idx[a_base + hi] = ilo;
+                }
+            }
+            barrier();
+            stride = stride / 2u;
+        }
+
+        s = s / 2u;
+    }
+
+    // ---- Write top-K to result, descending by value. ----
+    if (tid == 0u) {
+        uint kk = min(p.k, K_MAX);
+        for (uint i = 0u; i < kk; ++i) {
+            // CPU sampler reads f32; widen at the boundary.
+            result[p.out_offset + i]      = floatBitsToUint(float(sh_val[i]));
+            result[p.out_offset + kk + i] = sh_idx[i];
+        }
+    }
+}

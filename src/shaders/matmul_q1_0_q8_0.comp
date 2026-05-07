@@ -1,0 +1,205 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+
+// dotPacked4x8EXT matmul: Q1_0 weights × Q8_0 activations -> f16 output.
+//
+// 64×64 tile, 256 threads, each thread = 4×4 = 16 cells.
+
+layout(push_constant) uniform Params {
+    uint k;
+    uint n;
+    uint m;
+    uint w_d_offset;
+    uint w_qs_offset;
+    uint a_d_offset;
+    uint a_qs_offset;
+    uint out_offset;
+    uint accumulate;
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf {
+    uint weights[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer ABuf {
+    uint acts[];
+};
+layout(set = 0, binding = 2, std430) buffer YBuf {
+    float16_t y[];
+};
+
+const uint WG_N = 16u;
+const uint WG_M = 16u;
+const uint WG = 256u;
+const uint TN = 4u;
+const uint TM = 4u;
+const uint TILE_N = 64u;
+const uint TILE_M = 64u;
+
+shared float w_d_lds[64];
+shared uint  w_bits_lds[256];
+shared float a_d_lds[256];
+shared uint  a_qs_lds[2048];
+
+float load_w_f16(uint b_offset) {
+    uint word = weights[b_offset >> 2];
+    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
+    return unpackFloat2x16(half_bits).x;
+}
+
+uint expand_4_bits(uint bits) {
+    uint spread = (bits & 1u)
+                | ((bits & 2u) <<  7)
+                | ((bits & 4u) << 14)
+                | ((bits & 8u) << 21);
+    return ~(spread * 0xFEu);
+}
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint n_base = gl_WorkGroupID.x * TILE_N;
+    uint m_base = gl_WorkGroupID.y * TILE_M;
+    uint nb_q1 = p.k / 128u;
+    uint nb_q8 = p.k / 32u;
+    uint tid = gl_LocalInvocationIndex;
+
+    uint lx = tid % WG_N;
+    uint ly = tid / WG_N;
+
+    float acc[16];
+    for (uint i = 0u; i < 16u; ++i) acc[i] = 0.0;
+
+    // Bonsai's matmul callers guarantee tile alignment / activation buffer
+    // padding; OOB loads stay in LDS slots only their owner consults, and
+    // final writes are gated by m_idx < p.m.
+    for (uint b = 0u; b < nb_q1; ++b) {
+        // ---- Cooperative loads ----
+        if (tid < 64u) {
+            uint n_idx = n_base + tid;
+            w_d_lds[tid] = load_w_f16(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
+        }
+        {
+            uint n_local = tid / 4u;
+            uint s = tid % 4u;
+            uint n_idx = n_base + n_local;
+            uint off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
+            w_bits_lds[s * 64u + n_local] = weights[off >> 2];
+        }
+        {
+            uint s = tid / 64u;
+            uint m_local = tid % 64u;
+            uint m_idx = m_base + m_local;
+            uint a_block = b * 4u + s;
+            uint off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
+            a_d_lds[s * 64u + m_local] = uintBitsToFloat(acts[off >> 2]);
+        }
+        for (uint li = 0u; li < 8u; ++li) {
+            uint idx = li * WG + tid;
+            uint m_local = idx / 32u;
+            uint su = idx % 32u;
+            uint m_idx = m_base + m_local;
+            uint off = p.a_qs_offset + m_idx * p.k + b * 128u + su * 4u;
+            a_qs_lds[m_local * 32u + su] = acts[off >> 2];
+        }
+        barrier();
+
+        float wd0 = w_d_lds[lx * TN + 0u];
+        float wd1 = w_d_lds[lx * TN + 1u];
+        float wd2 = w_d_lds[lx * TN + 2u];
+        float wd3 = w_d_lds[lx * TN + 3u];
+
+        for (uint s = 0u; s < 4u; ++s) {
+            uint w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7;
+            uint w1_0, w1_1, w1_2, w1_3, w1_4, w1_5, w1_6, w1_7;
+            uint w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7;
+            uint w3_0, w3_1, w3_2, w3_3, w3_4, w3_5, w3_6, w3_7;
+            #define UNPACK_W(idx, w0, w1, w2, w3, w4, w5, w6, w7) { \
+                uint bw = w_bits_lds[s * 64u + lx * TN + (idx)]; \
+                w0 = expand_4_bits((bw      ) & 0xFu); \
+                w1 = expand_4_bits((bw >>  4) & 0xFu); \
+                w2 = expand_4_bits((bw >>  8) & 0xFu); \
+                w3 = expand_4_bits((bw >> 12) & 0xFu); \
+                w4 = expand_4_bits((bw >> 16) & 0xFu); \
+                w5 = expand_4_bits((bw >> 20) & 0xFu); \
+                w6 = expand_4_bits((bw >> 24) & 0xFu); \
+                w7 = expand_4_bits((bw >> 28) & 0xFu); \
+            }
+            UNPACK_W(0u, w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7)
+            UNPACK_W(1u, w1_0, w1_1, w1_2, w1_3, w1_4, w1_5, w1_6, w1_7)
+            UNPACK_W(2u, w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7)
+            UNPACK_W(3u, w3_0, w3_1, w3_2, w3_3, w3_4, w3_5, w3_6, w3_7)
+            #undef UNPACK_W
+
+            for (uint tm = 0u; tm < TM; ++tm) {
+                uint m_local = ly * TM + tm;
+                float a_d = a_d_lds[s * 64u + m_local];
+                uint a_base = m_local * 32u + s * 8u;
+                uint a0 = a_qs_lds[a_base + 0u];
+                uint a1 = a_qs_lds[a_base + 1u];
+                uint a2 = a_qs_lds[a_base + 2u];
+                uint a3 = a_qs_lds[a_base + 3u];
+                uint a4 = a_qs_lds[a_base + 4u];
+                uint a5 = a_qs_lds[a_base + 5u];
+                uint a6 = a_qs_lds[a_base + 6u];
+                uint a7 = a_qs_lds[a_base + 7u];
+
+                int sumi0 = dotPacked4x8EXT(int(w0_0), int(a0));
+                int sumi1 = dotPacked4x8EXT(int(w1_0), int(a0));
+                int sumi2 = dotPacked4x8EXT(int(w2_0), int(a0));
+                int sumi3 = dotPacked4x8EXT(int(w3_0), int(a0));
+                sumi0 = dotPacked4x8EXT(int(w0_1), int(a1)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_1), int(a1)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_1), int(a1)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_1), int(a1)) + sumi3;
+                sumi0 = dotPacked4x8EXT(int(w0_2), int(a2)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_2), int(a2)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_2), int(a2)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_2), int(a2)) + sumi3;
+                sumi0 = dotPacked4x8EXT(int(w0_3), int(a3)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_3), int(a3)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_3), int(a3)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_3), int(a3)) + sumi3;
+                sumi0 = dotPacked4x8EXT(int(w0_4), int(a4)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_4), int(a4)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_4), int(a4)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_4), int(a4)) + sumi3;
+                sumi0 = dotPacked4x8EXT(int(w0_5), int(a5)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_5), int(a5)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_5), int(a5)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_5), int(a5)) + sumi3;
+                sumi0 = dotPacked4x8EXT(int(w0_6), int(a6)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_6), int(a6)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_6), int(a6)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_6), int(a6)) + sumi3;
+                sumi0 = dotPacked4x8EXT(int(w0_7), int(a7)) + sumi0;
+                sumi1 = dotPacked4x8EXT(int(w1_7), int(a7)) + sumi1;
+                sumi2 = dotPacked4x8EXT(int(w2_7), int(a7)) + sumi2;
+                sumi3 = dotPacked4x8EXT(int(w3_7), int(a7)) + sumi3;
+
+                acc[tm * TN + 0u] += a_d * wd0 * float(sumi0);
+                acc[tm * TN + 1u] += a_d * wd1 * float(sumi1);
+                acc[tm * TN + 2u] += a_d * wd2 * float(sumi2);
+                acc[tm * TN + 3u] += a_d * wd3 * float(sumi3);
+            }
+        }
+        barrier();
+    }
+
+    for (uint tm = 0u; tm < TM; ++tm) {
+        uint m_idx = m_base + ly * TM + tm;
+        if (m_idx >= p.m) continue;
+        for (uint tn = 0u; tn < TN; ++tn) {
+            uint n_idx = n_base + lx * TN + tn;
+            if (n_idx >= p.n) continue;
+            uint yi = p.out_offset + m_idx * p.n + n_idx;
+            float val = acc[tm * TN + tn];
+            if (p.accumulate != 0u) {
+                y[yi] = float16_t(float(y[yi]) + val);
+            } else {
+                y[yi] = float16_t(val);
+            }
+        }
+    }
+}

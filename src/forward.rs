@@ -311,7 +311,7 @@ fn dispatch_matvec_q1_0_silu(
 
 /// Fused: `rms_norm(x) * w_norm` → multi-range `Q1_0` matvec, in one dispatch.
 /// Replaces `dispatch_rms_norm + dispatch_matvec_q1_0_fused` for the matvec
-/// single-token path. See `shaders/matvec_q1_0_fused_normed.wgsl`.
+/// single-token path. See `shaders/matvec_q1_0_fused_normed.comp`.
 fn dispatch_matvec_q1_0_fused_normed(
     model: &Model,
     cfg: &Config,

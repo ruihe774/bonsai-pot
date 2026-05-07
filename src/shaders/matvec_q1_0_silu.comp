@@ -1,0 +1,169 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+
+// Q1_0 matvec with the SiLU·gate × up activation fold + in-LDS Q8_0 quantize.
+// See `matvec_q1_0.comp` for the tile / shuffle layout — only the per-block
+// loader differs (computes `silu(g) * u` on the fly instead of just loading
+// `act`).
+
+layout(push_constant) uniform Params {
+    uint k;
+    uint n;
+    uint d_offset;
+    uint qs_offset;
+    uint gate_offset;
+    uint up_offset;
+    uint output_offset;
+    uint accumulate;
+    uint dispatch_x_dim;
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf {
+    uint weights[];
+};
+layout(set = 0, binding = 1, std430) buffer ActBuf {
+    float16_t act[];
+};
+
+float load_f16_at(uint b_offset) {
+    uint word = weights[b_offset >> 2];
+    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
+    return unpackFloat2x16(half_bits).x;
+}
+
+uint expand_4_bits(uint bits) {
+    uint spread = (bits & 1u)
+                | ((bits & 2u) <<  7)
+                | ((bits & 4u) << 14)
+                | ((bits & 8u) << 21);
+    return ~(spread * 0xFEu);
+}
+
+const uint WG_X = 8u;
+const uint WG_Y = 16u;
+const uint WG = WG_X * WG_Y;
+const uint ROWS_PER_WG = WG_Y;
+const uint TILE_K = 4096u;
+const uint TILE_NB_Q8 = TILE_K / 32u;
+const uint TILE_QS_LEN = TILE_K >> 2;
+
+shared uint  a_qs_sh[TILE_QS_LEN];
+shared float a_d_sh[TILE_NB_Q8];
+
+layout(local_size_x = 8, local_size_y = 16, local_size_z = 1) in;
+
+void main() {
+    uint wg_idx = gl_WorkGroupID.y * p.dispatch_x_dim + gl_WorkGroupID.x;
+    uint row = wg_idx * ROWS_PER_WG + gl_LocalInvocationID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint tid = ty * WG_X + tx;
+    bool valid = row < p.n;
+    uint nb_q1 = p.k / 128u;
+
+    uint row_d_byte  = p.d_offset  + row * nb_q1 * 2u;
+    uint row_qs_byte = p.qs_offset + row * nb_q1 * 16u;
+
+    float acc = 0.0;
+
+    for (uint tile_start = 0u; tile_start < p.k; tile_start += TILE_K) {
+        uint tile_size = min(TILE_K, p.k - tile_start);
+        uint nb_q8_tile = tile_size / 32u;
+        uint nb_q1_tile = tile_size / 128u;
+
+        if (tid < nb_q8_tile) {
+            uint elem_base = tile_start + tid * 32u;
+            uint g_v4_off = (p.gate_offset + elem_base) >> 2;
+            uint u_v4_off = (p.up_offset + elem_base) >> 2;
+
+            f16vec4 v0, v1, v2, v3, v4, v5, v6, v7;
+            float16_t max_abs_h = float16_t(0.0);
+
+            #define LOAD_SILU(i, vname) { \
+                uint gb = (g_v4_off + (i)) << 2; \
+                uint ub = (u_v4_off + (i)) << 2; \
+                vec4 g = vec4(float(act[gb]), float(act[gb+1u]), float(act[gb+2u]), float(act[gb+3u])); \
+                f16vec4 u = f16vec4(act[ub], act[ub+1u], act[ub+2u], act[ub+3u]); \
+                vec4 s = g / (vec4(1.0) + exp(-g)); \
+                vname = f16vec4(s) * u; \
+                f16vec4 af = abs(vname); \
+                max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w))); \
+            }
+            LOAD_SILU(0u, v0)
+            LOAD_SILU(1u, v1)
+            LOAD_SILU(2u, v2)
+            LOAD_SILU(3u, v3)
+            LOAD_SILU(4u, v4)
+            LOAD_SILU(5u, v5)
+            LOAD_SILU(6u, v6)
+            LOAD_SILU(7u, v7)
+            #undef LOAD_SILU
+
+            float max_abs = float(max_abs_h);
+            float d = max_abs * (1.0 / 127.0);
+            a_d_sh[tid] = d;
+            float inv_max = 127.0 / max(max_abs, 1.0e-30);
+
+            #define PACK_QV(i, vname) { \
+                vec4 q = clamp(round(vec4(vname) * inv_max), vec4(-128.0), vec4(127.0)); \
+                a_qs_sh[(i) * TILE_NB_Q8 + tid] = \
+                      (uint(int(q.x)) & 0xFFu) \
+                    | ((uint(int(q.y)) & 0xFFu) <<  8) \
+                    | ((uint(int(q.z)) & 0xFFu) << 16) \
+                    | ((uint(int(q.w)) & 0xFFu) << 24); \
+            }
+            PACK_QV(0u, v0)
+            PACK_QV(1u, v1)
+            PACK_QV(2u, v2)
+            PACK_QV(3u, v3)
+            PACK_QV(4u, v4)
+            PACK_QV(5u, v5)
+            PACK_QV(6u, v6)
+            PACK_QV(7u, v7)
+            #undef PACK_QV
+        }
+        barrier();
+
+        if (valid) {
+            uint b_q1_base_global = tile_start / 128u;
+            for (uint b_local = tx; b_local < nb_q1_tile; b_local += WG_X) {
+                uint b = b_q1_base_global + b_local;
+                float d_w = load_f16_at(row_d_byte + b * 2u);
+                uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
+                uint a_block_local_base = b_local * 4u;
+                float sub_acc = 0.0;
+                for (uint s = 0u; s < 4u; ++s) {
+                    uint qword = weights[qs_word_base + s];
+                    float a_d = a_d_sh[a_block_local_base + s];
+                    uint block_l = a_block_local_base + s;
+                    int sumi = 0;
+                    for (uint i = 0u; i < 8u; ++i) {
+                        uint bits = (qword >> (i * 4u)) & 0xFu;
+                        uint w_packed = expand_4_bits(bits);
+                        uint a_packed = a_qs_sh[i * TILE_NB_Q8 + block_l];
+                        sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;
+                    }
+                    sub_acc += a_d * float(sumi);
+                }
+                acc += d_w * sub_acc;
+            }
+        }
+        barrier();
+    }
+
+    acc += subgroupShuffleXor(acc, 1u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 4u);
+    if (tx == 0u && valid) {
+        uint yi = p.output_offset + row;
+        if (p.accumulate != 0u) {
+            act[yi] = float16_t(float(act[yi]) + acc);
+        } else {
+            act[yi] = float16_t(acc);
+        }
+    }
+}

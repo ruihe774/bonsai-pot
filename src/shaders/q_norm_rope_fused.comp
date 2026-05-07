@@ -1,0 +1,98 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Fused per-layer Q-side pre-attention pipeline:
+//   rms_norm(Q head) -> *w_q_norm -> NEOX-RoPE -> write back to act.q (f16,
+//   in place).
+// Replaces a 2-dispatch sequence (rms_norm Q, rope Q) with 1.
+//
+// Workgroup = head_dim (128). One workgroup per (head, token) processes one
+// Q head. Dispatch (n_head, m_tokens, 1).
+
+layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+
+layout(push_constant) uniform Params {
+    uint q_off;          // f16 element offset of Q in act (q region base)
+    uint w_q_norm_off;   // f16 element offset of w_q_norm[0..head_dim] in w_norms
+    uint rope_offset;    // f16 element base offset into rope_cs (typically 0)
+    uint pos_base;       // first absolute RoPE position
+    uint q_dim;          // = n_head * head_dim
+    float eps;
+} p;
+
+layout(set = 0, binding = 0, std430) buffer ActBuf {
+    float16_t act[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer WBuf {
+    float16_t w_norms[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer RopeBuf {
+    float16_t rope_cs[];
+};
+
+const uint HEAD_DIM = 128u;
+const uint HALF_DIM = 64u;
+const uint WG = 128u;
+const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+
+// q_sh holds normed-and-weighted Q so RoPE can fetch each thread's pair partner
+// across the head-half boundary (partners always cross a subgroup boundary at
+// WG=128). After RoPE the rotated value lives in a register; q_sh is dead.
+shared float16_t q_sh[128];
+// Cross-subgroup merge slot for the RMS reduction (used only when num_subgroups > 1).
+shared float sg_partial[SG_PARTIAL_MAX];
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tok  = gl_WorkGroupID.y;
+    uint tid  = gl_LocalInvocationID.x;
+
+    uint q_token_off = tok * p.q_dim + head * HEAD_DIM;
+    uint q_idx = p.q_off + q_token_off + tid;
+    float q_raw = float(act[q_idx]);
+
+    // ---- RMS-norm reduction over the Q head (sum of squares) ----
+    float sg_sum = subgroupAdd(q_raw * q_raw);
+    float total;
+    if (gl_NumSubgroups == 1u) {
+        total = sg_sum;
+    } else {
+        if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_sum;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float c = 0.0;
+            if (gl_SubgroupInvocationID < gl_NumSubgroups) c = sg_partial[gl_SubgroupInvocationID];
+            float f = subgroupAdd(c);
+            if (gl_SubgroupInvocationID == 0u) sg_partial[0] = f;
+        }
+        barrier();
+        total = sg_partial[0];
+    }
+    float inv_h = inversesqrt(total / float(HEAD_DIM) + p.eps);
+
+    // ---- norm * weight, stash to shmem so RoPE can swap pairs ----
+    q_sh[tid] = float16_t(q_raw * inv_h) * w_norms[p.w_q_norm_off + tid];
+    barrier();
+
+    // ---- NEOX RoPE: each lane computes its own output ----
+    uint pos_abs = p.pos_base + tok;
+    uint cs_base = p.rope_offset + pos_abs * HEAD_DIM;
+    float16_t q_post;
+    if (tid < HALF_DIM) {
+        float16_t c = rope_cs[cs_base + tid * 2u];
+        float16_t s = rope_cs[cs_base + tid * 2u + 1u];
+        q_post = q_sh[tid] * c - q_sh[tid + HALF_DIM] * s;
+    } else {
+        uint j = tid - HALF_DIM;
+        float16_t c = rope_cs[cs_base + j * 2u];
+        float16_t s = rope_cs[cs_base + j * 2u + 1u];
+        q_post = q_sh[j] * s + q_sh[tid] * c;
+    }
+
+    act[q_idx] = q_post;
+}

@@ -1,0 +1,179 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Split-K + GQA-batched attention chunk pass for the matvec (m_tokens=1) path.
+//
+// dispatch: (n_kv_head, n_chunks_active, 1).
+//
+// Each workgroup handles one (kv_group, chunk) pair, scanning the cache slice
+// [chunk * CHUNK_SIZE, min((chunk+1) * CHUNK_SIZE, pos)) and producing partial
+// (m, l, o) state for all Q_PER_GROUP=4 Q heads that share this KV head. The
+// four Q·K dots are computed in parallel via vec4 packing and reduced through
+// wg_sum_v4 — a subgroupAdd that takes a single instruction when
+// num_subgroups == 1 (e.g. RDNA wave64 with WG=64) and runs a runtime
+// cross-subgroup merge otherwise.
+
+layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint n_head;
+    uint n_kv_head;
+    uint pos;
+    uint kv_stride;
+    uint q_offset;
+    uint k_d_word_offset;
+    uint k_qs_byte_offset;
+    uint v_d_word_offset;
+    uint v_qs_byte_offset;
+    uint n_chunks_active;
+    float scale;
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf {
+    float16_t act[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer KCache {
+    uint k_cache[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer VCache {
+    uint v_cache[];
+};
+layout(set = 0, binding = 3, std430) buffer Partials {
+    float partials[];
+};
+
+const uint WG = 64u;
+const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
+const uint Q_PER_GROUP = 4u;
+const uint ELEMS_PER_THREAD = 2u;  // head_dim (128) / WG (64)
+const uint CHUNK_SIZE = 8u;
+const uint PARTIAL_STRIDE = 130u;  // head_dim + 2
+
+shared vec4 sg_partial4[SG_PARTIAL_MAX];
+
+vec4 wg_sum_v4(vec4 local_v) {
+    vec4 sg_sum = subgroupAdd(local_v);
+    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) {
+        return sg_sum;
+    }
+    if (gl_SubgroupInvocationID == 0u) sg_partial4[gl_SubgroupID] = sg_sum;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        vec4 combined = vec4(0.0);
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial4[gl_SubgroupInvocationID];
+        vec4 final_sum = subgroupAdd(combined);
+        if (gl_SubgroupInvocationID == 0u) sg_partial4[0] = final_sum;
+    }
+    barrier();
+    return sg_partial4[0];
+}
+
+float load_k(uint t, uint e_local) {
+    uint elem_idx = t * p.kv_stride + e_local;
+    uint block_idx = elem_idx >> 5;
+    float scale = uintBitsToFloat(k_cache[p.k_d_word_offset + block_idx]);
+    uint qs_byte_idx = p.k_qs_byte_offset + elem_idx;
+    uint qs_word = k_cache[qs_byte_idx >> 2];
+    uint shift = (qs_byte_idx & 3u) << 3;
+    uint qs_byte = (qs_word >> shift) & 0xFFu;
+    int qs_signed = int(qs_byte << 24) >> 24;
+    return scale * float(qs_signed);
+}
+
+float load_v(uint t, uint e_local) {
+    uint elem_idx = t * p.kv_stride + e_local;
+    uint block_idx = elem_idx >> 5;
+    float scale = uintBitsToFloat(v_cache[p.v_d_word_offset + block_idx]);
+    uint qs_byte_idx = p.v_qs_byte_offset + elem_idx;
+    uint qs_word = v_cache[qs_byte_idx >> 2];
+    uint shift = (qs_byte_idx & 3u) << 3;
+    uint qs_byte = (qs_word >> shift) & 0xFFu;
+    int qs_signed = int(qs_byte << 24) >> 24;
+    return scale * float(qs_signed);
+}
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint chunk = gl_WorkGroupID.y;
+    if (g >= p.n_kv_head || chunk >= p.n_chunks_active) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = p.head_dim;
+    uint chunk_start = chunk * CHUNK_SIZE;
+    uint chunk_end = min(chunk_start + CHUNK_SIZE, p.pos);
+    uint g_off = g * hd;
+
+    uint q_base0 = p.q_offset + (g * Q_PER_GROUP + 0u) * hd;
+    uint q_base1 = p.q_offset + (g * Q_PER_GROUP + 1u) * hd;
+    uint q_base2 = p.q_offset + (g * Q_PER_GROUP + 2u) * hd;
+    uint q_base3 = p.q_offset + (g * Q_PER_GROUP + 3u) * hd;
+
+    float o0[ELEMS_PER_THREAD];
+    float o1[ELEMS_PER_THREAD];
+    float o2[ELEMS_PER_THREAD];
+    float o3[ELEMS_PER_THREAD];
+    for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) { o0[i] = 0.0; o1[i] = 0.0; o2[i] = 0.0; o3[i] = 0.0; }
+    vec4 m = vec4(-1e30);
+    vec4 l = vec4(0.0);
+
+    for (uint t = chunk_start; t < chunk_end; ++t) {
+        vec4 local_v = vec4(0.0);
+        for (uint d = tid; d < hd; d += WG) {
+            float k = load_k(t, g_off + d);
+            float q0 = float(act[q_base0 + d]);
+            float q1 = float(act[q_base1 + d]);
+            float q2 = float(act[q_base2 + d]);
+            float q3 = float(act[q_base3 + d]);
+            local_v += k * vec4(q0, q1, q2, q3);
+        }
+        vec4 dots = wg_sum_v4(local_v);
+        vec4 scores = dots * p.scale;
+
+        vec4 m_new = max(m, scores);
+        vec4 correction = exp(m - m_new);
+        vec4 weight = exp(scores - m_new);
+        l = l * correction + weight;
+        m = m_new;
+
+        for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+            uint d = tid + i * WG;
+            float v = load_v(t, g_off + d);
+            o0[i] = o0[i] * correction.x + weight.x * v;
+            o1[i] = o1[i] * correction.y + weight.y * v;
+            o2[i] = o2[i] * correction.z + weight.z * v;
+            o3[i] = o3[i] * correction.w + weight.w * v;
+        }
+    }
+
+    uint h0 = g * Q_PER_GROUP + 0u;
+    uint h1 = g * Q_PER_GROUP + 1u;
+    uint h2 = g * Q_PER_GROUP + 2u;
+    uint h3 = g * Q_PER_GROUP + 3u;
+    uint stride_h = p.n_chunks_active * PARTIAL_STRIDE;
+    uint base0 = h0 * stride_h + chunk * PARTIAL_STRIDE;
+    uint base1 = h1 * stride_h + chunk * PARTIAL_STRIDE;
+    uint base2 = h2 * stride_h + chunk * PARTIAL_STRIDE;
+    uint base3 = h3 * stride_h + chunk * PARTIAL_STRIDE;
+    for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+        uint d = tid + i * WG;
+        partials[base0 + d] = o0[i];
+        partials[base1 + d] = o1[i];
+        partials[base2 + d] = o2[i];
+        partials[base3 + d] = o3[i];
+    }
+    if (tid == 0u) {
+        partials[base0 + hd] = m.x;
+        partials[base0 + hd + 1u] = l.x;
+        partials[base1 + hd] = m.y;
+        partials[base1 + hd + 1u] = l.y;
+        partials[base2 + hd] = m.z;
+        partials[base2 + hd + 1u] = l.z;
+        partials[base3 + hd] = m.w;
+        partials[base3 + hd + 1u] = l.w;
+    }
+}
