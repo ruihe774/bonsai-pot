@@ -7,6 +7,7 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let debug_shaders = env::var("PROFILE").as_deref() == Ok("debug");
 
     // Every kernel runs as a precompiled SPIR-V shader module, fed to wgpu via
     // `create_shader_module_passthrough`. naga is bypassed entirely on the
@@ -45,12 +46,25 @@ fn main() {
         let opt_path = out_dir.join(format!("{name}.spv"));
         println!("cargo:rerun-if-changed={}", src_path.display());
 
-        let glslang_status = Command::new("glslangValidator")
+        let mut glslang = Command::new("glslangValidator");
+        glslang
             .arg("--target-env")
             .arg("vulkan1.3")
             .arg("-S")
             .arg("comp")
-            .arg("-V")
+            .arg("-V");
+        if debug_shaders {
+            // `-g` embeds OpSource (with the full GLSL source string),
+            // OpString filenames, and OpLine debug info, so RGP / Nsight /
+            // RenderDoc can show the original source against profiler
+            // samples. The follow-up `spirv-opt -O` preserves these
+            // (it does not implicitly `--strip-debug`). The richer
+            // `-gVS` (NonSemantic.Shader.DebugInfo) is *not* used because
+            // its `DebugTypeArray` instructions reject our spec-constant
+            // array sizes inside spirv-opt's legalisation passes.
+            glslang.arg("-g");
+        }
+        let glslang_status = glslang
             .arg(&src_path)
             .arg("-o")
             .arg(&raw_path)
