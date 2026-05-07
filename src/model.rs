@@ -342,19 +342,26 @@ pub const SPEC_N_EMBD_V4: u32 = 2;
 /// * `wg <= sg_min` → `Varying`, spec = `wg`. The hardware subgroup is
 ///   wider than the WG; only the first `wg` lanes are active. Subgroup
 ///   reductions still see only the active lanes.
-/// * `wg < sg_max`  → `Fixed(wg)`, spec = `wg`. The WG fit in the supported range.
-/// * `wg >= sg_max` → `Full`, spec = `sg_max`. The WG spans
-///   `wg / sg_max` full subgroups (driver picks a single size).
+/// * `wg < sg_max`  → `Fixed(wg)`, spec = `wg`. The WG fits exactly in one
+///   subgroup of the requested size (`wg % wg == 0`).
+/// * `wg >= sg_max` → `Fixed(sg_max)`, spec = `sg_max`. The WG spans
+///   `wg / sg_max` full subgroups. `Fixed` pins the runtime to `sg_max`,
+///   matching the spec-const (`wg % sg_max == 0` since both are POT and
+///   `wg >= sg_max`). `Full` is intentionally avoided here: after the
+///   upstream wgpu change it sets `ALLOW_VARYING_SUBGROUP_SIZE` alongside
+///   `REQUIRE_FULL_SUBGROUPS`, so the runtime is free to pick any size in
+///   `[sg_min, sg_max]` rather than `sg_max`, which would disagree with the
+///   spec-const baked into the shader.
 ///
-/// Order matters — `wg < sg_min` must be tested first, since `Fixed(wg)` is
-/// invalid in that case (the requested size must lie in `[sg_min, sg_max]`).
+/// Order matters — `wg <= sg_min` must be tested first, since `Fixed(wg)` is
+/// invalid when `wg < sg_min` (requested size must lie in `[sg_min, sg_max]`).
 pub const fn pick_subgroup_config(wg: u32, sg_min: u32, sg_max: u32) -> (wgpu::SubgroupSize, u32) {
     if wg <= sg_min {
         (wgpu::SubgroupSize::Varying, wg)
     } else if wg < sg_max {
         (wgpu::SubgroupSize::Fixed(wg), wg)
     } else {
-        (wgpu::SubgroupSize::Full, sg_max)
+        (wgpu::SubgroupSize::Fixed(sg_max), sg_max)
     }
 }
 
@@ -2100,11 +2107,11 @@ mod tests {
         );
         assert_eq!(
             super::pick_subgroup_config(128, 32, 32),
-            (SubgroupSize::Full, 32)
+            (SubgroupSize::Fixed(32), 32)
         );
         assert_eq!(
             super::pick_subgroup_config(512, 32, 32),
-            (SubgroupSize::Full, 32)
+            (SubgroupSize::Fixed(32), 32)
         );
         // wave64 hardware (default RDNA): WG=32 → small-WG branch (Varying, spec=WG).
         assert_eq!(
@@ -2117,7 +2124,7 @@ mod tests {
         );
         assert_eq!(
             super::pick_subgroup_config(128, 64, 64),
-            (SubgroupSize::Full, 64)
+            (SubgroupSize::Fixed(64), 64)
         );
         // mixed wave32-and-64 hardware (e.g. Intel Gen11): RDNA with cswave32.
         assert_eq!(
@@ -2126,11 +2133,11 @@ mod tests {
         );
         assert_eq!(
             super::pick_subgroup_config(64, 32, 64),
-            (SubgroupSize::Full, 64)
+            (SubgroupSize::Fixed(64), 64)
         );
         assert_eq!(
             super::pick_subgroup_config(128, 32, 64),
-            (SubgroupSize::Full, 64)
+            (SubgroupSize::Fixed(64), 64)
         );
     }
 
