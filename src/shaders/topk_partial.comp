@@ -25,22 +25,19 @@ layout(push_constant) uniform Params {
     uint in_offset;    // f16 element offset into `logits`; must be even
     uint partials_off; // u32 word offset into `result` for pass-1 scratch
     uint n_per_wg;     // # f16 logits assigned to each WG (last WG may overflow; clamped to n)
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer LogitsBuf {
-    uint logits[];
-};
-layout(set = 0, binding = 1, std430) buffer ResultBuf {
-    uint result[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer LogitsBuf { uint logits[]; };
+layout(set = 0, binding = 1, std430) buffer ResultBuf { uint result[]; };
 
 const uint WG = 128u;
 const uint K_MAX = 32u;
 
 // f16 LDS heap halves LDS use vs f32 (16 KiB → 8 KiB) and is lossless since
 // logits enter at f16 precision.
-shared float16_t sh_val[4096];   // WG * K_MAX
-shared uint      sh_idx[4096];
+shared float16_t sh_val[4096]; // WG * K_MAX
+shared uint sh_idx[4096];
 
 const float16_t NEG_INF_H = float16_t(-65504.0);
 
@@ -52,11 +49,18 @@ void sift_down(uint base) {
         uint l = 2u * i + 1u;
         uint r = l + 1u;
         uint smallest = i;
-        if (l < K_MAX && sh_val[base + l] < sh_val[base + smallest]) smallest = l;
-        if (r < K_MAX && sh_val[base + r] < sh_val[base + smallest]) smallest = r;
-        if (smallest == i) break;
-        float16_t tv = sh_val[base + i]; sh_val[base + i] = sh_val[base + smallest]; sh_val[base + smallest] = tv;
-        uint ti = sh_idx[base + i]; sh_idx[base + i] = sh_idx[base + smallest]; sh_idx[base + smallest] = ti;
+        if (l < K_MAX && sh_val[base + l] < sh_val[base + smallest])
+            smallest = l;
+        if (r < K_MAX && sh_val[base + r] < sh_val[base + smallest])
+            smallest = r;
+        if (smallest == i)
+            break;
+        float16_t tv = sh_val[base + i];
+        sh_val[base + i] = sh_val[base + smallest];
+        sh_val[base + smallest] = tv;
+        uint ti = sh_idx[base + i];
+        sh_idx[base + i] = sh_idx[base + smallest];
+        sh_idx[base + smallest] = ti;
         i = smallest;
     }
 }
@@ -72,8 +76,8 @@ void main() {
     uint i_lo = gl_WorkGroupID.x * p.n_per_wg;
     uint i_hi = min(i_lo + p.n_per_wg, p.n);
     uint in_word_off = p.in_offset >> 1;
-    uint w_lo = i_lo >> 1;            // i_lo is a multiple of 2 because n_per_wg is chosen even
-    uint w_hi = (i_hi + 1u) >> 1;     // round up so we don't drop a trailing odd element
+    uint w_lo = i_lo >> 1;        // i_lo is a multiple of 2 because n_per_wg is chosen even
+    uint w_hi = (i_hi + 1u) >> 1; // round up so we don't drop a trailing odd element
 
     // ---- Phase 1: build per-thread top-K min-heap.
     [[unroll]] for (uint i = 0u; i < K_MAX; ++i) {
@@ -106,19 +110,30 @@ void main() {
     [[unroll, min_iterations(31), max_iterations(31), dependency_length(1)]]
     for (uint active_minus1 = K_MAX - 1u; active_minus1 > 0u; --active_minus1) {
         uint last = base + active_minus1;
-        float16_t tv = sh_val[base]; sh_val[base] = sh_val[last]; sh_val[last] = tv;
-        uint ti = sh_idx[base]; sh_idx[base] = sh_idx[last]; sh_idx[last] = ti;
+        float16_t tv = sh_val[base];
+        sh_val[base] = sh_val[last];
+        sh_val[last] = tv;
+        uint ti = sh_idx[base];
+        sh_idx[base] = sh_idx[last];
+        sh_idx[last] = ti;
         uint i = 0u;
         [[unroll, min_iterations(1), max_iterations(6), dependency_length(1)]]
         while (true) {
             uint l = 2u * i + 1u;
             uint r = l + 1u;
             uint smallest = i;
-            if (l < active_minus1 && sh_val[base + l] < sh_val[base + smallest]) smallest = l;
-            if (r < active_minus1 && sh_val[base + r] < sh_val[base + smallest]) smallest = r;
-            if (smallest == i) break;
-            float16_t tv2 = sh_val[base + i]; sh_val[base + i] = sh_val[base + smallest]; sh_val[base + smallest] = tv2;
-            uint ti2 = sh_idx[base + i]; sh_idx[base + i] = sh_idx[base + smallest]; sh_idx[base + smallest] = ti2;
+            if (l < active_minus1 && sh_val[base + l] < sh_val[base + smallest])
+                smallest = l;
+            if (r < active_minus1 && sh_val[base + r] < sh_val[base + smallest])
+                smallest = r;
+            if (smallest == i)
+                break;
+            float16_t tv2 = sh_val[base + i];
+            sh_val[base + i] = sh_val[base + smallest];
+            sh_val[base + smallest] = tv2;
+            uint ti2 = sh_idx[base + i];
+            sh_idx[base + i] = sh_idx[base + smallest];
+            sh_idx[base + smallest] = ti2;
             i = smallest;
         }
     }
@@ -180,7 +195,7 @@ void main() {
     if (tid < K_MAX) {
         // Inter-pass storage stays f32 (untouched layout); widen the f16 LDS
         // value for free at the boundary.
-        result[slot_base + tid]         = floatBitsToUint(float(sh_val[tid]));
+        result[slot_base + tid] = floatBitsToUint(float(sh_val[tid]));
         result[slot_base + K_MAX + tid] = sh_idx[tid];
     }
 }

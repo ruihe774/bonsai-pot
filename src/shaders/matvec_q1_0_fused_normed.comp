@@ -29,20 +29,24 @@ layout(push_constant) uniform Params {
     uint dispatch_x_dim;
     uint w_norm_off;
     float eps;
-    uint d_offset_0; uint qs_offset_0; uint n_0; uint output_offset_0;
-    uint d_offset_1; uint qs_offset_1; uint n_1; uint output_offset_1;
-    uint d_offset_2; uint qs_offset_2; uint n_2; uint output_offset_2;
-} p;
+    uint d_offset_0;
+    uint qs_offset_0;
+    uint n_0;
+    uint output_offset_0;
+    uint d_offset_1;
+    uint qs_offset_1;
+    uint n_1;
+    uint output_offset_1;
+    uint d_offset_2;
+    uint qs_offset_2;
+    uint n_2;
+    uint output_offset_2;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer WBuf {
-    uint weights[];
-};
-layout(set = 0, binding = 1, std430) buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 2, std430) readonly buffer NormBuf {
-    float16_t w_norms[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
+layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 2, std430) readonly buffer NormBuf { float16_t w_norms[]; };
 
 float load_f16_at(uint b_offset) {
     uint word = weights[b_offset >> 2];
@@ -51,10 +55,7 @@ float load_f16_at(uint b_offset) {
 }
 
 uint expand_4_bits(uint bits) {
-    uint spread = (bits & 1u)
-                | ((bits & 2u) <<  7)
-                | ((bits & 4u) << 14)
-                | ((bits & 8u) << 21);
+    uint spread = (bits & 1u) | ((bits & 2u) << 7) | ((bits & 4u) << 14) | ((bits & 8u) << 21);
     return ~(spread * 0xFEu);
 }
 
@@ -66,9 +67,9 @@ const uint ROWS_PER_WG = WG_Y;
 const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
 shared f16vec4 x_sh[K_V4];
-shared uint    a_qs_sh[K_V4];           // K bytes packed as u32 (= K_V4)
-shared float   a_d_sh[(K_V4 << 2) / 32];
-shared float   sg_partial[SG_PARTIAL_MAX];
+shared uint a_qs_sh[K_V4]; // K bytes packed as u32 (= K_V4)
+shared float a_d_sh[(K_V4 << 2) / 32];
+shared float sg_partial[SG_PARTIAL_MAX];
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -93,8 +94,7 @@ void main() {
         vec4 xv4f = vec4(xv4);
         ssq += xv4f.x * xv4f.x + xv4f.y * xv4f.y + xv4f.z * xv4f.z + xv4f.w * xv4f.w;
         uint w_base = (w_v4_off + v) << 2;
-        f16vec4 wv4 = f16vec4(w_norms[w_base + 0u], w_norms[w_base + 1u],
-                              w_norms[w_base + 2u], w_norms[w_base + 3u]);
+        f16vec4 wv4 = f16vec4(w_norms[w_base + 0u], w_norms[w_base + 1u], w_norms[w_base + 2u], w_norms[w_base + 3u]);
         x_sh[v] = xv4 * wv4;
     }
 
@@ -104,13 +104,16 @@ void main() {
     if (gl_NumSubgroups == 1u) {
         total = sg_sum;
     } else {
-        if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_sum;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial[gl_SubgroupID] = sg_sum;
         barrier();
         if (gl_SubgroupID == 0u) {
             float c = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups) c = sg_partial[gl_SubgroupInvocationID];
+            if (gl_SubgroupInvocationID < gl_NumSubgroups)
+                c = sg_partial[gl_SubgroupInvocationID];
             float f = subgroupAdd(c);
-            if (gl_SubgroupInvocationID == 0u) sg_partial[0] = f;
+            if (gl_SubgroupInvocationID == 0u)
+                sg_partial[0] = f;
         }
         barrier();
         total = sg_partial[0];
@@ -149,18 +152,24 @@ void main() {
     uint local_row = 0u;
     if (valid) {
         if (global_row < p.n_0) {
-            d_off = p.d_offset_0; qs_off = p.qs_offset_0;
-            out_off = p.output_offset_0; local_row = global_row;
+            d_off = p.d_offset_0;
+            qs_off = p.qs_offset_0;
+            out_off = p.output_offset_0;
+            local_row = global_row;
         } else if (global_row < p.n_0 + p.n_1) {
-            d_off = p.d_offset_1; qs_off = p.qs_offset_1;
-            out_off = p.output_offset_1; local_row = global_row - p.n_0;
+            d_off = p.d_offset_1;
+            qs_off = p.qs_offset_1;
+            out_off = p.output_offset_1;
+            local_row = global_row - p.n_0;
         } else {
-            d_off = p.d_offset_2; qs_off = p.qs_offset_2;
-            out_off = p.output_offset_2; local_row = global_row - p.n_0 - p.n_1;
+            d_off = p.d_offset_2;
+            qs_off = p.qs_offset_2;
+            out_off = p.output_offset_2;
+            local_row = global_row - p.n_0 - p.n_1;
         }
     }
 
-    uint row_d_byte  = d_off  + local_row * nb_q1 * 2u;
+    uint row_d_byte = d_off + local_row * nb_q1 * 2u;
     uint row_qs_byte = qs_off + local_row * nb_q1 * 16u;
 
     float acc = 0.0;
@@ -192,6 +201,6 @@ void main() {
     acc += subgroupShuffleXor(acc, 4u);
     if (tx == 0u && valid) {
         uint yi = out_off + local_row;
-        act[yi] = float16_t(acc);  // fused matvecs don't accumulate
+        act[yi] = float16_t(acc); // fused matvecs don't accumulate
     }
 }

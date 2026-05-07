@@ -25,33 +25,34 @@ layout(push_constant) uniform Params {
     uint n_head;
     uint out_offset;
     uint n_chunks_active;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 1, std430) readonly buffer Partials {
-    float partials[];
-};
+layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Partials { float partials[]; };
 
 const uint WG = 128u;
 const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 const uint ELEMS_PER_THREAD = 1u;
-const uint PARTIAL_STRIDE = 130u;  // head_dim + 2
+const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
 shared float sg_partial[SG_PARTIAL_MAX];
 shared float weights_sh[MAX_CHUNKS];
 
 float wg_max(float local_v) {
     float sg_m = subgroupMax(local_v);
-    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) return sg_m;
-    if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_m;
+    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u)
+        return sg_m;
+    if (gl_SubgroupInvocationID == 0u)
+        sg_partial[gl_SubgroupID] = sg_m;
     barrier();
     if (gl_SubgroupID == 0u) {
         float combined = -1e30;
-        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial[gl_SubgroupInvocationID];
+        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            combined = sg_partial[gl_SubgroupInvocationID];
         float final_m = subgroupMax(combined);
-        if (gl_SubgroupInvocationID == 0u) sg_partial[0] = final_m;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial[0] = final_m;
     }
     barrier();
     return sg_partial[0];
@@ -59,14 +60,18 @@ float wg_max(float local_v) {
 
 float wg_sum(float local_v) {
     float sg_s = subgroupAdd(local_v);
-    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) return sg_s;
-    if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_s;
+    if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u)
+        return sg_s;
+    if (gl_SubgroupInvocationID == 0u)
+        sg_partial[gl_SubgroupID] = sg_s;
     barrier();
     if (gl_SubgroupID == 0u) {
         float combined = 0.0;
-        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial[gl_SubgroupInvocationID];
+        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            combined = sg_partial[gl_SubgroupInvocationID];
         float final_s = subgroupAdd(combined);
-        if (gl_SubgroupInvocationID == 0u) sg_partial[0] = final_s;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial[0] = final_s;
     }
     barrier();
     return sg_partial[0];
@@ -76,7 +81,8 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     uint h = gl_WorkGroupID.x;
-    if (h >= p.n_head) return;
+    if (h >= p.n_head)
+        return;
     uint tid = gl_LocalInvocationID.x;
     uint hd = p.head_dim;
     uint n = p.n_chunks_active;
@@ -103,7 +109,8 @@ void main() {
 
     // Phase C: per-thread o accumulation using precomputed weights.
     float o[ELEMS_PER_THREAD];
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) o[i] = 0.0;
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i)
+        o[i] = 0.0;
     for (uint c = 0u; c < n; ++c) {
         uint pb = head_base + c * PARTIAL_STRIDE;
         float weight = weights_sh[c];

@@ -18,22 +18,21 @@
 // dispatch: (1, 1, 1)
 
 layout(push_constant) uniform Params {
-    uint partials_off;  // u32 word offset into `result` where pass-1 wrote
-    uint num_partials;  // # partial slots; <= WG
-    uint out_offset;    // u32 word offset for the final top-K output in `result`
+    uint partials_off; // u32 word offset into `result` where pass-1 wrote
+    uint num_partials; // # partial slots; <= WG
+    uint out_offset;   // u32 word offset for the final top-K output in `result`
     uint k;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) buffer ResultBuf {
-    uint result[];
-};
+layout(set = 0, binding = 0, std430) buffer ResultBuf { uint result[]; };
 
 const uint WG = 64u;
 const uint K_MAX = 32u;
 
 // Logits enter at f16; demote to f16 in shmem (lossless; halves LDS: 8 KiB → 4 KiB).
-shared float16_t sh_val[2048];   // WG * K_MAX
-shared uint      sh_idx[2048];
+shared float16_t sh_val[2048]; // WG * K_MAX
+shared uint sh_idx[2048];
 
 const float16_t NEG_INF_H = float16_t(-65504.0);
 
@@ -112,7 +111,7 @@ void main() {
         [[unroll, min_iterations(1), max_iterations(32), dependency_length(1)]]
         for (uint i = 0u; i < kk; ++i) {
             // CPU sampler reads f32; widen at the boundary.
-            result[p.out_offset + i]      = floatBitsToUint(float(sh_val[i]));
+            result[p.out_offset + i] = floatBitsToUint(float(sh_val[i]));
             result[p.out_offset + kk + i] = sh_idx[i];
         }
     }

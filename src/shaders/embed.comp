@@ -12,22 +12,17 @@
 // 32 keeps the workgroup small and SIMD-aligned.)
 
 layout(push_constant) uniform Params {
-    uint k;             // n_embd
+    uint k; // n_embd
     uint d_offset;
     uint qs_offset;
     uint output_offset; // f16 elements
     uint sample_offset; // base index into sample[] for the input tokens
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer WBuf {
-    uint weights[];
-};
-layout(set = 0, binding = 1, std430) buffer ActBuf {
-    float16_t x[];
-};
-layout(set = 0, binding = 2, std430) readonly buffer SampleBuf {
-    uint sample_in[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
+layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t x[]; };
+layout(set = 0, binding = 2, std430) readonly buffer SampleBuf { uint sample_in[]; };
 
 uint load_half_bits(uint b_offset) {
     uint word = weights[b_offset >> 2];
@@ -45,7 +40,8 @@ void main() {
     uint nb = p.k / 128u;
     uint row = sample_in[p.sample_offset + gl_WorkGroupID.x];
     uint tid = gl_LocalInvocationID.x;
-    if (tid >= nb) return;
+    if (tid >= nb)
+        return;
     uint b = tid;
     uint d_bits = load_half_bits(p.d_offset + (row * nb + b) * 2u);
     uint qs_b = p.qs_offset + (row * nb + b) * 16u;

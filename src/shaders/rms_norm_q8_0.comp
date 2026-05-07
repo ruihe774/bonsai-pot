@@ -26,37 +26,36 @@ layout(push_constant) uniform Params {
     uint d_offset;      // bytes (Q8_0 d-section, FP32 scales)
     uint qs_offset;     // bytes (Q8_0 qs-section, packed i8)
     float eps;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 1, std430) readonly buffer WBuf {
-    float16_t w[];
-};
-layout(set = 0, binding = 2, std430) buffer OutBuf {
-    uint outbuf[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w[]; };
+layout(set = 0, binding = 2, std430) buffer OutBuf { uint outbuf[]; };
 
 const uint WG = 256u;
 const uint BLOCK_SIZE = 32u;
-const uint BLOCKS_PER_ITER = WG / BLOCK_SIZE;  // 8
+const uint BLOCKS_PER_ITER = WG / BLOCK_SIZE; // 8
 const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 
 shared float sg_partial[SG_PARTIAL_MAX];
 shared float inv_h_sh;
-shared uint  qv_sh[256];
+shared uint qv_sh[256];
 
 float wg_sum_f32(float local_v) {
     float sg_sum = subgroupAdd(local_v);
-    if (gl_NumSubgroups == 1u) return sg_sum;
-    if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_sum;
+    if (gl_NumSubgroups == 1u)
+        return sg_sum;
+    if (gl_SubgroupInvocationID == 0u)
+        sg_partial[gl_SubgroupID] = sg_sum;
     barrier();
     if (gl_SubgroupID == 0u) {
         float c = 0.0;
-        if (gl_SubgroupInvocationID < gl_NumSubgroups) c = sg_partial[gl_SubgroupInvocationID];
+        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            c = sg_partial[gl_SubgroupInvocationID];
         float f = subgroupAdd(c);
-        if (gl_SubgroupInvocationID == 0u) sg_partial[0] = f;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial[0] = f;
     }
     barrier();
     return sg_partial[0];
@@ -112,18 +111,13 @@ void main() {
         if (SUBGROUP_MIN_SIZE >= 32u) {
             uint group4_in_block = lane_in_block & ~3u;
             uint tgt = sg_block_base | group4_in_block;
-            packed = subgroupShuffle(qv, tgt + 0u)
-                   | (subgroupShuffle(qv, tgt + 1u) <<  8)
-                   | (subgroupShuffle(qv, tgt + 2u) << 16)
-                   | (subgroupShuffle(qv, tgt + 3u) << 24);
+            packed = subgroupShuffle(qv, tgt + 0u) | (subgroupShuffle(qv, tgt + 1u) << 8) |
+                     (subgroupShuffle(qv, tgt + 2u) << 16) | (subgroupShuffle(qv, tgt + 3u) << 24);
         } else {
             qv_sh[tid] = qv;
             barrier();
             uint base = (block_within_iter * 32u) + (lane_in_block & ~3u);
-            packed = qv_sh[base + 0u]
-                   | (qv_sh[base + 1u] <<  8)
-                   | (qv_sh[base + 2u] << 16)
-                   | (qv_sh[base + 3u] << 24);
+            packed = qv_sh[base + 0u] | (qv_sh[base + 1u] << 8) | (qv_sh[base + 2u] << 16) | (qv_sh[base + 3u] << 24);
             barrier();
         }
         if ((lane_in_block & 3u) == 0u) {

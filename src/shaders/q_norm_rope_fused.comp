@@ -15,23 +15,18 @@
 layout(constant_id = 0) const uint SUBGROUP_MIN_SIZE = 32;
 
 layout(push_constant) uniform Params {
-    uint q_off;          // f16 element offset of Q in act (q region base)
-    uint w_q_norm_off;   // f16 element offset of w_q_norm[0..head_dim] in w_norms
-    uint rope_offset;    // f16 element base offset into rope_cs (typically 0)
-    uint pos_base;       // first absolute RoPE position
-    uint q_dim;          // = n_head * head_dim
+    uint q_off;        // f16 element offset of Q in act (q region base)
+    uint w_q_norm_off; // f16 element offset of w_q_norm[0..head_dim] in w_norms
+    uint rope_offset;  // f16 element base offset into rope_cs (typically 0)
+    uint pos_base;     // first absolute RoPE position
+    uint q_dim;        // = n_head * head_dim
     float eps;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 1, std430) readonly buffer WBuf {
-    float16_t w_norms[];
-};
-layout(set = 0, binding = 2, std430) readonly buffer RopeBuf {
-    float16_t rope_cs[];
-};
+layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w_norms[]; };
+layout(set = 0, binding = 2, std430) readonly buffer RopeBuf { float16_t rope_cs[]; };
 
 const uint HEAD_DIM = 128u;
 const uint HALF_DIM = 64u;
@@ -49,8 +44,8 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     uint head = gl_WorkGroupID.x;
-    uint tok  = gl_WorkGroupID.y;
-    uint tid  = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
 
     uint q_token_off = tok * p.q_dim + head * HEAD_DIM;
     uint q_idx = p.q_off + q_token_off + tid;
@@ -62,13 +57,16 @@ void main() {
     if (gl_NumSubgroups == 1u) {
         total = sg_sum;
     } else {
-        if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID] = sg_sum;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial[gl_SubgroupID] = sg_sum;
         barrier();
         if (gl_SubgroupID == 0u) {
             float c = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups) c = sg_partial[gl_SubgroupInvocationID];
+            if (gl_SubgroupInvocationID < gl_NumSubgroups)
+                c = sg_partial[gl_SubgroupInvocationID];
             float f = subgroupAdd(c);
-            if (gl_SubgroupInvocationID == 0u) sg_partial[0] = f;
+            if (gl_SubgroupInvocationID == 0u)
+                sg_partial[0] = f;
         }
         barrier();
         total = sg_partial[0];

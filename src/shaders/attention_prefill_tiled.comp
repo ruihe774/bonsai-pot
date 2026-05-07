@@ -40,28 +40,21 @@ layout(push_constant) uniform Params {
     uint m_tokens;
     uint pos_base;
     uint kv_stride;
-    uint q_offset;         // f16 element offset of Q in `act`
+    uint q_offset; // f16 element offset of Q in `act`
     uint k_d_word_offset;
     uint k_qs_byte_offset;
     uint v_d_word_offset;
     uint v_qs_byte_offset;
-    uint out_d_offset;     // byte offset of Q8_0 d-section in `act_q8`
-    uint out_qs_offset;    // byte offset of Q8_0 qs-section in `act_q8`
+    uint out_d_offset;  // byte offset of Q8_0 d-section in `act_q8`
+    uint out_qs_offset; // byte offset of Q8_0 qs-section in `act_q8`
     float scale;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 1, std430) readonly buffer KCache {
-    uint k_cache[];
-};
-layout(set = 0, binding = 2, std430) readonly buffer VCache {
-    uint v_cache[];
-};
-layout(set = 0, binding = 3, std430) buffer OutBuf {
-    uint outbuf[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KCache { uint k_cache[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VCache { uint v_cache[]; };
+layout(set = 0, binding = 3, std430) buffer OutBuf { uint outbuf[]; };
 
 const uint WG = 64u;
 const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
@@ -77,13 +70,16 @@ vec4 wg_sum_v4(vec4 local_v) {
     if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) {
         return sg_sum;
     }
-    if (gl_SubgroupInvocationID == 0u) sg_partial4[gl_SubgroupID] = sg_sum;
+    if (gl_SubgroupInvocationID == 0u)
+        sg_partial4[gl_SubgroupID] = sg_sum;
     barrier();
     if (gl_SubgroupID == 0u) {
         vec4 combined = vec4(0.0);
-        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial4[gl_SubgroupInvocationID];
+        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            combined = sg_partial4[gl_SubgroupInvocationID];
         vec4 final_sum = subgroupAdd(combined);
-        if (gl_SubgroupInvocationID == 0u) sg_partial4[0] = final_sum;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial4[0] = final_sum;
     }
     barrier();
     return sg_partial4[0];
@@ -126,10 +122,8 @@ float block_max_abs(float v) {
 
 uint pack4(uint qv) {
     uint base = gl_SubgroupInvocationID & ~3u;
-    return  subgroupShuffle(qv, base + 0u)
-         | (subgroupShuffle(qv, base + 1u) <<  8)
-         | (subgroupShuffle(qv, base + 2u) << 16)
-         | (subgroupShuffle(qv, base + 3u) << 24);
+    return subgroupShuffle(qv, base + 0u) | (subgroupShuffle(qv, base + 1u) << 8) |
+           (subgroupShuffle(qv, base + 2u) << 16) | (subgroupShuffle(qv, base + 3u) << 24);
 }
 
 void write_block(float v, uint block_global) {
@@ -153,9 +147,11 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 void main() {
     uint g = gl_WorkGroupID.x;
     uint m_tile = gl_WorkGroupID.y;
-    if (g >= p.n_kv_head) return;
+    if (g >= p.n_kv_head)
+        return;
     uint m_base = m_tile * Q_TILE;
-    if (m_base >= p.m_tokens) return;
+    if (m_base >= p.m_tokens)
+        return;
     uint tid = gl_LocalInvocationID.x;
     uint sg_inv_id = gl_SubgroupInvocationID;
     uint hd = p.head_dim;
@@ -208,17 +204,13 @@ void main() {
     float o[Q_TILE][Q_PER_GROUP][ELEMS_PER_THREAD];
     [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
         [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
-            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
-                o[ml][pg][e] = 0.0;
-            }
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { o[ml][pg][e] = 0.0; }
         }
     }
 
     for (uint t = 0u; t < t_max; ++t) {
         float k_e[ELEMS_PER_THREAD];
-        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
-            k_e[e] = load_k(t, g_off + d_lane[e]);
-        }
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { k_e[e] = load_k(t, g_off + d_lane[e]); }
 
         vec4 corr[Q_TILE];
         vec4 w_attn[Q_TILE];
@@ -226,9 +218,7 @@ void main() {
             vec4 local_dots;
             [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
                 float d_acc = 0.0;
-                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
-                    d_acc += q[ml][pg][e] * k_e[e];
-                }
+                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { d_acc += q[ml][pg][e] * k_e[e]; }
                 local_dots[pg] = d_acc;
             }
             vec4 dots = wg_sum_v4(local_dots);
@@ -242,9 +232,7 @@ void main() {
         }
 
         float v_e[ELEMS_PER_THREAD];
-        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
-            v_e[e] = load_v(t, g_off + d_lane[e]);
-        }
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { v_e[e] = load_v(t, g_off + d_lane[e]); }
 
         [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
             [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
@@ -256,11 +244,12 @@ void main() {
     }
 
     // ---- Normalize and write Q8_0 directly to outbuf ----
-    uint half_id = tid >> 5;                       // 0 or 1 → block-pair selector for d_lane[0]/d_lane[1]
-    uint nb_per_token = p.n_head * hd / 32u;       // = q_dim / 32 = 128
+    uint half_id = tid >> 5;                 // 0 or 1 → block-pair selector for d_lane[0]/d_lane[1]
+    uint nb_per_token = p.n_head * hd / 32u; // = q_dim / 32 = 128
 
     [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
-        if (!ml_valid[ml]) continue;
+        if (!ml_valid[ml])
+            continue;
         vec4 inv = vec4(1.0) / l_run[ml];
         uint block_base = m_idx[ml] * nb_per_token + g * Q_PER_GROUP * 4u;
         [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {

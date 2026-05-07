@@ -28,15 +28,12 @@ layout(push_constant) uniform Params {
     uint output_offset;
     uint weight_offset;
     float eps;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) buffer ActBuf {
-    float16_t act[];
-};
+layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
 
-layout(set = 0, binding = 1, std430) readonly buffer WBuf {
-    float16_t w[];
-};
+layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w[]; };
 
 shared float sg_partial[SG_PARTIAL_MAX];
 
@@ -44,7 +41,8 @@ layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     uint gi = gl_WorkGroupID.x;
-    if (gi >= p.n_groups) return;
+    if (gi >= p.n_groups)
+        return;
     uint tid = gl_LocalInvocationID.x;
     uint n = p.group_size;
     uint in_base = p.input_offset + gi * n;

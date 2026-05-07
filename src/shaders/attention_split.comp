@@ -33,27 +33,20 @@ layout(push_constant) uniform Params {
     uint v_qs_byte_offset;
     uint n_chunks_active;
     float scale;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 1, std430) readonly buffer KCache {
-    uint k_cache[];
-};
-layout(set = 0, binding = 2, std430) readonly buffer VCache {
-    uint v_cache[];
-};
-layout(set = 0, binding = 3, std430) buffer Partials {
-    float partials[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KCache { uint k_cache[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VCache { uint v_cache[]; };
+layout(set = 0, binding = 3, std430) buffer Partials { float partials[]; };
 
 const uint WG = 64u;
 const uint SG_PARTIAL_MAX = (WG + SUBGROUP_MIN_SIZE - 1u) / SUBGROUP_MIN_SIZE;
 const uint Q_PER_GROUP = 4u;
-const uint ELEMS_PER_THREAD = 2u;  // head_dim (128) / WG (64)
+const uint ELEMS_PER_THREAD = 2u; // head_dim (128) / WG (64)
 const uint CHUNK_SIZE = 8u;
-const uint PARTIAL_STRIDE = 130u;  // head_dim + 2
+const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
 shared vec4 sg_partial4[SG_PARTIAL_MAX];
 
@@ -62,13 +55,16 @@ vec4 wg_sum_v4(vec4 local_v) {
     if (SUBGROUP_MIN_SIZE >= WG || gl_NumSubgroups == 1u) {
         return sg_sum;
     }
-    if (gl_SubgroupInvocationID == 0u) sg_partial4[gl_SubgroupID] = sg_sum;
+    if (gl_SubgroupInvocationID == 0u)
+        sg_partial4[gl_SubgroupID] = sg_sum;
     barrier();
     if (gl_SubgroupID == 0u) {
         vec4 combined = vec4(0.0);
-        if (gl_SubgroupInvocationID < gl_NumSubgroups) combined = sg_partial4[gl_SubgroupInvocationID];
+        if (gl_SubgroupInvocationID < gl_NumSubgroups)
+            combined = sg_partial4[gl_SubgroupInvocationID];
         vec4 final_sum = subgroupAdd(combined);
-        if (gl_SubgroupInvocationID == 0u) sg_partial4[0] = final_sum;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial4[0] = final_sum;
     }
     barrier();
     return sg_partial4[0];
@@ -103,7 +99,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 void main() {
     uint g = gl_WorkGroupID.x;
     uint chunk = gl_WorkGroupID.y;
-    if (g >= p.n_kv_head || chunk >= p.n_chunks_active) return;
+    if (g >= p.n_kv_head || chunk >= p.n_chunks_active)
+        return;
     uint tid = gl_LocalInvocationID.x;
     uint hd = p.head_dim;
     uint chunk_start = chunk * CHUNK_SIZE;
@@ -119,7 +116,12 @@ void main() {
     float o1[ELEMS_PER_THREAD];
     float o2[ELEMS_PER_THREAD];
     float o3[ELEMS_PER_THREAD];
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) { o0[i] = 0.0; o1[i] = 0.0; o2[i] = 0.0; o3[i] = 0.0; }
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+        o0[i] = 0.0;
+        o1[i] = 0.0;
+        o2[i] = 0.0;
+        o3[i] = 0.0;
+    }
     vec4 m = vec4(-1e30);
     vec4 l = vec4(0.0);
 

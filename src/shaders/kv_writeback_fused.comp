@@ -29,23 +29,14 @@ layout(push_constant) uniform Params {
     uint kv_dim;             // = n_kv_head * head_dim
     uint nb_per_row;         // = kv_dim / 32
     float eps;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer ActBuf {
-    float16_t act[];
-};
-layout(set = 0, binding = 1, std430) readonly buffer WBuf {
-    float16_t w_norms[];
-};
-layout(set = 0, binding = 2, std430) readonly buffer RopeBuf {
-    float16_t rope_cs[];
-};
-layout(set = 0, binding = 3, std430) buffer KBuf {
-    uint kv_k[];
-};
-layout(set = 0, binding = 4, std430) buffer VBuf {
-    uint kv_v[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w_norms[]; };
+layout(set = 0, binding = 2, std430) readonly buffer RopeBuf { float16_t rope_cs[]; };
+layout(set = 0, binding = 3, std430) buffer KBuf { uint kv_k[]; };
+layout(set = 0, binding = 4, std430) buffer VBuf { uint kv_v[]; };
 
 const uint HEAD_DIM = 128u;
 const uint HALF_DIM = 64u;
@@ -65,8 +56,8 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     uint head = gl_WorkGroupID.x;
-    uint tok  = gl_WorkGroupID.y;
-    uint tid  = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
     uint sg_size = gl_SubgroupSize;
 
     uint kv_token_off = tok * p.kv_dim + head * HEAD_DIM;
@@ -79,13 +70,16 @@ void main() {
     if (gl_NumSubgroups == 1u) {
         total = sg_sum;
     } else {
-        if (gl_SubgroupInvocationID == 0u) sg_partial[gl_SubgroupID].x = sg_sum;
+        if (gl_SubgroupInvocationID == 0u)
+            sg_partial[gl_SubgroupID].x = sg_sum;
         barrier();
         if (gl_SubgroupID == 0u) {
             float c = 0.0;
-            if (gl_SubgroupInvocationID < gl_NumSubgroups) c = sg_partial[gl_SubgroupInvocationID].x;
+            if (gl_SubgroupInvocationID < gl_NumSubgroups)
+                c = sg_partial[gl_SubgroupInvocationID].x;
             float f = subgroupAdd(c);
-            if (gl_SubgroupInvocationID == 0u) sg_partial[0].x = f;
+            if (gl_SubgroupInvocationID == 0u)
+                sg_partial[0].x = f;
         }
         barrier();
         total = sg_partial[0].x;
@@ -160,14 +154,14 @@ void main() {
         av = mv;
     }
 
-    uint block_in_head = tid >> 5;       // 0..3
+    uint block_in_head = tid >> 5; // 0..3
     float dk = ak / 127.0;
     float dv = av / 127.0;
     float inv_dk = (dk > 0.0) ? (1.0 / dk) : 0.0;
     float inv_dv = (dv > 0.0) ? (1.0 / dv) : 0.0;
 
     uint qk = uint(int(clamp(round(k_post * inv_dk), -127.0, 127.0))) & 0xFFu;
-    uint qv = uint(int(clamp(round(v_raw  * inv_dv), -127.0, 127.0))) & 0xFFu;
+    uint qv = uint(int(clamp(round(v_raw * inv_dv), -127.0, 127.0))) & 0xFFu;
 
     // ---- Pack 4 bytes into one u32 via subgroup shuffle, write to cache ----
     // 4-lane clusters (tid % 4 == 0 lanes are the leaders) live entirely
@@ -187,16 +181,14 @@ void main() {
     if ((tid & 3u) == 0u) {
         uint pk = qk0 | (qk1 << 8) | (qk2 << 16) | (qk3 << 24);
         uint pv = qv0 | (qv1 << 8) | (qv2 << 16) | (qv3 << 24);
-        uint qs_byte_in_layer =
-            p.dst_qs_byte_offset + pos_abs * p.kv_dim + head * HEAD_DIM + tid;
+        uint qs_byte_in_layer = p.dst_qs_byte_offset + pos_abs * p.kv_dim + head * HEAD_DIM + tid;
         kv_k[qs_byte_in_layer >> 2] = pk;
         kv_v[qs_byte_in_layer >> 2] = pv;
     }
 
     // d (FP32 scale) — one writer per block.
     if ((tid & 31u) == 0u) {
-        uint block_global =
-            pos_abs * p.nb_per_row + head * NB_PER_HEAD + block_in_head;
+        uint block_global = pos_abs * p.nb_per_row + head * NB_PER_HEAD + block_in_head;
         kv_k[p.dst_d_word_offset + block_global] = floatBitsToUint(dk);
         kv_v[p.dst_d_word_offset + block_global] = floatBitsToUint(dv);
     }

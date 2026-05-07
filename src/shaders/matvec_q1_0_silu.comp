@@ -21,14 +21,11 @@ layout(push_constant) uniform Params {
     uint output_offset;
     uint accumulate;
     uint dispatch_x_dim;
-} p;
+}
+p;
 
-layout(set = 0, binding = 0, std430) readonly buffer WBuf {
-    uint weights[];
-};
-layout(set = 0, binding = 1, std430) buffer ActBuf {
-    float16_t act[];
-};
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
+layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t act[]; };
 
 float load_f16_at(uint b_offset) {
     uint word = weights[b_offset >> 2];
@@ -37,10 +34,7 @@ float load_f16_at(uint b_offset) {
 }
 
 uint expand_4_bits(uint bits) {
-    uint spread = (bits & 1u)
-                | ((bits & 2u) <<  7)
-                | ((bits & 4u) << 14)
-                | ((bits & 8u) << 21);
+    uint spread = (bits & 1u) | ((bits & 2u) << 7) | ((bits & 4u) << 14) | ((bits & 8u) << 21);
     return ~(spread * 0xFEu);
 }
 
@@ -52,7 +46,7 @@ const uint TILE_K = 4096u;
 const uint TILE_NB_Q8 = TILE_K / 32u;
 const uint TILE_QS_LEN = TILE_K >> 2;
 
-shared uint  a_qs_sh[TILE_QS_LEN];
+shared uint a_qs_sh[TILE_QS_LEN];
 shared float a_d_sh[TILE_NB_Q8];
 
 layout(local_size_x = 8, local_size_y = 16, local_size_z = 1) in;
@@ -66,7 +60,7 @@ void main() {
     bool valid = row < p.n;
     uint nb_q1 = p.k / 128u;
 
-    uint row_d_byte  = p.d_offset  + row * nb_q1 * 2u;
+    uint row_d_byte = p.d_offset + row * nb_q1 * 2u;
     uint row_qs_byte = p.qs_offset + row * nb_q1 * 16u;
 
     float acc = 0.0;
@@ -86,8 +80,8 @@ void main() {
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 uint gb = (g_v4_off + i) << 2;
                 uint ub = (u_v4_off + i) << 2;
-                vec4 g = vec4(float(act[gb]), float(act[gb+1u]), float(act[gb+2u]), float(act[gb+3u]));
-                f16vec4 u = f16vec4(act[ub], act[ub+1u], act[ub+2u], act[ub+3u]);
+                vec4 g = vec4(float(act[gb]), float(act[gb + 1u]), float(act[gb + 2u]), float(act[gb + 3u]));
+                f16vec4 u = f16vec4(act[ub], act[ub + 1u], act[ub + 2u], act[ub + 3u]);
                 vec4 s = g / (vec4(1.0) + exp(-g));
                 v[i] = f16vec4(s) * u;
                 f16vec4 af = abs(v[i]);
@@ -101,11 +95,8 @@ void main() {
 
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 vec4 q = clamp(round(vec4(v[i]) * inv_max), vec4(-128.0), vec4(127.0));
-                a_qs_sh[i * TILE_NB_Q8 + tid] =
-                      (uint(int(q.x)) & 0xFFu)
-                    | ((uint(int(q.y)) & 0xFFu) <<  8)
-                    | ((uint(int(q.z)) & 0xFFu) << 16)
-                    | ((uint(int(q.w)) & 0xFFu) << 24);
+                a_qs_sh[i * TILE_NB_Q8 + tid] = (uint(int(q.x)) & 0xFFu) | ((uint(int(q.y)) & 0xFFu) << 8) |
+                                                ((uint(int(q.z)) & 0xFFu) << 16) | ((uint(int(q.w)) & 0xFFu) << 24);
             }
         }
         barrier();
