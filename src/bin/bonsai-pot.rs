@@ -34,6 +34,7 @@ struct Args {
     tg_n: u32,
     max_seq: u32,
     repeats: u32,
+    no_marker: bool,
     use_matmul_prefill: bool,
     temperature: f32,
     top_k: Option<u32>,
@@ -81,6 +82,14 @@ BENCH OPTIONS:
                            [default: 128]
     --repeats <n>          Repeat count per bench row.
                            [default: 5]
+    --no-marker            (--mode microbench only) Skip per-step GPU timestamp
+                           markers and the post-step resolve submit. Each
+                           measurement becomes exactly one submit, giving
+                           deterministic submit indices suitable for selecting
+                           the measurement window in an external profiler like
+                           Nsight Graphics GPU Trace via --start-after-submits.
+                           Brackets the measurement loop with PROFILE
+                           BEGIN/END markers on stderr.
 
 LOAD OPTIONS:
     --max-seq <n>          KV-cache capacity (positions). Larger values cost
@@ -124,6 +133,7 @@ fn parse_args() -> Args {
         tg_n: 128,
         max_seq: 1024,
         repeats: 5,
+        no_marker: false,
         use_matmul_prefill: false,
         temperature: 0.0, // CLI default = greedy, for reproducible runs
         top_k: None,
@@ -158,6 +168,10 @@ fn parse_args() -> Args {
             "--repeats" => {
                 a.repeats = parse_or_die("--repeats", &next());
                 i += 2;
+            }
+            "--no-marker" => {
+                a.no_marker = true;
+                i += 1;
             }
             "--max-seq" => {
                 a.max_seq = parse_or_die("--max-seq", &next());
@@ -218,14 +232,18 @@ fn main() {
             });
         }
         "microbench" => {
-            __bench::microbench_pp(&model, args.pp_n, args.repeats).unwrap_or_else(|e| {
-                eprintln!("microbench error: {e}");
-                exit(3)
-            });
-            __bench::microbench_tg(&model, args.tg_n, args.repeats).unwrap_or_else(|e| {
-                eprintln!("microbench error: {e}");
-                exit(3)
-            });
+            __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker).unwrap_or_else(
+                |e| {
+                    eprintln!("microbench error: {e}");
+                    exit(3)
+                },
+            );
+            __bench::microbench_tg(&model, args.tg_n, args.repeats, args.no_marker).unwrap_or_else(
+                |e| {
+                    eprintln!("microbench error: {e}");
+                    exit(3)
+                },
+            );
         }
         "gen" | "prompt" => {
             let mut buf = Vec::new();

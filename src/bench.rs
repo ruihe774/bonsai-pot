@@ -221,7 +221,7 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
 /// attention scans a single KV entry, which is unrepresentative. The KV cache
 /// is pre-filled with `pos` no-readback steps before measurement so attention
 /// sees `pos+1` cached tokens on each measured step.
-pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
+pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> Result<()> {
     if pos >= model.max_seq {
         return Err(PotError::ContextOverflow {
             pos,
@@ -229,13 +229,31 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32) -> Result<()> {
             max: model.max_seq,
         });
     }
-    eprintln!("--- microbench tg (pos={pos}, repeats={repeats}) ---");
+    eprintln!(
+        "--- microbench tg (pos={pos}, repeats={repeats}{}) ---",
+        if no_marker { ", NO MARKER" } else { "" }
+    );
 
     // Pre-fill KV cache so attention scans `pos+1` cached tokens on each
     // measured step. `step_matvec_no_sample` skips the topk readback but polls
     // internally to drive the staging-buffer remap callback.
     for p in 0..pos {
         step_matvec_no_sample(model, 1, p);
+    }
+
+    // No-marker mode: switch to NoMarker so per-step timing isn't recorded.
+    // Each measurement is a single submit (no extra resolve submit), giving
+    // deterministic submit indices for external profilers like Nsight Graphics
+    // GPU Trace, which select work via --start-after-submits / --limit-to-submits.
+    if no_marker {
+        // warmup
+        run_uninstrumented_step(model, pos)?;
+        eprintln!(">>> PROFILE BEGIN: tg measurement ({repeats} submit(s)) <<<");
+        for _ in 0..repeats {
+            run_uninstrumented_step(model, pos)?;
+        }
+        eprintln!(">>> PROFILE END: tg measurement <<<");
+        return Ok(());
     }
 
     // warm up: one instrumented step at the measurement pos
@@ -324,6 +342,21 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
     marker.resolve()
 }
 
+/// Like [`run_instrumented_step`] but with no per-kernel timestamp marker —
+/// used in `--no-marker` profiling mode so the measurement is exactly one submit
+/// with no resolve submit afterward.
+fn run_uninstrumented_step(model: &Model, pos: u32) -> Result<()> {
+    let tok: u32 = 1;
+    let mut se = StepEncoder::new(model);
+    upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut NoMarker);
+    se.copy_sample_to_readback(8);
+    se.schedule_topk_map(8);
+    model.queue.submit(Some(se.finish()));
+    wait_topk_readback(model, 1)?;
+    Ok(())
+}
+
 /// Per-kernel breakdown of one matmul-prefill step at batch size `m`.
 ///
 /// Mirrors [`microbench_tg`] but for the batched-prefill (matmul) path.
@@ -332,7 +365,7 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
 /// measurement so the measured prefill runs at `pos_base = m` — the matmul
 /// attention then scans `[0, m + m_tok]` per query, exercising the realistic
 /// "prefill into an existing context" path rather than always starting at 0.
-pub fn microbench_pp(model: &Model, m: u32, repeats: u32) -> Result<()> {
+pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Result<()> {
     let m = m.min(model.m_max);
     if m == 0 {
         return Err(PotError::PrefillTooLarge {
@@ -348,7 +381,10 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32) -> Result<()> {
         });
     }
     let pos_base = m;
-    eprintln!("--- microbench pp (m={m}, pos_base={pos_base}, repeats={repeats}) ---");
+    eprintln!(
+        "--- microbench pp (m={m}, pos_base={pos_base}, repeats={repeats}{}) ---",
+        if no_marker { ", NO MARKER" } else { "" }
+    );
     let cfg = &model.cfg;
     let prompt: Vec<u32> = (0..m).map(|i| (i % (cfg.n_vocab - 1)) + 1).collect();
 
@@ -358,6 +394,29 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32) -> Result<()> {
     if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
+    }
+
+    // No-marker mode: switch to NoMarker so per-step timing isn't recorded.
+    // Each measurement is a single submit (no extra resolve submit), giving
+    // deterministic submit indices for external profilers like Nsight Graphics
+    // GPU Trace, which select work via --start-after-submits / --limit-to-submits.
+    if no_marker {
+        // warmup
+        let _ = prefill_matmul_topk(model, &prompt, pos_base, 1, &mut NoMarker)?;
+        if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+            model.check_device()?;
+            return Err(PotError::Poll(e));
+        }
+        eprintln!(">>> PROFILE BEGIN: pp measurement ({repeats} submit(s)) <<<");
+        for _ in 0..repeats {
+            let _ = prefill_matmul_topk(model, &prompt, pos_base, 1, &mut NoMarker)?;
+            if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
+                model.check_device()?;
+                return Err(PotError::Poll(e));
+            }
+        }
+        eprintln!(">>> PROFILE END: pp measurement <<<");
+        return Ok(());
     }
 
     // warm up
