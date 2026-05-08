@@ -1618,14 +1618,14 @@ impl Model {
             (512, 1, 1)
         );
         let sh_matvec = load_shader!("matvec_q1_0", no_spec, (8, 16, 1));
-        let sh_matvec_silu = load_shader!("matvec_q1_0_silu", no_spec, (8, 16, 1));
+        let sh_matvec_silu = load_shader!("matvec_q1_0_silu", no_spec, (8, 32, 1));
         let sh_matvec_fused_normed = load_shader!(
             "matvec_q1_0_fused_normed",
             &[
                 (SPEC_SUBGROUP_SIZE, sg_spec_matvec_fused_normed),
                 (SPEC_N_EMBD_V4, cfg.n_embd / 4),
             ],
-            (128, 1, 1)
+            (256, 1, 1)
         );
         let sh_matmul = load_shader!("matmul_q1_0_q8_0", no_spec, (256, 1, 1));
         let sh_attn_prefill_tiled = load_shader!(
@@ -1636,7 +1636,7 @@ impl Model {
         let sh_attn_split = load_shader!(
             "attention_split",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_split)],
-            (64, 1, 1)
+            (if cfg!(target_vendor = "apple") { 32 } else { 64 }, 1, 1)
         );
         let sh_attn_merge = load_shader!(
             "attention_merge",
@@ -1644,7 +1644,7 @@ impl Model {
                 (SPEC_SUBGROUP_SIZE, sg_spec_attn_merge),
                 (SPEC_MAX_CHUNKS, max_chunks),
             ],
-            (128, 1, 1)
+            (if cfg!(target_vendor = "apple") { 32 } else { 128 }, 1, 1)
         );
         let sh_rms_q8 = load_shader!(
             "rms_norm_q8_0",

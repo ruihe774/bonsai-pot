@@ -39,11 +39,15 @@ static inline float load_f16_at(device const uint* weights, uint b_offset) {
     return float(as_type<half2>(half_bits).x);
 }
 
+// Apple sweep: WG_Y=32 (256 threads, 8 simdgroups per WG) wins ~5% on e2e_tg
+// over WG_Y=16. The cross-SG ssq merge cost is real (8 SGs vs 4) but is
+// dominated by the better amortization of the K_V4-sized `x_sh` load and
+// the halved dispatch count. Smaller WG (WG_Y∈{4,8}) regresses sharply.
 constant uint WG_X = 8u;
-constant uint WG_Y = 16u;
+constant uint WG_Y = 32u;
 constant uint WG = WG_X * WG_Y;
 constant uint ROWS_PER_WG = WG_Y;
-constant uint NUM_SUBGROUPS = WG / 32u; // = 4
+constant uint NUM_SUBGROUPS = WG / 32u; // = 8
 
 kernel void cs_main(
     constant Params& p [[buffer(0)]],

@@ -14,9 +14,12 @@ struct Params {
     uint n_chunks_active;
 };
 
-constant uint WG = 128u;
-constant uint NUM_SUBGROUPS = WG / 32u; // = 4
-constant uint ELEMS_PER_THREAD = 1u;
+// Apple sweep: WG=32 (1 simdgroup) wins marginally over WG=128 (4-SG). The
+// per-WG max/sum reductions collapse to a single simd_max/simd_sum. EPT=4
+// covers head_dim=128.
+constant uint WG = 32u;
+constant uint NUM_SUBGROUPS = WG / 32u; // = 1
+constant uint ELEMS_PER_THREAD = 4u;
 constant uint PARTIAL_STRIDE = 130u;
 
 kernel void cs_main(
