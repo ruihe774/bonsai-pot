@@ -38,7 +38,7 @@ constant uint TM = 4u;
 constant uint TILE_N = 64u;
 constant uint TILE_M = 64u;
 
-kernel void matmul_q1_0_q8_0(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const uint* weights [[buffer(1)]],
     device const uint* acts [[buffer(2)]],

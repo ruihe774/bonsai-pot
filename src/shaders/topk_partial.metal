@@ -38,7 +38,7 @@ static void sift_down(threadgroup half* sh_val, threadgroup uint* sh_idx, uint b
     }
 }
 
-kernel void topk_partial(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const uint* logits [[buffer(1)]],
     device uint* result [[buffer(2)]],

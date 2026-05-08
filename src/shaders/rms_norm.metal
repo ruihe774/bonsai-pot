@@ -17,7 +17,7 @@ struct Params {
     float eps;
 };
 
-kernel void rms_norm(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device half* act [[buffer(1)]],
     device const half* w [[buffer(2)]],
