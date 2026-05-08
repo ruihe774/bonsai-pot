@@ -27,7 +27,9 @@ static inline uint expand_4_bits(uint bits) {
 }
 
 static inline int dot4i8packed(uint a, uint b) {
-    return dot(as_type<char4>(a), as_type<char4>(b));
+    packed_char4 vec1 = as_type<packed_char4>(a);
+    packed_char4 vec2 = as_type<packed_char4>(b);
+    return vec1[0] * vec2[0] + vec1[1] * vec2[1] + vec1[2] * vec2[2] + vec1[3] * vec2[3];
 }
 
 constant uint WG_X = 8u;
