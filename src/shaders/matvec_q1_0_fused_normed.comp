@@ -132,7 +132,10 @@ void main() {
             max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
         }
         float max_abs = float(max_abs_h);
-        float d = max_abs * inv_rms * (1.0 / 127.0);
+        // Don't fold inv_rms here — apply it once at row-write below.
+        // Saves one fmul per Q8_0 a-block per token in this stage; the
+        // matmul inner loop is unaffected.
+        float d = max_abs * (1.0 / 127.0);
         a_d_sh[tid] = d;
         float inv_max = 127.0 / max(max_abs, 1.0e-30);
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
@@ -203,6 +206,6 @@ void main() {
     acc += subgroupShuffleXor(acc, 4u);
     if (tx == 0u && valid) {
         uint yi = out_off + local_row;
-        act[yi] = float16_t(acc); // fused matvecs don't accumulate
+        act[yi] = float16_t(acc * inv_rms); // fused matvecs don't accumulate
     }
 }

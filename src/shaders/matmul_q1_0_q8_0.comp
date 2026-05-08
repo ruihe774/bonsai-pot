@@ -111,10 +111,20 @@ void main() {
         float wd[TN];
         [[unroll]] for (uint tn = 0u; tn < TN; ++tn) { wd[tn] = w_d_lds[lx * TN + tn]; }
 
+        // Hoist the 4 × TN sign-words out of the s-loop so all LDS reads are
+        // issued up front and the compiler can overlap them with the dot/FMA
+        // work below. Only 16 uints / thread → no register pressure issue.
+        uint bw_all[4u * TN];
+        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                bw_all[s * TN + tn] = w_bits_lds[s * 64u + lx * TN + tn];
+            }
+        }
+
         [[unroll]] for (uint s = 0u; s < 4u; ++s) {
             uint w[TN][8];
             [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-                uint bw = w_bits_lds[s * 64u + lx * TN + tn];
+                uint bw = bw_all[s * TN + tn];
                 [[unroll]] for (uint i = 0u; i < 8u; ++i) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
             }
 
