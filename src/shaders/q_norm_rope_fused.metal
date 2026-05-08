@@ -19,7 +19,7 @@ constant uint HALF_DIM = 64u;
 constant uint WG = 128u;
 constant uint NUM_SUBGROUPS = WG / 32u; // = 4
 
-kernel void q_norm_rope_fused(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device half* act [[buffer(1)]],
     device const half* w_norms [[buffer(2)]],

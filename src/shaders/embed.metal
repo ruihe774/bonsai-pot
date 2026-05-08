@@ -22,7 +22,7 @@ static inline uint load_byte_at(device const uint* weights, uint b_offset) {
     return (word >> ((b_offset & 3u) * 8u)) & 0xFFu;
 }
 
-kernel void embed(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const uint* weights [[buffer(1)]],
     device half* x [[buffer(2)]],

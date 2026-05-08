@@ -39,7 +39,7 @@ constant uint TILE_K = 4096u;
 constant uint TILE_NB_Q8 = TILE_K / 32u;
 constant uint TILE_QS_LEN = TILE_K >> 2;
 
-kernel void matvec_q1_0(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const uint* weights [[buffer(1)]],
     device half* act [[buffer(2)]],

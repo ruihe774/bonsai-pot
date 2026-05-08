@@ -24,7 +24,7 @@ constant uint NB_PER_HEAD = HEAD_DIM / 32u;
 constant uint WG = 128u;
 constant uint NUM_SUBGROUPS = WG / 32u; // = 4
 
-kernel void kv_writeback_fused(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const half* act [[buffer(1)]],
     device const half* w_norms [[buffer(2)]],

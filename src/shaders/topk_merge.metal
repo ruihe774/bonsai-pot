@@ -14,7 +14,7 @@ constant uint WG = 64u;
 constant uint K_MAX = 32u;
 constant half NEG_INF_H = half(-65504.0h);
 
-kernel void topk_merge(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device uint* result [[buffer(1)]],
     uint tid [[thread_index_in_threadgroup]])

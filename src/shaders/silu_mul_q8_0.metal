@@ -16,7 +16,7 @@ constant uint WG = 256u;
 constant uint BLOCK_SIZE = 32u;
 constant uint BLOCKS_PER_ITER = WG / BLOCK_SIZE;
 
-kernel void silu_mul_q8_0(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const half* act [[buffer(1)]],
     device uint* outbuf [[buffer(2)]],

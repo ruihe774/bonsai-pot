@@ -18,7 +18,7 @@ constant uint BLOCK_SIZE = 32u;
 constant uint BLOCKS_PER_ITER = WG / BLOCK_SIZE; // 8
 constant uint NUM_SUBGROUPS = WG / 32u; // = 8
 
-kernel void rms_norm_q8_0(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const half* act [[buffer(1)]],
     device const half* w [[buffer(2)]],

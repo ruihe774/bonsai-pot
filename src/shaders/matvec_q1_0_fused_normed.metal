@@ -49,7 +49,7 @@ constant uint WG = WG_X * WG_Y;
 constant uint ROWS_PER_WG = WG_Y;
 constant uint NUM_SUBGROUPS = WG / 32u; // = 4
 
-kernel void matvec_q1_0_fused_normed(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const uint* weights [[buffer(1)]],
     device half* act [[buffer(2)]],

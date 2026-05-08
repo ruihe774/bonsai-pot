@@ -38,7 +38,7 @@ static float load_kv_q8(device const uint* cache, uint d_word_offset, uint qs_by
     return scale * float(qs_signed);
 }
 
-kernel void attention_split(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const half* act [[buffer(1)]],
     device const uint* k_cache [[buffer(2)]],

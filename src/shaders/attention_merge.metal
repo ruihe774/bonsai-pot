@@ -19,7 +19,7 @@ constant uint NUM_SUBGROUPS = WG / 32u; // = 4
 constant uint ELEMS_PER_THREAD = 1u;
 constant uint PARTIAL_STRIDE = 130u;
 
-kernel void attention_merge(
+kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device half* act [[buffer(1)]],
     device const float* partials [[buffer(2)]],
