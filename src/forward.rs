@@ -27,9 +27,10 @@ use wgpu::PollType;
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnPrefillTiledParams, AttnSplitParams, Config, EmbedParams,
-    KvWritebackFusedParams, MatmulParams, MatvecFusedNormedParams, MatvecParams, MatvecSiluParams,
-    Model, QNormRopeFusedParams, RmsNormParams, RmsNormQ8Params, SiluMulQ8Params, TOPK_MAX,
-    TOPK_NUM_PARTIAL_WG, TopKMergeParams, TopKPartialParams, WeightSet,
+    KvWritebackFusedParams, MATVEC_FUSED_NORMED_ROWS_PER_WG, MATVEC_SILU_ROWS_PER_WG, MatmulParams,
+    MatvecFusedNormedParams, MatvecParams, MatvecSiluParams, Model, QNormRopeFusedParams,
+    RmsNormParams, RmsNormQ8Params, SiluMulQ8Params, TOPK_MAX, TOPK_NUM_PARTIAL_WG,
+    TopKMergeParams, TopKPartialParams, WeightSet,
 };
 
 // ---------- Q8_0 KV cache layout helpers ------------------------------------
@@ -316,11 +317,7 @@ fn dispatch_matvec_q1_0_silu(
     out_off: u32,
     accumulate: bool,
 ) {
-    // Must match `WG_Y` in shaders/matvec_q1_0_silu.{metal,comp}.
-    #[cfg(target_vendor = "apple")]
-    const ROWS_PER_WG: u32 = 32;
-    #[cfg(not(target_vendor = "apple"))]
-    const ROWS_PER_WG: u32 = 16;
+    const ROWS_PER_WG: u32 = MATVEC_SILU_ROWS_PER_WG;
     let n_wg = n.div_ceil(ROWS_PER_WG);
     let dispatch_x = n_wg.min(65535);
     let dispatch_y = n_wg.div_ceil(dispatch_x);
@@ -354,11 +351,7 @@ fn dispatch_matvec_q1_0_fused_normed(
     weights: WeightSet,
     ranges: &[(u32, u32, u32, u32)],
 ) {
-    // Must match `WG_Y` in shaders/matvec_q1_0_fused_normed.{metal,comp}.
-    #[cfg(target_vendor = "apple")]
-    const ROWS_PER_WG: u32 = 32;
-    #[cfg(not(target_vendor = "apple"))]
-    const ROWS_PER_WG: u32 = 16;
+    const ROWS_PER_WG: u32 = MATVEC_FUSED_NORMED_ROWS_PER_WG;
     debug_assert!(ranges.len() == 2 || ranges.len() == 3);
     for (_, _, n, _) in ranges {
         debug_assert!(n % ROWS_PER_WG == 0);
@@ -744,7 +737,14 @@ pub fn encode_step_matvec<C: DispatchCtx>(
         });
 
         ctx.dispatch("topk_reduce", |pass| {
-            dispatch_topk_reduce(m, pass, cfg.n_vocab, k, m.act_layout.logits, topk_out_u32_base);
+            dispatch_topk_reduce(
+                m,
+                pass,
+                cfg.n_vocab,
+                k,
+                m.act_layout.logits,
+                topk_out_u32_base,
+            );
         });
     }
 }

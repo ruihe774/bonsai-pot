@@ -330,6 +330,57 @@ pub const SPEC_SUBGROUP_SIZE: u32 = 0;
 pub const SPEC_MAX_CHUNKS: u32 = 1;
 pub const SPEC_N_EMBD_V4: u32 = 2;
 
+// ----- Per-kernel workgroup shapes ------------------------------------------
+//
+// Single source of truth for `threads_per_threadgroup` of every kernel.
+// MSL passthrough consumes this directly via
+// `ShaderModuleDescriptorPassthrough::num_workgroups`; SPIR-V kernels embed
+// `local_size_*` in their own `OpExecutionMode` so the value passed here is
+// ignored on Vulkan — but we keep the Vulkan column populated anyway so the
+// table stays a faithful record of what each backend's shader actually uses.
+//
+// Numbers must match the literal `WG_X`/`WG_Y`/`WG` constants in the
+// corresponding `.metal` (Apple column) and `.comp` (Vulkan column) sources.
+// A few kernels (matvec_q1_0_silu, matvec_q1_0_fused_normed, attention_split,
+// attention_merge) deliberately diverge between backends — see the per-file
+// "Apple sweep" comments in the `.metal` headers for why.
+const fn wg_pick(apple: (u32, u32, u32), vulkan: (u32, u32, u32)) -> (u32, u32, u32) {
+    if cfg!(target_vendor = "apple") {
+        apple
+    } else {
+        vulkan
+    }
+}
+
+//                                                          apple          vulkan
+const WG_EMBED: (u32, u32, u32) = wg_pick((32, 1, 1), (32, 1, 1));
+const WG_RMS_NORM: (u32, u32, u32) = wg_pick((512, 1, 1), (512, 1, 1));
+const WG_MATVEC: (u32, u32, u32) = wg_pick((8, 16, 1), (8, 16, 1));
+const WG_MATVEC_SILU: (u32, u32, u32) = wg_pick((8, 32, 1), (8, 16, 1));
+const WG_MATVEC_FUSED_NORMED: (u32, u32, u32) = wg_pick((256, 1, 1), (128, 1, 1));
+const WG_MATMUL: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
+const WG_ATTN_PREFILL_TILED: (u32, u32, u32) = wg_pick((32, 1, 1), (32, 1, 1));
+const WG_ATTN_SPLIT: (u32, u32, u32) = wg_pick((32, 1, 1), (64, 1, 1));
+const WG_ATTN_MERGE: (u32, u32, u32) = wg_pick((32, 1, 1), (128, 1, 1));
+const WG_RMS_NORM_Q8: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
+const WG_SILU_MUL_Q8: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
+const WG_TOPK_PARTIAL: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
+const WG_TOPK_MERGE: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
+const WG_KV_WRITEBACK_FUSED: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
+const WG_Q_NORM_ROPE_FUSED: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
+
+/// Rows of the output matrix processed per workgroup by `matvec_q1_0_silu`.
+/// Equals `WG_Y` in the corresponding shader (Apple) and total threads / 8 in
+/// the GLSL counterpart. Used by `forward::dispatch_matvec_q1_0_silu` to size
+/// the dispatch grid.
+pub const MATVEC_SILU_ROWS_PER_WG: u32 = WG_MATVEC_SILU.1;
+
+/// Rows of the output matrix processed per workgroup by
+/// `matvec_q1_0_fused_normed`. Both backends use a flat 1D threadgroup
+/// (`WG_X * WG_Y` threads) with `WG_X = 8` lanes per row, so
+/// `ROWS_PER_WG = total_threads / 8`.
+pub const MATVEC_FUSED_NORMED_ROWS_PER_WG: u32 = WG_MATVEC_FUSED_NORMED.0 / 8;
+
 /// Pick a `SubgroupSize` request and the matching `SUBGROUP_SIZE` spec-const
 /// value for a pipeline whose workgroup is `wg` lanes wide.
 ///
@@ -1611,32 +1662,32 @@ impl Model {
         }
         let no_spec: &[(u32, u32)] = &[];
 
-        let sh_embed = load_shader!("embed", no_spec, (32, 1, 1));
+        let sh_embed = load_shader!("embed", no_spec, WG_EMBED);
         let sh_rms = load_shader!(
             "rms_norm",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_rms)],
-            (512, 1, 1)
+            WG_RMS_NORM
         );
-        let sh_matvec = load_shader!("matvec_q1_0", no_spec, (8, 16, 1));
-        let sh_matvec_silu = load_shader!("matvec_q1_0_silu", no_spec, (8, 32, 1));
+        let sh_matvec = load_shader!("matvec_q1_0", no_spec, WG_MATVEC);
+        let sh_matvec_silu = load_shader!("matvec_q1_0_silu", no_spec, WG_MATVEC_SILU);
         let sh_matvec_fused_normed = load_shader!(
             "matvec_q1_0_fused_normed",
             &[
                 (SPEC_SUBGROUP_SIZE, sg_spec_matvec_fused_normed),
                 (SPEC_N_EMBD_V4, cfg.n_embd / 4),
             ],
-            (256, 1, 1)
+            WG_MATVEC_FUSED_NORMED
         );
-        let sh_matmul = load_shader!("matmul_q1_0_q8_0", no_spec, (256, 1, 1));
+        let sh_matmul = load_shader!("matmul_q1_0_q8_0", no_spec, WG_MATMUL);
         let sh_attn_prefill_tiled = load_shader!(
             "attention_prefill_tiled",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_prefill_tiled)],
-            (32, 1, 1)
+            WG_ATTN_PREFILL_TILED
         );
         let sh_attn_split = load_shader!(
             "attention_split",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_split)],
-            (if cfg!(target_vendor = "apple") { 32 } else { 64 }, 1, 1)
+            WG_ATTN_SPLIT
         );
         let sh_attn_merge = load_shader!(
             "attention_merge",
@@ -1644,29 +1695,29 @@ impl Model {
                 (SPEC_SUBGROUP_SIZE, sg_spec_attn_merge),
                 (SPEC_MAX_CHUNKS, max_chunks),
             ],
-            (if cfg!(target_vendor = "apple") { 32 } else { 128 }, 1, 1)
+            WG_ATTN_MERGE
         );
         let sh_rms_q8 = load_shader!(
             "rms_norm_q8_0",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_rms_q8)],
-            (256, 1, 1)
+            WG_RMS_NORM_Q8
         );
         let sh_silu_q8 = load_shader!(
             "silu_mul_q8_0",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_silu_q8)],
-            (256, 1, 1)
+            WG_SILU_MUL_Q8
         );
-        let sh_topk_partial = load_shader!("topk_partial", no_spec, (128, 1, 1));
-        let sh_topk_merge = load_shader!("topk_merge", no_spec, (64, 1, 1));
+        let sh_topk_partial = load_shader!("topk_partial", no_spec, WG_TOPK_PARTIAL);
+        let sh_topk_merge = load_shader!("topk_merge", no_spec, WG_TOPK_MERGE);
         let sh_kv_writeback_fused = load_shader!(
             "kv_writeback_fused",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_kv_writeback_fused)],
-            (128, 1, 1)
+            WG_KV_WRITEBACK_FUSED
         );
         let sh_q_norm_rope_fused = load_shader!(
             "q_norm_rope_fused",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_q_norm_rope_fused)],
-            (128, 1, 1)
+            WG_Q_NORM_ROPE_FUSED
         );
 
         let make_bgl =

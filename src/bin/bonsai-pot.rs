@@ -232,16 +232,18 @@ fn main() {
             });
         }
         "microbench" => {
-            __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker)
-                .unwrap_or_else(|e| {
+            __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker).unwrap_or_else(
+                |e| {
                     eprintln!("microbench error: {e}");
                     exit(3)
-                });
-            __bench::microbench_tg(&model, args.tg_n, args.repeats, args.no_marker)
-                .unwrap_or_else(|e| {
+                },
+            );
+            __bench::microbench_tg(&model, args.tg_n, args.repeats, args.no_marker).unwrap_or_else(
+                |e| {
                     eprintln!("microbench error: {e}");
                     exit(3)
-                });
+                },
+            );
         }
         "gen" | "prompt" => {
             let mut buf = Vec::new();
