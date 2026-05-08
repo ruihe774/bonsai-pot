@@ -429,8 +429,10 @@ pub const fn pick_subgroup_config(
 }
 
 /// Override the default of a spirv-cross-emitted SpecConstant in an MSL
-/// source string by prepending a `#define`. spirv-cross emits each Vulkan
-/// SpecConstant as
+/// source string. spirv-cross emits Vulkan SpecConstants in one of two forms,
+/// and this function handles both:
+///
+/// **Form A** (the simple substitution case):
 ///
 /// ```text
 /// #ifndef SPIRV_CROSS_CONSTANT_ID_<slot>
@@ -439,11 +441,22 @@ pub const fn pick_subgroup_config(
 /// constant uint NAME = SPIRV_CROSS_CONSTANT_ID_<slot>;
 /// ```
 ///
-/// so prepending `#define SPIRV_CROSS_CONSTANT_ID_<slot> <value>u\n` ahead
-/// of the source wins via the `#ifndef` guard, with no need to mutate the
-/// per-shader name. wgpu's MSL passthrough path doesn't expose
-/// `MTLFunctionConstantValues`, so this textual route is the substitute
-/// for runtime spec-constant binding.
+/// Patched by prepending `#define SPIRV_CROSS_CONSTANT_ID_<slot> <value>u\n`
+/// ahead of the source — the prepended define wins via the `#ifndef` guard.
+///
+/// **Form B** (emitted when the spec constant participates in expressions
+/// spirv-cross can't fold to a `#define`, e.g. as a control predicate that
+/// also feeds a constexpr):
+///
+/// ```text
+/// constant uint NAME_tmp [[function_constant(<slot>)]];
+/// constant uint NAME = is_function_constant_defined(NAME_tmp) ? NAME_tmp : <default>u;
+/// ```
+///
+/// Patched by replacing both lines with `constant uint NAME = <value>u;`.
+/// Without this rewrite, the `[[function_constant]]` attribute leaves the
+/// pipeline waiting for an `MTLFunctionConstantValues`, which wgpu's MSL
+/// passthrough path doesn't expose — pipeline creation fails at load time.
 ///
 /// Asserts the slot actually appears in the source so a typo or missing
 /// `layout(constant_id = N)` is caught at load time rather than silently
@@ -452,15 +465,53 @@ pub const fn pick_subgroup_config(
 #[allow(clippy::panic, reason = "shaders are written by us")]
 fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
     let id = format!("SPIRV_CROSS_CONSTANT_ID_{slot}");
-    assert!(
-        src.contains(&id),
-        "spec constant slot {slot} ({id}) not found in MSL source"
-    );
-    let prefix = format!("#define {id} {value}u\n");
-    let mut out = String::with_capacity(src.len() + prefix.len());
-    out.push_str(&prefix);
-    out.push_str(src);
-    out
+    if src.contains(&id) {
+        let prefix = format!("#define {id} {value}u\n");
+        let mut out = String::with_capacity(src.len() + prefix.len());
+        out.push_str(&prefix);
+        out.push_str(src);
+        return out;
+    }
+
+    let attr = format!("[[function_constant({slot})]]");
+    if let Some(attr_pos) = src.find(&attr) {
+        // Locate the surrounding `constant uint NAME_tmp [[function_constant(N)]];` line.
+        let line_start = src[..attr_pos].rfind('\n').map_or(0, |p| p + 1);
+        let line_end = src[attr_pos..]
+            .find('\n')
+            .map_or(src.len(), |p| attr_pos + p + 1);
+        let decl_line = &src[line_start..line_end];
+
+        // Parse `<NAME>_tmp` from `constant uint <NAME>_tmp [[function_constant(N)]];`.
+        let after_uint = decl_line
+            .trim_start()
+            .strip_prefix("constant uint ")
+            .expect("expected 'constant uint ' prefix on function_constant decl");
+        let name_tmp = after_uint
+            .split_whitespace()
+            .next()
+            .expect("expected name token after 'constant uint '");
+        let name = name_tmp
+            .strip_suffix("_tmp")
+            .expect("expected '_tmp' suffix on function_constant name");
+
+        // The next line is the `is_function_constant_defined(...) ? ... : <default>u;`
+        // ternary that defines `NAME`. Consume it through the next `;\n`.
+        let after = line_end;
+        let semi = src[after..]
+            .find(";\n")
+            .expect("expected `;\\n` after function_constant ternary");
+        let next_line_end = after + semi + 2;
+
+        let replacement = format!("constant uint {name} = {value}u;\n");
+        let mut out = String::with_capacity(src.len());
+        out.push_str(&src[..line_start]);
+        out.push_str(&replacement);
+        out.push_str(&src[next_line_end..]);
+        return out;
+    }
+
+    panic!("spec constant slot {slot} ({id}) not found in MSL source");
 }
 
 /// Patch the default value of an `OpSpecConstant` (32-bit type) in a SPIR-V
@@ -1645,6 +1696,16 @@ impl Model {
                 const SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/", $name, ".comp.msl"));
                 let mut s: String = SRC.to_owned();
                 for &(id, value) in $spec_consts as &[(u32, u32)] {
+                    // Slot 0 (`SUBGROUP_SIZE`) is always 32 on Apple Silicon
+                    // (`pick_subgroup_config` enforces this), but the patch
+                    // is not always a no-op: when SUBGROUP_SIZE participates
+                    // in a constexpr context spirv-cross can't fold, it emits
+                    // `[[function_constant(0)]]` — which wgpu's passthrough
+                    // path can't bind — and `msl_set_function_const_u32` is
+                    // what rewrites the declaration to a literal.
+                    if id == SPEC_SUBGROUP_SIZE {
+                        debug_assert_eq!(value, 32, "Apple SUBGROUP_SIZE must be 32");
+                    }
                     s = msl_set_function_const_u32(&s, id, value);
                 }
                 unsafe {
@@ -2388,6 +2449,26 @@ mod tests {
         let p1 = s.find("#define SPIRV_CROSS_CONSTANT_ID_1 1234u").unwrap();
         let g1 = s.find("#ifndef SPIRV_CROSS_CONSTANT_ID_1").unwrap();
         assert!(p1 < g1, "patch must precede the guarded default");
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn msl_patcher_rewrites_function_constant_form() {
+        let src = "// preamble\n\
+                   constant uint SUBGROUP_SIZE_tmp [[function_constant(0)]];\n\
+                   constant uint SUBGROUP_SIZE = is_function_constant_defined(SUBGROUP_SIZE_tmp) ? SUBGROUP_SIZE_tmp : 32u;\n\
+                   constant bool _193 = (SUBGROUP_SIZE >= 32u);\n\
+                   kernel void cs_main() {}\n";
+        let s = super::msl_set_function_const_u32(src, 0, 32);
+        // The two-line declaration is collapsed into a single literal binding.
+        assert!(s.contains("constant uint SUBGROUP_SIZE = 32u;\n"));
+        // The function_constant attribute and ternary are gone — Metal would
+        // otherwise refuse to build a pipeline without MTLFunctionConstantValues.
+        assert!(!s.contains("[[function_constant("));
+        assert!(!s.contains("is_function_constant_defined"));
+        // Surrounding context is preserved.
+        assert!(s.contains("// preamble\n"));
+        assert!(s.contains("constant bool _193 = (SUBGROUP_SIZE >= 32u);\n"));
     }
 
     #[cfg(target_vendor = "apple")]
