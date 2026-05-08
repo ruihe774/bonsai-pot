@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`bonsai-pot` is a from-scratch, dependency-light **Bonsai (Qwen3-architecture) Q1_0 inference engine** built on **wgpu compute shaders**. It supports the Bonsai 4B and 8B model sizes. There is no `llama.cpp`, `ggml`, or PyTorch on the hot path — weights are loaded from a custom flat-file layout (produced by `scripts/extract.py` from a GGUF), all kernels are hand-rolled GLSL compiled to SPIR-V at build time and fed to wgpu via `create_shader_module_passthrough` (so naga is bypassed entirely), and the host side is plain Rust + wgpu 29 + pollster. The build needs `glslangValidator` (>= 14, for `GL_EXT_integer_dot_product`) and `spirv-opt` on `$PATH`.
+`bonsai-pot` is a from-scratch, dependency-light **Bonsai (Qwen3-architecture) Q1_0 inference engine** built on **wgpu compute shaders**. It supports the Bonsai 4B and 8B model sizes. There is no `llama.cpp`, `ggml`, or PyTorch on the hot path — weights are loaded from a custom flat-file layout (produced by `scripts/extract.py` from a GGUF), all kernels are hand-rolled GLSL compiled to SPIR-V at build time (Vulkan backend) or hand-ported MSL compiled by Metal at load time (Apple backend), fed to wgpu via `create_shader_module_passthrough` (so naga is bypassed entirely on both backends), and the host side is plain Rust + wgpu 29 + pollster. The Vulkan build needs `glslangValidator` (>= 14, for `GL_EXT_integer_dot_product`) and `spirv-opt` on `$PATH`; the Apple build needs only Xcode's bundled Metal toolchain.
 
 The crate exposes both:
 - a **library** (`bonsai_pot::{Model, Session, Sampler, GenerateOptions, …}`) for embedding the engine in other Rust programs;
@@ -36,8 +36,8 @@ cargo run --features bench-internals -- ./model --mode microbench
 
 Tests live in `tests/gpu_integration.rs` (end-to-end on a real GPU against `./model`) plus unit tests in `src/session.rs` (CPU sampler) and `src/kv_snapshot.rs` (header round-trips). Run with `cargo test`. Beyond that, `--mode gen` / `--mode prompt` plus parity diffs against captured baselines (and `examples/chat.rs`) are the correctness harness.
 
-- `--mode gen` (default): single-token matvec path for both prompt and generation (multiply-free Q1_0 hot path).
-- `--mode prompt`: batched dot4I8Packed matmul prefill (with a Q8_0 activation quantize pre-pass), then matvec for generation.
+- `--mode gen` (default): single-token matvec path for both prompt and generation (Q1_0 hot path: `dotPacked4x8EXT` against Q8_0 acts on Vulkan, f16 ±-accumulate on Metal).
+- `--mode prompt`: batched matmul prefill (Q8_0 activation quantize pre-pass + `dot4I8Packed` matmul on Vulkan; on Metal the matmul kernel dequantizes Q8_0 → f16 inline and uses the same f16 ±-accumulate inner loop), then matvec for generation.
 - `--mode bench`: prints an `llama-bench`-style table with pp/tg t/s. (There used to be a `tg{N} pipe` row from CHUNK=8 pipelining; that path was removed when sampling moved off the GPU.)
 - `--mode microbench`: per-kernel GPU-timestamp breakdown for a matmul prefill step (`--pp` tokens) followed by a tg step (KV pre-filled to `--tg` positions); shows us/call × calls/step for both paths.
 
@@ -81,11 +81,16 @@ uv run scripts/bpe.py ./model "Once upon a time" | cargo run ...
 - `scripts/extract.py` — GGUF → flat-file converter. Writes weights + vocab + merges + config.
 - `scripts/bpe.py` — standalone BPE encoder; reads model dir, writes u32 token IDs.
 
-### Q1_0 weight format and the multiply-free matvec
+### Q1_0 weight format and the matvec/matmul inner loops
 
-Q1_0 stores 128 weights per block as 16 bytes of sign bits (+1/-1 per weight) + a 2-byte FP16 scale `d` — 18 bytes per block. `scripts/extract.py` splits each Q1_0 tensor into a contiguous **d-array** (FP16 scales) followed by a **qs-array** (raw 16-byte sign blocks); the manifest in `config.ini` records `d_offset`, `qs_offset`, and `nb` (blocks per row) for every tensor. Both halves are u32-aligned — all WGSL reads are word loads.
+Q1_0 stores 128 weights per block as 16 bytes of sign bits (+1/-1 per weight) + a 2-byte FP16 scale `d` — 18 bytes per block. `scripts/extract.py` splits each Q1_0 tensor into a contiguous **d-array** (FP16 scales) followed by a **qs-array** (raw 16-byte sign blocks); the manifest in `config.ini` records `d_offset`, `qs_offset`, and `nb` (blocks per row) for every tensor. Both halves are u32-aligned — all reads are word loads. Sign-bit convention: bit=1 → weight=+1, bit=0 → weight=−1 (verifiable via `expand_4_bits`'s 4-byte spread).
 
-The hot-path kernel `shaders/matvec_q1_0.comp` therefore needs **no multiplications inside the inner loop** — it accumulates `±x` per weight via `select(-xv, xv, bit_set)` and only multiplies by `d` once per block. `matvec_q1_0_fused_normed.comp` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup to amortize x-load cost, and additionally folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip.
+Two inner-loop formulations live in the codebase, picked by backend:
+
+- **Vulkan / GLSL** (AMD, NVIDIA, Intel): the matvec/matmul kernels stage activations as Q8_0 in shmem and accumulate via `dotPacked4x8EXT` (one hardware DP4a instruction per 4-element dot on AMD Vega+, NVIDIA Pascal+, Intel Gen12+). The Q1_0 weights are unpacked to ±1 packed-byte form by `expand_4_bits` so the hardware integer dot reduces to "sum of ±a[i]" — fast and exact.
+- **Apple / MSL**: Apple GPUs lack a hardware integer dot product (no DP4a / `dotPacked4x8` / `OpSDot` equivalent — confirmed against `philipturner/metal-benchmarks` and the WebGPU DP4a proposal `gpuweb/gpuweb#2677`; `IMUL32` is 4 cyc/lane on Apple Silicon). The MSL kernels skip the Q8_0 round-trip entirely on the matvec path (and dequantize Q8_0 → f16 inline on the matmul path), then run the inner loop on Apple's fast f32 ALU pipe as `select(±a, cond)` accumulate per Q1_0 sign bit, with one f16 weight-scale multiply per block. Inner-loop ops drop from ~19 cyc per 4-element dot (4 IMUL32 + 3 ADD when expanded from `dot4i8packed`) to ~7 cyc fp ops. Empirically on M2 Pro / Bonsai-4B this lifts pp64 from 15 → 110 t/s and tg64 from 18 → 53 t/s end-to-end.
+
+`matvec_q1_0_fused_normed` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup to amortize x-load cost, and additionally folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip. On the MSL path, `inv_rms` is folded once at row-write (after the per-row 8-lane reduction); on the GLSL path it's folded into the per-Q8 sub-block scale.
 
 ### Two execution paths
 
@@ -136,6 +141,25 @@ Bonsai-4B / GB10 (NVIDIA Blackwell, wave32), microbench step time at m=512, pos_
 | WG=32 + portable wg_sum_v4 (current)   |     84.6  |    243.8  |    ~2100  |
 
 The WG=32 rewrite landed −56.6% on the attention kernel at m=512/pos_base=512; reintroducing the cross-subgroup fallback (so the kernel stays correct for subgroup_size < 32 hardware) gave back about 5% of the kernel time as dead-code overhead on the SG ≥ 32 fast path.
+
+Bonsai-4B / Apple M2 Pro (Metal, simdgroup_size=32), end-to-end at pp64/tg64:
+
+| state                                  | pp64 wall t/s | tg64 wall t/s | e2e_pp632 t/s | e2e_tg64 t/s |
+|----------------------------------------|--------------:|--------------:|--------------:|-------------:|
+| Q8_0 + dot4i8packed inner loop (pre)   |          15.0 |          18.4 |          16.1 |         20.5 |
+| f16 ±-accumulate inner loop (current)  |         110.4 |          53.2 |         116.5 |         67.1 |
+
+The MSL inner-loop rewrite recovered ~7.4× on prefill and ~3× on generation. Apple still trails AMD/NVIDIA on per-MAC throughput by a hard ~2× even after the rewrite — Apple's f16 packed-half2 path is 2 MACs/cyc/lane vs DP4a's 4 MACs/cyc/lane — plus another ~7× from raw lane-cycles/sec, so closing the wall-clock gap further would need either an algorithmic change (e.g. `simdgroup_matrix` reformulation against fp16 weight tiles) or accepting Apple's architectural ceiling for this workload.
+
+### Apple / Metal backend
+
+The Apple build path is structurally distinct enough to call out explicitly:
+
+- **Shaders.** `src/shaders/*.metal` are hand-ported MSL counterparts of the GLSL kernels with the same name. `build.rs` is a no-op on `target_vendor = "apple"`; MSL is included as a string at compile time and compiled by the Metal driver at `Model::load`. Both backends feed `create_shader_module_passthrough`.
+- **Specialization constants.** `SUBGROUP_SIZE` (SpecId 0) is baked as a literal `32` in the MSL source (Apple Silicon's simdgroup width is fixed). `MAX_CHUNKS` (SpecId 1) and `K_V4` (SpecId 2) remain as Metal **function constants**, which `model::msl_set_function_const_u32` patches at load time by string-substituting the `[[function_constant(N)]]` decl with a `constant uint X = literal;`.
+- **Inner-loop divergence.** Apple GPUs have no DP4a / hardware integer dot product (see `memory/apple_gpu_no_dp4a.md`). The MSL matvec/matmul kernels skip the Q8_0 round-trip in shmem and run an f32 `select(±a, cond)` accumulate instead — see the "Q1_0 weight format" section above. This is the largest single-shader divergence between the two backends; future kernel changes that touch the matvec/matmul inner loop should be made in both `.comp` and `.metal` files, with the MSL version preserving the f16-staged ±-accumulate pattern.
+- **Microbench.** Apple does not support `TIMESTAMP_QUERY_INSIDE_PASSES`, so the Apple microbench path uses one compute pass per labeled dispatch, with begin/end timestamps installed via `ComputePassDescriptor::timestamp_writes`. The single-pass `PassCtx` and per-dispatch `PerDispatchCtx` in `forward.rs` cover both backends behind one `DispatchCtx` trait. End-to-end pp/tg bench (`--mode bench`) uses single-pass timestamps and works identically on both backends.
+- **Limits.** `SUBGROUP_SIZE_CONTROL` is not requested on Apple (Metal lacks it). The validated subgroup floor is still 8, satisfied by Apple's fixed 32. `max_immediate_size` is requested at ≥128 B as on Vulkan.
 
 ### Sampling: hybrid GPU top-K → CPU finish
 
@@ -193,7 +217,7 @@ Since embed runs before topk_partial in any step, the two roles never alias. `bu
 
 ## When making changes
 
-- **Adding a new kernel**: write `shaders/foo.comp`, add the basename to `build.rs`'s `shaders` array so glslangValidator + spirv-opt produce `OUT_DIR/foo.comp.spv`, then `load_spirv!("foo.comp", spec_consts)` in `model.rs` (pass `no_spec` if it doesn't reference SpecId 0/1/2). Add a `FooParams` struct (≤ 64 bytes, `Pod + Zeroable + repr(C)`) in `model.rs`, register a BGL in `BindGroupLayouts` (single-rw discipline above), build a pipeline in `Pipelines`. Then add a `dispatch_foo` (in-pass) helper in `forward.rs` and slot it into the layer pipeline.
+- **Adding a new kernel**: write `shaders/foo.comp` AND `shaders/foo.metal` (the loader picks one per backend); add the basename to `build.rs`'s `shaders` array so glslangValidator + spirv-opt produce `OUT_DIR/foo.comp.spv`, then `load_shader!("foo", spec_consts, (wg_x, wg_y, wg_z))` in `model.rs` (pass `no_spec` if it doesn't reference SpecId 0/1/2; the `wg` tuple is required by the MSL passthrough path and ignored by the SPIR-V one). Add a `FooParams` struct (≤ 64 bytes, `Pod + Zeroable + repr(C)`) in `model.rs`, register a BGL in `BindGroupLayouts` (single-rw discipline above), build a pipeline in `Pipelines`. Then add a `dispatch_foo` helper in `forward.rs` and route it through `ctx.dispatch("foo_label", |pass| dispatch_foo(...))` at each call site.
 - **Modifying weight layout**: changes to Q1_0 packing or to the grouping of tensors into the 5 buffers must be made in **both** `scripts/extract.py` (writer) and `model.rs` / shaders (reader), and the manifest format in `config.ini` will need to round-trip. Re-extract the model dir after any layout change.
 - **Modifying the tokenizer / pretok regex**: changes to vocab encoding must be made in **both** `scripts/extract.py` (which writes `vocab.bin` + `merges.txt`) and `scripts/bpe.py` (which encodes prompts) and possibly `src/decode.rs` (which inverts the byte-level mapping). The Rust runtime never tokenizes, only decodes.
 - **Public API changes**: re-exports live in `src/lib.rs`. Anything not re-exported there is internal and may change without notice; keep `Model`, `ModelConfig`, `LoadOptions`, `Session`, `Sampler`, `GenerateOptions`, `StopReason`, `KvSnapshot`, `PotError`, `Result`, `TOPK_MAX` stable.
