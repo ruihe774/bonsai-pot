@@ -14,10 +14,7 @@ use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 
-use ash::ext::global_priority;
-use ash::vk;
 use bytemuck::{Pod, Zeroable, cast_slice};
-use wgpu::hal::api::Vulkan as VulkanApi;
 use wgpu::util::DeviceExt as _;
 use wgpu::{Backends, InstanceDescriptor};
 
@@ -608,8 +605,10 @@ pub const ATTN_CHUNK_SIZE: u32 = 8;
 /// to *all* other GPU clients (compositors, games, other ML processes). Requires
 /// driver support for `VK_EXT_global_priority`; if unsupported the requested
 /// value is ignored and a warning is logged.
-pub use vk::QueueGlobalPriorityKHR as GlobalPriority;
+#[cfg(not(target_vendor = "apple"))]
+pub use ash::vk::QueueGlobalPriorityKHR as GlobalPriority;
 
+#[cfg(not(target_vendor = "apple"))]
 fn global_priority_fallback_to_queue_prio(priority: GlobalPriority) -> f32 {
     const LOWEST: i32 = GlobalPriority::LOW.as_raw();
     const HIGHEST: i32 = GlobalPriority::HIGH.as_raw();
@@ -640,6 +639,7 @@ pub struct LoadOptions {
     /// [`GlobalPriority::LOW`] — yields to compositors and other GPU clients,
     /// which is appropriate for background inference. If the driver does not
     /// expose `VK_EXT_global_priority` this field is silently ignored.
+    #[cfg(not(target_vendor = "apple"))]
     pub priority: GlobalPriority,
     /// Power Preference when choosing a physical adapter.
     ///
@@ -652,6 +652,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             max_seq: DEFAULT_MAX_SEQ,
+            #[cfg(not(target_vendor = "apple"))]
             priority: GlobalPriority::LOW,
             power_perference: PowerPreference::HighPerformance,
         }
@@ -993,7 +994,11 @@ impl Model {
 
         // ---- wgpu init ------------------------------------------------------
         let mut instance_desc = InstanceDescriptor::new_without_display_handle();
-        instance_desc.backends = Backends::VULKAN;
+        if cfg!(target_vendor = "apple") {
+            instance_desc.backends = Backends::METAL;
+        } else {
+            instance_desc.backends = Backends::VULKAN;
+        }
         let instance = wgpu::Instance::new(instance_desc);
         let adapter = pin!(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: opts.power_perference,
@@ -1090,7 +1095,12 @@ impl Model {
         // still asks for queue (0,0) which we never requested — segfault.
         // Instead we replicate `open_with_callback` ourselves and pass the
         // chosen family index through to `device_from_raw`.
+        #[cfg(not(target_vendor = "apple"))]
         let hal_open = unsafe {
+            use ash::ext::global_priority;
+            use ash::vk;
+            use wgpu::hal::api::Vulkan as VulkanApi;
+
             let Some(hal_adapter) = adapter.as_hal::<VulkanApi>() else {
                 unreachable!("Vulkan adapter expected");
             };
@@ -1184,8 +1194,18 @@ impl Model {
             }
         };
 
-        let Ok((device, queue)) = (unsafe { adapter.create_device_from_hal(hal_open, &desc) })
-        else {
+        #[cfg(target_vendor = "apple")]
+        let r = {
+            let future = pin!(adapter.request_device(&desc));
+            match future.poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Pending => unreachable!("native wgpu always resolves immediately"),
+                Poll::Ready(r @ Ok(_)) => r,
+                Poll::Ready(e @ Err(_)) => e,
+            }
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let r = unsafe { adapter.create_device_from_hal(hal_open, &desc) };
+        let Ok((device, queue)) = r else {
             return Err(PotError::NoDevice);
         };
 

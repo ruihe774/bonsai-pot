@@ -35,8 +35,6 @@ bench-internals = ["dep:env_logger"]
 
 [dependencies]
 # Library deps.
-wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "subgroup_control_v39", default-features = false, features = ["std", "parking_lot", "vulkan"] }
-ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 log = "0.4"
@@ -44,6 +42,13 @@ thiserror = "2"
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
 env_logger = { version = "0.11", optional = true }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "subgroup_control_v39", default-features = false, features = ["std", "parking_lot", "vulkan"] }
+ash = "0.38"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "subgroup_control_v39", default-features = false, features = ["std", "parking_lot", "metal"] }
 
 [dev-dependencies]
 env_logger = "0.11"

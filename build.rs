@@ -1,12 +1,21 @@
-#![allow(clippy::panic, clippy::expect_used, reason = "build script")]
+#![allow(clippy::panic, clippy::unwrap_used, reason = "build script")]
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    if env::var_os("CARGO_CFG_TARGET_VENDOR")
+        .unwrap()
+        .as_encoded_bytes()
+        == b"apple"
+    {
+        // Nothing to do in macOS: MSL does not need compilation
+        return;
+    }
+
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let debug_shaders = env::var("PROFILE").as_deref() == Ok("debug");
 
     // Every kernel runs as a precompiled SPIR-V shader module, fed to wgpu via
