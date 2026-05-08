@@ -1286,14 +1286,14 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
 /// Each `MicroMarker` reuses `model.buffers.bench_query_set` starting from slot 0,
 /// so only one `MicroMarker` may be live at a time (the previous one must be
 /// resolved before a new one is marked into the same query set).
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
 pub struct MicroMarker<'m> {
     model: &'m Model,
     next_idx: u32,
     labels: Vec<&'static str>,
 }
 
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
 impl<'m> MicroMarker<'m> {
     pub const fn new(model: &'m Model) -> Self {
         Self {
@@ -1323,7 +1323,7 @@ impl<'m> MicroMarker<'m> {
     }
 }
 
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
 impl StepMarker for MicroMarker<'_> {
     #[inline(always)]
     fn setup_desc<'a>(&'a self, _desc: &mut wgpu::ComputePassDescriptor<'a>) {}
