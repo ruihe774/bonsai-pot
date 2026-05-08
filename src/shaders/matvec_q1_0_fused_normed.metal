@@ -2,8 +2,13 @@
 using namespace metal;
 
 // Multi-range Q1_0 matvec fused with the preceding RMS-norm + scale.
-// Inner matmul uses dotPacked4x8-style accumulation against a Q8_0 staged
-// activation in LDS. Used for fused QKV (3 ranges) and gate+up (2 ranges).
+//
+// Apple variant: weights are ±1, so the inner loop is a sign-flip-and-
+// accumulate against the f16 staged activation. No int8 dot product (Apple
+// GPUs lack DP4a / dotPacked4x8 — see memory/apple_gpu_no_dp4a.md), no
+// Q8_0 quantize-then-dequantize round-trip in shmem. This trades 4 IMUL32
+// (4 cyc each on Apple) + 3 ADD per 4-element dot for 4 fselect-with-neg +
+// 3 FADD on the fast f32 ALU pipe.
 
 constant uint K_V4 [[function_constant(2)]];
 
@@ -34,17 +39,6 @@ static inline float load_f16_at(device const uint* weights, uint b_offset) {
     return float(as_type<half2>(half_bits).x);
 }
 
-static inline uint expand_4_bits(uint bits) {
-    uint spread = (bits * 0x00204081u) & 0x01010101u;
-    return ~(spread * 0xFEu);
-}
-
-static inline int dot4i8packed(uint a, uint b) {
-    packed_char4 vec1 = as_type<packed_char4>(a);
-    packed_char4 vec2 = as_type<packed_char4>(b);
-    return vec1[0] * vec2[0] + vec1[1] * vec2[1] + vec1[2] * vec2[2] + vec1[3] * vec2[3];
-}
-
 constant uint WG_X = 8u;
 constant uint WG_Y = 16u;
 constant uint WG = WG_X * WG_Y;
@@ -62,12 +56,9 @@ kernel void cs_main(
     uint sg_id [[simdgroup_index_in_threadgroup]])
 {
     threadgroup half4 x_sh[K_V4];
-    threadgroup uint a_qs_sh[K_V4];
-    threadgroup float a_d_sh[(K_V4 << 2) / 32];
     threadgroup float sg_partial[NUM_SUBGROUPS];
 
     uint K = K_V4 << 2;
-    uint NB_Q8 = K >> 5;
     uint wg_idx = wg_id.y * p.dispatch_x_dim + wg_id.x;
     uint ty = tid / WG_X;
     uint tx = tid % WG_X;
@@ -103,35 +94,9 @@ kernel void cs_main(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float total = sg_partial[0];
     float inv_rms = rsqrt(total / float(K) + p.eps);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Stage 2: per-block Q8_0 quantize ----
-    if (tid < NB_Q8) {
-        uint block_v4_base = tid * 8u;
-        half max_abs_h = half(0.0);
-        #pragma unroll
-        for (uint i = 0u; i < 8u; ++i) {
-            half4 af = abs(x_sh[block_v4_base + i]);
-            max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
-        }
-        float max_abs = float(max_abs_h);
-        float d = max_abs * inv_rms * (1.0f / 127.0f);
-        a_d_sh[tid] = d;
-        float inv_max = 127.0f / max(max_abs, 1.0e-30f);
-        #pragma unroll
-        for (uint i = 0u; i < 8u; ++i) {
-            float4 v = float4(x_sh[block_v4_base + i]);
-            float4 q = clamp(rint(v * inv_max), float4(-128.0f), float4(127.0f));
-            uint q0 = uint(int(q.x)) & 0xFFu;
-            uint q1 = uint(int(q.y)) & 0xFFu;
-            uint q2 = uint(int(q.z)) & 0xFFu;
-            uint q3 = uint(int(q.w)) & 0xFFu;
-            a_qs_sh[i * NB_Q8 + tid] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ---- Stage 3: matvec inner ----
+    // ---- Stage 2: matvec inner. ±-accumulate against f16 x_sh; multiply
+    //              by d_w per Q1_0 block; fold inv_rms once at row write.
     uint d_off = 0u;
     uint qs_off = 0u;
     uint out_off = 0u;
@@ -163,31 +128,32 @@ kernel void cs_main(
         for (uint b = tx; b < nb_q1; b += WG_X) {
             float d_w = load_f16_at(weights, row_d_byte + b * 2u);
             uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
-            uint a_block_base = b * 4u;
+            uint x_block_base = b * 32u; // half4 stride per Q1_0 block (128 elems / 4)
             float sub_acc = 0.0f;
             #pragma unroll
             for (uint s = 0u; s < 4u; ++s) {
                 uint qword = weights[qs_word_base + s];
-                float a_d = a_d_sh[a_block_base + s];
-                uint block_l = a_block_base + s;
-                int sumi = 0;
                 #pragma unroll
                 for (uint i = 0u; i < 8u; ++i) {
                     uint bits = (qword >> (i * 4u)) & 0xFu;
-                    uint w_packed = expand_4_bits(bits);
-                    uint a_packed = a_qs_sh[i * NB_Q8 + block_l];
-                    sumi = dot4i8packed(w_packed, a_packed) + sumi;
+                    float4 a4 = float4(x_sh[x_block_base + s * 8u + i]);
+                    // Q1_0 sign convention: bit=1 → weight=+1, bit=0 → weight=-1.
+                    sub_acc += (bits & 1u) != 0u ? a4.x : -a4.x;
+                    sub_acc += (bits & 2u) != 0u ? a4.y : -a4.y;
+                    sub_acc += (bits & 4u) != 0u ? a4.z : -a4.z;
+                    sub_acc += (bits & 8u) != 0u ? a4.w : -a4.w;
                 }
-                sub_acc += a_d * float(sumi);
             }
             acc += d_w * sub_acc;
         }
     }
 
+    // 8-lane row reduction via SIMD shuffle butterfly (within one simdgroup).
     acc += simd_shuffle_xor(acc, 1u);
     acc += simd_shuffle_xor(acc, 2u);
     acc += simd_shuffle_xor(acc, 4u);
     if (tx == 0u && valid) {
+        acc *= inv_rms;
         uint yi = out_off + local_row;
         act[yi] = half(acc);
     }
