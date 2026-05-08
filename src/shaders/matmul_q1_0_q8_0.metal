@@ -110,40 +110,50 @@ kernel void cs_main(
             wd[tn] = w_d_lds[lx * TN + tn];
         }
 
+        // Hoist all 4×TN sign-bit words into registers once per Q1_0 block so
+        // the inner s-loop never re-reads from threadgroup memory.
+        uint bw_all[4][TN];
         #pragma unroll
         for (uint s = 0u; s < 4u; ++s) {
-            uint bw[TN];
             #pragma unroll
             for (uint tn = 0u; tn < TN; ++tn) {
-                bw[tn] = w_bits_lds[s * 64u + lx * TN + tn];
+                bw_all[s][tn] = w_bits_lds[s * 64u + lx * TN + tn];
             }
+        }
 
+        #pragma unroll
+        for (uint s = 0u; s < 4u; ++s) {
             #pragma unroll
             for (uint tm = 0u; tm < TM; ++tm) {
                 uint m_local = ly * TM + tm;
-                float sub_acc[TN];
+                // Inner reduction on packed-half2 f16 ALU pipe (2 MAC/cyc/lane).
+                half4 acc4[TN];
                 #pragma unroll
                 for (uint tn = 0u; tn < TN; ++tn) {
-                    sub_acc[tn] = 0.0f;
+                    acc4[tn] = half4(0.0h);
                 }
 
                 #pragma unroll
                 for (uint i = 0u; i < 8u; ++i) {
-                    float4 a4 = float4(a_sh[m_local * 32u + s * 8u + i]);
+                    half4 a4 = a_sh[m_local * 32u + s * 8u + i];
                     #pragma unroll
                     for (uint tn = 0u; tn < TN; ++tn) {
-                        uint bits = (bw[tn] >> (i * 4u)) & 0xFu;
-                        // Q1_0 sign convention: bit=1 → weight=+1, bit=0 → weight=-1.
-                        sub_acc[tn] += (bits & 1u) != 0u ? a4.x : -a4.x;
-                        sub_acc[tn] += (bits & 2u) != 0u ? a4.y : -a4.y;
-                        sub_acc[tn] += (bits & 4u) != 0u ? a4.z : -a4.z;
-                        sub_acc[tn] += (bits & 8u) != 0u ? a4.w : -a4.w;
+                        uint bits = (bw_all[s][tn] >> (i * 4u)) & 0xFu;
+                        // Q1_0 sign convention: bit=1 → +a, bit=0 → -a.
+                        half4 signs = half4(
+                            ((bits & 1u) != 0u) ? 1.0h : -1.0h,
+                            ((bits & 2u) != 0u) ? 1.0h : -1.0h,
+                            ((bits & 4u) != 0u) ? 1.0h : -1.0h,
+                            ((bits & 8u) != 0u) ? 1.0h : -1.0h);
+                        acc4[tn] += a4 * signs;
                     }
                 }
 
                 #pragma unroll
                 for (uint tn = 0u; tn < TN; ++tn) {
-                    acc[tm * TN + tn] += wd[tn] * sub_acc[tn];
+                    float sub_acc = float(acc4[tn].x) + float(acc4[tn].y)
+                                  + float(acc4[tn].z) + float(acc4[tn].w);
+                    acc[tm * TN + tn] += wd[tn] * sub_acc;
                 }
             }
         }

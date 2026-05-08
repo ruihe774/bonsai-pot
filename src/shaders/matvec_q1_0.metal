@@ -77,21 +77,29 @@ kernel void cs_main(
                 float d_w = load_f16_at(weights, row_d_byte + b * 2u);
                 uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
                 uint x_block_base = b_local * 32u; // half4 stride per Q1_0 block in tile-local a_sh
-                float sub_acc = 0.0f;
+                // Run inner reduction on packed-half2 f16 ALU pipe (2 MAC/cyc/lane
+                // vs f32's 1). 128 ±-terms per Q1_0 block × O(1) activations fits
+                // comfortably in fp16; the d_w * sub_acc accumulate stays f32.
+                half4 acc4 = half4(0.0h);
                 #pragma unroll
                 for (uint s = 0u; s < 4u; ++s) {
                     uint qword = weights[qs_word_base + s];
                     #pragma unroll
                     for (uint i = 0u; i < 8u; ++i) {
                         uint bits = (qword >> (i * 4u)) & 0xFu;
-                        float4 a4 = float4(a_sh[x_block_base + s * 8u + i]);
-                        // Q1_0 sign convention: bit=1 → weight=+1, bit=0 → weight=-1.
-                        sub_acc += (bits & 1u) != 0u ? a4.x : -a4.x;
-                        sub_acc += (bits & 2u) != 0u ? a4.y : -a4.y;
-                        sub_acc += (bits & 4u) != 0u ? a4.z : -a4.z;
-                        sub_acc += (bits & 8u) != 0u ? a4.w : -a4.w;
+                        half4 a4 = a_sh[x_block_base + s * 8u + i];
+                        // Q1_0 sign convention: bit=1 → +a, bit=0 → -a. Build a
+                        // half4 of ±1 signs and FMA into the half4 accumulator —
+                        // the compiler maps this to 2 packed-half2 vmul/vadd.
+                        half4 signs = half4(
+                            ((bits & 1u) != 0u) ? 1.0h : -1.0h,
+                            ((bits & 2u) != 0u) ? 1.0h : -1.0h,
+                            ((bits & 4u) != 0u) ? 1.0h : -1.0h,
+                            ((bits & 8u) != 0u) ? 1.0h : -1.0h);
+                        acc4 += a4 * signs;
                     }
                 }
+                float sub_acc = float(acc4.x) + float(acc4.y) + float(acc4.z) + float(acc4.w);
                 acc += d_w * sub_acc;
             }
         }
