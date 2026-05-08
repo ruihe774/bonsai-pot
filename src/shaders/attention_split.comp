@@ -41,10 +41,19 @@ layout(set = 0, binding = 1, std430) readonly buffer KCache { uint k_cache[]; };
 layout(set = 0, binding = 2, std430) readonly buffer VCache { uint v_cache[]; };
 layout(set = 0, binding = 3, std430) buffer Partials { float partials[]; };
 
+// Apple sweep: WG=32 (1 simdgroup) wins ~5% on tg over WG=64 — `wg_sum_v4`
+// becomes a no-op (NUM_SUBGROUPS=1 → simd_sum already covers the whole WG)
+// and the smem-staged cross-SG combine drops out. ELEMS_PER_THREAD doubles
+// to keep head_dim=128 covered.
+#ifndef METAL_BACKEND
 const uint WG = 64u;
+const uint ELEMS_PER_THREAD = 2u; // head_dim (128) / WG (64)
+#else
+const uint WG = 32u;
+const uint ELEMS_PER_THREAD = 4u; // head_dim (128) / WG (32)
+#endif
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 const uint Q_PER_GROUP = 4u;
-const uint ELEMS_PER_THREAD = 2u; // head_dim (128) / WG (64)
 const uint CHUNK_SIZE = 8u;
 const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
@@ -94,7 +103,11 @@ float load_v(uint t, uint e_local) {
     return scale * float(qs_signed);
 }
 
+#ifndef METAL_BACKEND
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 void main() {
     uint g = gl_WorkGroupID.x;
