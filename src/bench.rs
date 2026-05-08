@@ -11,9 +11,9 @@ use std::time::Instant;
 use wgpu::PollType;
 
 use super::{
-    Model, PassCtx, PerDispatchCtx, Result, StepEncoder, encode_step_matvec,
-    prefill_matmul_topk, prefill_matmul_with_ctx, resolve_per_dispatch, resolve_whole_pass_ns,
-    step_matvec_no_sample, upload_sample, wait_topk_readback, whole_pass_timestamp_writes,
+    Model, PassCtx, PerDispatchCtx, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk,
+    prefill_matmul_with_ctx, resolve_per_dispatch, resolve_whole_pass_ns, step_matvec_no_sample,
+    upload_sample, wait_topk_readback, whole_pass_timestamp_writes,
 };
 use crate::error::PotError;
 use crate::session::{GenerateOptions, Sampler};
