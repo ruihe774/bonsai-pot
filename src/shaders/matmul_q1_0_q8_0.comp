@@ -116,9 +116,7 @@ void main() {
         // work below. Only 16 uints / thread → no register pressure issue.
         uint bw_all[4u * TN];
         [[unroll]] for (uint s = 0u; s < 4u; ++s) {
-            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-                bw_all[s * TN + tn] = w_bits_lds[s * 64u + lx * TN + tn];
-            }
+            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) { bw_all[s * TN + tn] = w_bits_lds[s * 64u + lx * TN + tn]; }
         }
 
         [[unroll]] for (uint s = 0u; s < 4u; ++s) {

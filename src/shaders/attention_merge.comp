@@ -31,9 +31,18 @@ p;
 layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
 layout(set = 0, binding = 1, std430) readonly buffer Partials { float partials[]; };
 
+// Apple sweep: WG=32 (1 simdgroup) + ELEMS_PER_THREAD=4 covers head_dim=128
+// in one pass and collapses `wg_max`/`wg_sum` to a single simd_max/simd_sum.
+// Vulkan keeps WG=128 / EPT=1 since the inner phase-C loop's `tid + i*WG`
+// indexing reads sequential lanes per chunk and amortizes the partials load.
+#ifndef METAL_BACKEND
 const uint WG = 128u;
-const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 const uint ELEMS_PER_THREAD = 1u;
+#else
+const uint WG = 32u;
+const uint ELEMS_PER_THREAD = 4u;
+#endif
+const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
 shared float sg_partial[NUM_SUBGROUPS];
@@ -77,7 +86,11 @@ float wg_sum(float local_v) {
     return sg_partial[0];
 }
 
+#ifndef METAL_BACKEND
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 void main() {
     uint h = gl_WorkGroupID.x;
