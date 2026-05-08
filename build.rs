@@ -180,6 +180,8 @@ fn run_spirv_cross_msl(spv_path: &Path, msl_path: &Path) {
         .arg("--msl")
         .arg("--msl-version")
         .arg("30000")
+        .arg("--msl-fixed-subgroup-size")
+        .arg("32")
         .arg("--rename-entry-point")
         .arg("main")
         .arg("cs_main")
