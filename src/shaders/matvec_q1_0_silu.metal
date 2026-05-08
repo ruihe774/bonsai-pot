@@ -26,8 +26,13 @@ static inline float load_f16_at(device const uint* weights, uint b_offset) {
     return float(as_type<half2>(half_bits).x);
 }
 
+// Apple sweep: WG_Y=32 (256 threads, 8 simdgroups per WG) wins ~5% on
+// e2e_tg over WG_Y=16. The kernel has no cross-WG reduction, so the larger
+// WG just amortizes the per-WG `a_sh` activation load (5 KB) over more
+// output rows; dispatch count drops 2× and Apple's GPU absorbs the extra
+// concurrent lanes per WG without contention.
 constant uint WG_X = 8u;
-constant uint WG_Y = 16u;
+constant uint WG_Y = 32u;
 constant uint WG = WG_X * WG_Y;
 constant uint ROWS_PER_WG = WG_Y;
 constant uint TILE_K = 4096u;

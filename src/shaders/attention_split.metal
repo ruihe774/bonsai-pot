@@ -19,10 +19,13 @@ struct Params {
     float scale;
 };
 
-constant uint WG = 64u;
-constant uint NUM_SUBGROUPS = WG / 32u; // = 2
+// Apple sweep: WG=32 (1 simdgroup) wins ~5% on tg over the previous WG=64
+// (2-SG) layout. The cross-SG `wg_sum_v4` becomes a no-op (NUM_SUBGROUPS=1
+// → simd_sum already covers the whole WG). EPT=4 covers head_dim=128.
+constant uint WG = 32u;
+constant uint NUM_SUBGROUPS = WG / 32u; // = 1
 constant uint Q_PER_GROUP = 4u;
-constant uint ELEMS_PER_THREAD = 2u;
+constant uint ELEMS_PER_THREAD = 4u;
 constant uint CHUNK_SIZE = 8u;
 constant uint PARTIAL_STRIDE = 130u;
 
