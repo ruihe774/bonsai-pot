@@ -1097,11 +1097,15 @@ impl Model {
         }
 
         let info = adapter.get_info();
-        log::info!(
-            "adapter subgroup range: min={}, max={}",
-            info.subgroup_min_size,
-            info.subgroup_max_size,
-        );
+        if cfg!(target_vendor = "apple") {
+            log::info!("adapter subgroup size: 32 (Apple Silicon)");
+        } else {
+            log::info!(
+                "adapter subgroup range: min={}, max={}",
+                info.subgroup_min_size,
+                info.subgroup_max_size,
+            );
+        }
 
         let mut limits = adapter.limits();
         // Floor at 300 MB so the largest grouped weight buffer (~510 MB at 8B) fits
