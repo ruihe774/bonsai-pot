@@ -176,13 +176,8 @@ impl<'m> Session<'m> {
         let chunk = self.model.max_prefill_tokens() as usize;
         let mut chosen = 0u32;
         for slice in tokens.chunks(chunk) {
-            let (logits, indices) = forward::prefill_matmul_topk(
-                self.model,
-                slice,
-                self.pos,
-                k,
-                &mut forward::NoMarker,
-            )?;
+            let (logits, indices) =
+                forward::prefill_matmul_topk(self.model, slice, self.pos, k, None)?;
             chosen = sample_from_topk(&logits, &indices, sampler, self.pos);
             self.pos += slice.len() as u32;
         }
