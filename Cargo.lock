@@ -198,9 +198,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.61"
+version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
+checksum = "a1dce859f0832a7d088c4f1119888ab94ef4b5d6795d1ce05afb7fe159d79f98"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -727,7 +727,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -1401,7 +1401,7 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1429,7 +1429,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -1460,7 +1460,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "wgpu-hal",
 ]
@@ -1468,7 +1468,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "wgpu-hal",
 ]
@@ -1476,7 +1476,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -1516,7 +1516,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -1525,7 +1525,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=subgroup_control_v39#3d05a830ac9e20b2db879304773b51ce4a91ed36"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
 dependencies = [
  "bitflags",
  "bytemuck",
