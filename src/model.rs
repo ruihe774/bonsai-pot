@@ -514,6 +514,108 @@ fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
     panic!("spec constant slot {slot} ({id}) not found in MSL source");
 }
 
+/// Rewrite `[[buffer(N)]]` decorations on the `cs_main` kernel signature so
+/// the kernel's buffer slots match wgpu's Metal HAL allocation: push constants
+/// at slot 0, then storage-buffer bindings at slots 1.. in SPIR-V binding
+/// order. (See `wgpu-hal/src/metal/device.rs::create_pipeline_layout`.)
+///
+/// Why this is needed: spirv-cross numbers MSL buffer slots in SPIR-V
+/// `OpVariable` declaration order, which for the matvec/embed shaders puts
+/// a storage buffer at slot 0 and the push constant at slot 1 — silently
+/// swapping `Params` with the first SSBO at runtime and causing the shader
+/// to read garbage. Other shaders happened to declare the push constant
+/// first in their SPIR-V and so escaped notice.
+///
+/// The fix is to re-sort by `(is_ssbo, old_slot)`: the push constant lands
+/// first because `false < true`, and SSBOs follow in their existing slot
+/// order — which matches SPIR-V binding order, since spirv-cross emits
+/// SSBOs in binding order with the push constant inserted at whatever slot
+/// it falls in. The sorted position is the new MSL buffer slot. Textures
+/// and samplers are not used by this engine, so we only handle buffers.
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::panic, reason = "shaders are written by us")]
+fn msl_remap_buffer_indices_for_wgpu(src: &str) -> String {
+    let head = "kernel void cs_main(";
+    let head_pos = src
+        .find(head)
+        .expect("'kernel void cs_main(' not found in MSL source");
+    let args_start = head_pos + head.len();
+
+    let bytes = src.as_bytes();
+    let mut depth: u32 = 1;
+    let mut args_end = args_start;
+    let mut i = args_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    args_end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    assert!(depth == 0, "unterminated cs_main argument list");
+
+    let sig = &src[args_start..args_end];
+    let marker = "[[buffer(";
+
+    // (is_ssbo, old_slot, byte_start, byte_end). `is_ssbo` is the primary
+    // sort key so push constants land at sorted-position 0; `old_slot` is
+    // the secondary key so SSBOs keep their existing relative order (which
+    // is SPIR-V binding order).
+    let mut entries: Vec<(bool, u32, usize, usize)> = Vec::new();
+    let mut p = 0;
+    while let Some(rel) = sig[p..].find(marker) {
+        let abs = p + rel;
+        let after = abs + marker.len();
+        let close_rel = sig[after..]
+            .find(")]]")
+            .expect("malformed [[buffer(N)]] decoration");
+        let close = after + close_rel;
+        let old_slot: u32 = sig[after..close]
+            .parse()
+            .expect("non-numeric buffer index in [[buffer(N)]]");
+        let arg_start = sig[..abs].rfind(',').map_or(0, |c| c + 1);
+        let is_ssbo = !sig[arg_start..abs].trim_start().starts_with("constant ");
+        entries.push((is_ssbo, old_slot, abs, close + ")]]".len()));
+        p = close + ")]]".len();
+    }
+
+    // Derive new slot = sorted position.
+    let mut sorted = entries.clone();
+    sorted.sort_by_key(|&(is_ssbo, old_slot, ..)| (is_ssbo, old_slot));
+    let new_slot = |old: u32| -> u32 {
+        sorted
+            .iter()
+            .position(|&(_, o, ..)| o == old)
+            .expect("slot not in sort table") as u32
+    };
+
+    if entries.iter().all(|&(_, old, ..)| new_slot(old) == old) {
+        return src.to_owned();
+    }
+
+    let mut new_sig = String::with_capacity(sig.len());
+    let mut last = 0;
+    for &(_, old, start, end) in &entries {
+        new_sig.push_str(&sig[last..start]);
+        new_sig.push_str(&format!("[[buffer({})]]", new_slot(old)));
+        last = end;
+    }
+    new_sig.push_str(&sig[last..]);
+
+    let mut out = String::with_capacity(src.len());
+    out.push_str(&src[..args_start]);
+    out.push_str(&new_sig);
+    out.push_str(&src[args_end..]);
+    out
+}
+
 /// Patch the default value of an `OpSpecConstant` (32-bit type) in a SPIR-V
 /// module identified by its `SpecId` decoration. wgpu's passthrough shader
 /// path doesn't expose `VkSpecializationInfo` to the application, so we bake
@@ -1708,6 +1810,7 @@ impl Model {
                     }
                     s = msl_set_function_const_u32(&s, id, value);
                 }
+                s = msl_remap_buffer_indices_for_wgpu(&s);
                 unsafe {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
@@ -2476,6 +2579,45 @@ mod tests {
     #[should_panic(expected = "not found in MSL source")]
     fn msl_patcher_panics_on_missing_slot() {
         let _ = super::msl_set_function_const_u32("kernel void cs_main() {}\n", 0, 32);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn msl_remap_swaps_push_constant_to_slot_zero() {
+        // Reproduces the spirv-cross emission for matvec_q1_0.comp: an SSBO
+        // gets buffer(0) and the push constant gets buffer(1), with another
+        // SSBO at buffer(2). wgpu's HAL allocates push-constants → slot 0
+        // and SSBOs → slot 1.., so the rewrite must put `Params` at slot 0
+        // and shift the leading SSBO up by one.
+        let src = "kernel void cs_main(device WBuf& _17 [[buffer(0)]], constant Params& p [[buffer(1)]], device ActBuf& _170 [[buffer(2)]], uint3 wid [[threadgroup_position_in_grid]]) { }\n";
+        let out = super::msl_remap_buffer_indices_for_wgpu(src);
+        assert!(out.contains("device WBuf& _17 [[buffer(1)]]"));
+        assert!(out.contains("constant Params& p [[buffer(0)]]"));
+        assert!(out.contains("device ActBuf& _170 [[buffer(2)]]"));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn msl_remap_is_a_noop_when_already_correct() {
+        let src = "kernel void cs_main(constant Params& p [[buffer(0)]], device KCache& _107 [[buffer(1)]], device VCache& _167 [[buffer(2)]], device ActBuf& _353 [[buffer(3)]], uint3 wid [[threadgroup_position_in_grid]]) { }\n";
+        let out = super::msl_remap_buffer_indices_for_wgpu(src);
+        assert_eq!(out, src);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn msl_remap_handles_push_constant_in_middle_of_many_ssbos() {
+        // Mirrors the matvec_q1_0_fused_normed and embed shapes: push constant
+        // sits between binding 0 and binding 1 in spirv-cross's emission.
+        let src = "kernel void cs_main(device WBuf& a [[buffer(0)]], constant Params& p [[buffer(1)]], device ActBuf& b [[buffer(2)]], device NormBuf& c [[buffer(3)]]) { }\n";
+        let out = super::msl_remap_buffer_indices_for_wgpu(src);
+        // Push-constant moves to slot 0; the SSBO that was at slot 0
+        // shifts to slot 1; the other SSBOs (already past the push constant
+        // in the original layout) keep their slots.
+        assert!(out.contains("device WBuf& a [[buffer(1)]]"));
+        assert!(out.contains("constant Params& p [[buffer(0)]]"));
+        assert!(out.contains("device ActBuf& b [[buffer(2)]]"));
+        assert!(out.contains("device NormBuf& c [[buffer(3)]]"));
     }
 
     #[cfg(not(target_vendor = "apple"))]
