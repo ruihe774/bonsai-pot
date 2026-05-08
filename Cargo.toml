@@ -35,7 +35,7 @@ bench-internals = ["dep:env_logger"]
 
 [dependencies]
 # Library deps.
-wgpu = { version = "29", default-features = false, features = ["std", "vulkan"] }
+wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "vulkan"] }
 ash = "0.38"
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }

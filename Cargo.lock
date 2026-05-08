@@ -1404,6 +1404,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "js-sys",
  "log",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
