@@ -132,6 +132,7 @@ void main() {
     float total;
     if (NUM_SUBGROUPS == 1u) {
         total = sg_sum;
+        barrier();
     } else {
         if (gl_SubgroupInvocationID == 0u)
             sg_partial[gl_SubgroupID] = sg_sum;
@@ -148,7 +149,6 @@ void main() {
         total = sg_partial[0];
     }
     float inv_rms = inversesqrt(total / float(K) + p.eps);
-    barrier();
 
 #ifndef METAL_BACKEND
     // ---- Stage 2: quantize each Q8_0 block (8 f16vec4) to Q8_0 ----
