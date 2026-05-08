@@ -2,6 +2,12 @@
 using namespace metal;
 
 // Q1_0 weights × Q8_0 activations -> f16 output. 64×64 tile, 256 threads.
+//
+// Apple variant: Q1_0 weights are ±1, so the inner loop is a sign-flip-and-
+// accumulate against f16 staged activations. No int8 dot product (Apple GPUs
+// lack DP4a — see memory/apple_gpu_no_dp4a.md). Q8_0 activations are
+// dequantized to f16 once during the cooperative load into shmem; the inner
+// loop runs entirely on Apple's fast f32 ALU pipe.
 
 struct Params {
     uint k;
@@ -21,19 +27,7 @@ static inline float load_w_f16(device const uint* weights, uint b_offset) {
     return float(as_type<half2>(half_bits).x);
 }
 
-static inline uint expand_4_bits(uint bits) {
-    uint spread = (bits * 0x00204081u) & 0x01010101u;
-    return ~(spread * 0xFEu);
-}
-
-static inline int dot4i8packed(uint a, uint b) {
-    packed_char4 vec1 = as_type<packed_char4>(a);
-    packed_char4 vec2 = as_type<packed_char4>(b);
-    return vec1[0] * vec2[0] + vec1[1] * vec2[1] + vec1[2] * vec2[2] + vec1[3] * vec2[3];
-}
-
 constant uint WG_N = 16u;
-constant uint WG_M = 16u;
 constant uint WG = 256u;
 constant uint TN = 4u;
 constant uint TM = 4u;
@@ -50,8 +44,8 @@ kernel void cs_main(
 {
     threadgroup float w_d_lds[64];
     threadgroup uint w_bits_lds[256];
-    threadgroup float a_d_lds[256];
-    threadgroup uint a_qs_lds[2048];
+    // 64 tokens × 32 half4 per token (= 128 elements) = 2048 half4 = 16 KB.
+    threadgroup half4 a_sh[TILE_M * 32u];
 
     uint n_base = wg_id.x * TILE_N;
     uint m_base = wg_id.y * TILE_M;
@@ -67,7 +61,7 @@ kernel void cs_main(
         acc[i] = 0.0f;
 
     for (uint b = 0u; b < nb_q1; ++b) {
-        // ---- Cooperative loads ----
+        // ---- Cooperative loads: weight scales + sign bits ----
         if (tid < 64u) {
             uint n_idx = n_base + tid;
             w_d_lds[tid] = load_w_f16(weights, p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
@@ -79,62 +73,78 @@ kernel void cs_main(
             uint off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
             w_bits_lds[s * 64u + n_local] = weights[off >> 2];
         }
-        {
-            uint s = tid / 64u;
-            uint m_local = tid % 64u;
-            uint m_idx = m_base + m_local;
-            uint a_block = b * 4u + s;
-            uint off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
-            a_d_lds[s * 64u + m_local] = as_type<float>(acts[off >> 2]);
-        }
+
+        // ---- Cooperative load: activations (dequant Q8_0 → f16 inline) ----
+        // a_sh layout: a_sh[m_local * 32 + v4_local], where v4_local = s * 8 + i
+        // covers element [m_local, b*128 + s*32 + i*4 .. i*4 + 3].
+        // 2048 half4 across 256 threads → 8 half4 per thread.
         #pragma unroll
         for (uint li = 0u; li < 8u; ++li) {
-            uint idx = li * WG + tid;
-            uint m_local = idx / 32u;
-            uint su = idx % 32u;
+            uint idx = li * WG + tid;       // 0..2047
+            uint m_local = idx / 32u;        // 0..63 (token within tile)
+            uint v4_local = idx % 32u;        // 0..31 (half4 index within 128 elems)
+            uint sub = v4_local / 8u;         // 0..3 (Q8_0 sub-block)
+            uint v4_in_sub = v4_local % 8u;   // 0..7 (half4 within sub-block)
+
             uint m_idx = m_base + m_local;
-            uint off = p.a_qs_offset + m_idx * p.k + b * 128u + su * 4u;
-            a_qs_lds[m_local * 32u + su] = acts[off >> 2];
+            uint a_block = b * 4u + sub;
+
+            // Q8_0 d-scale (one per 32-element sub-block).
+            uint d_off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
+            float a_d = as_type<float>(acts[d_off >> 2]);
+
+            // Q8_0 quantized i8 quants — 4 i8 per uint.
+            uint qs_off = p.a_qs_offset + m_idx * p.k + b * 128u + sub * 32u + v4_in_sub * 4u;
+            uint q_packed = acts[qs_off >> 2];
+            char4 q_chars = as_type<char4>(q_packed);
+
+            float4 q_f = float4(float(q_chars[0]), float(q_chars[1]), float(q_chars[2]), float(q_chars[3])) * a_d;
+            a_sh[idx] = half4(q_f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // ---- Inner: per-thread (4 tm × 4 tn) outputs ----
         float wd[TN];
         #pragma unroll
-        for (uint tn = 0u; tn < TN; ++tn) { wd[tn] = w_d_lds[lx * TN + tn]; }
+        for (uint tn = 0u; tn < TN; ++tn) {
+            wd[tn] = w_d_lds[lx * TN + tn];
+        }
 
         #pragma unroll
         for (uint s = 0u; s < 4u; ++s) {
-            uint w[TN][8];
+            uint bw[TN];
             #pragma unroll
             for (uint tn = 0u; tn < TN; ++tn) {
-                uint bw = w_bits_lds[s * 64u + lx * TN + tn];
-                #pragma unroll
-                for (uint i = 0u; i < 8u; ++i) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
+                bw[tn] = w_bits_lds[s * 64u + lx * TN + tn];
             }
 
             #pragma unroll
             for (uint tm = 0u; tm < TM; ++tm) {
                 uint m_local = ly * TM + tm;
-                float a_d = a_d_lds[s * 64u + m_local];
-                uint a_base = m_local * 32u + s * 8u;
-                uint a[8];
+                float sub_acc[TN];
                 #pragma unroll
-                for (uint i = 0u; i < 8u; ++i) { a[i] = a_qs_lds[a_base + i]; }
+                for (uint tn = 0u; tn < TN; ++tn) {
+                    sub_acc[tn] = 0.0f;
+                }
 
-                int sumi[TN];
-                #pragma unroll
-                for (uint tn = 0u; tn < TN; ++tn)
-                    sumi[tn] = 0;
                 #pragma unroll
                 for (uint i = 0u; i < 8u; ++i) {
+                    float4 a4 = float4(a_sh[m_local * 32u + s * 8u + i]);
                     #pragma unroll
                     for (uint tn = 0u; tn < TN; ++tn) {
-                        sumi[tn] = dot4i8packed(w[tn][i], a[i]) + sumi[tn];
+                        uint bits = (bw[tn] >> (i * 4u)) & 0xFu;
+                        // Q1_0 sign convention: bit=1 → weight=+1, bit=0 → weight=-1.
+                        sub_acc[tn] += (bits & 1u) != 0u ? a4.x : -a4.x;
+                        sub_acc[tn] += (bits & 2u) != 0u ? a4.y : -a4.y;
+                        sub_acc[tn] += (bits & 4u) != 0u ? a4.z : -a4.z;
+                        sub_acc[tn] += (bits & 8u) != 0u ? a4.w : -a4.w;
                     }
                 }
 
                 #pragma unroll
-                for (uint tn = 0u; tn < TN; ++tn) { acc[tm * TN + tn] += a_d * wd[tn] * float(sumi[tn]); }
+                for (uint tn = 0u; tn < TN; ++tn) {
+                    acc[tm * TN + tn] += wd[tn] * sub_acc[tn];
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
