@@ -31,7 +31,9 @@ mod session;
 
 pub use error::{PotError, Result};
 pub use kv_snapshot::KvSnapshot;
-pub use model::{GlobalPriority, LoadOptions, Model};
+#[cfg(not(target_vendor = "apple"))]
+pub use model::GlobalPriority;
+pub use model::{LoadOptions, Model};
 pub use session::{GenerateOptions, Sampler, Session, StopReason};
 
 /// Bench / microbench helpers, exposed only with the `bench-internals` feature.
