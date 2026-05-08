@@ -73,11 +73,7 @@ kernel void cs_main(
         float v = float(act[in_base + elem_idx]) * inv_h * float(w[p.weight_offset + elem_idx]);
 
         float m = fabs(v);
-        m = max(m, simd_shuffle_xor(m, 1u));
-        m = max(m, simd_shuffle_xor(m, 2u));
-        m = max(m, simd_shuffle_xor(m, 4u));
-        m = max(m, simd_shuffle_xor(m, 8u));
-        m = max(m, simd_shuffle_xor(m, 16u));
+        m = simd_max(m);
         float d = m / 127.0f;
         float id_inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
         uint qv = uint(int(clamp(rint(v * id_inv), -127.0f, 127.0f))) & 0xFFu;
