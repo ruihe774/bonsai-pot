@@ -4,16 +4,22 @@
 //! Included as a child module of `forward` via `#[path]` so the helpers can
 //! reach `forward`'s private items via `super::`.
 
+#[cfg(not(target_vendor = "apple"))]
 use std::cmp::Ordering;
+#[cfg(not(target_vendor = "apple"))]
 use std::collections::HashMap;
 use std::time::Instant;
 
+#[cfg(not(target_vendor = "apple"))]
 use wgpu::PollType;
 
 use super::{
-    BenchMarker, MicroMarker, Model, NoMarker, Result, StepEncoder, encode_step_matvec,
-    prefill_matmul_topk, step_matvec_no_sample, upload_sample, wait_topk_readback,
+    BenchMarker, Model, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk,
+    step_matvec_no_sample, upload_sample, wait_topk_readback,
 };
+#[cfg(not(target_vendor = "apple"))]
+use super::{MicroMarker, NoMarker};
+#[cfg(not(target_vendor = "apple"))]
 use crate::error::PotError;
 use crate::session::{GenerateOptions, Sampler};
 
@@ -221,6 +227,7 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
 /// attention scans a single KV entry, which is unrepresentative. The KV cache
 /// is pre-filled with `pos` no-readback steps before measurement so attention
 /// sees `pos+1` cached tokens on each measured step.
+#[cfg(not(target_vendor = "apple"))]
 pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> Result<()> {
     if pos >= model.max_seq {
         return Err(PotError::ContextOverflow {
@@ -329,6 +336,7 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
 }
 
 /// Run one instrumented matvec step at `pos`, returning per-span GPU durations.
+#[cfg(not(target_vendor = "apple"))]
 fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f32)>> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(model);
@@ -345,6 +353,7 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
 /// Like [`run_instrumented_step`] but with no per-kernel timestamp marker —
 /// used in `--no-marker` profiling mode so the measurement is exactly one submit
 /// with no resolve submit afterward.
+#[cfg(not(target_vendor = "apple"))]
 fn run_uninstrumented_step(model: &Model, pos: u32) -> Result<()> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(model);
@@ -365,6 +374,7 @@ fn run_uninstrumented_step(model: &Model, pos: u32) -> Result<()> {
 /// measurement so the measured prefill runs at `pos_base = m` — the matmul
 /// attention then scans `[0, m + m_tok]` per query, exercising the realistic
 /// "prefill into an existing context" path rather than always starting at 0.
+#[cfg(not(target_vendor = "apple"))]
 pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Result<()> {
     let m = m.min(model.m_max);
     if m == 0 {
@@ -485,6 +495,7 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     Ok(())
 }
 
+#[cfg(not(target_vendor = "apple"))]
 fn run_instrumented_prefill(
     model: &Model,
     prompt: &[u32],

@@ -22,6 +22,9 @@
 //! [`Session::prefill`]. Decode token ids back to bytes/text via
 //! [`Model::decode_token`] and [`Model::decode_tokens`].
 
+#[cfg(all(target_vendor = "apple", not(target_arch = "aarch64")))]
+compile_error!("the Metal backend requires Apple Silicon (aarch64); Intel Macs are not supported");
+
 mod decode;
 mod error;
 pub(crate) mod forward;
@@ -41,5 +44,7 @@ pub use session::{GenerateOptions, Sampler, Session, StopReason};
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod __bench {
-    pub use crate::forward::bench_internals::{bench, microbench_pp, microbench_tg};
+    pub use crate::forward::bench_internals::bench;
+    #[cfg(not(target_vendor = "apple"))]
+    pub use crate::forward::bench_internals::{microbench_pp, microbench_tg};
 }
