@@ -53,61 +53,33 @@ const fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
     (d_word, qs_byte)
 }
 
-// ---------- dispatch context ------------------------------------------------
-// Generic hook for routing encoded dispatches into a compute pass. Two flavors:
-//
-//   * [`PassCtx`] — single open pass shared by every dispatch in one step.
-//     Used by production (no instrumentation) and by whole-step pp/tg
-//     benching (a single `ComputePassTimestampWrites` set on the pass
-//     descriptor records begin/end of the whole step). Keeps `begin_compute_pass`
-//     overhead at one call per step.
-//
-//   * [`PerDispatchCtx`] — opens a fresh compute pass per labeled dispatch,
-//     each with its own `ComputePassTimestampWrites { begin, end }` recording
-//     a begin/end timestamp pair. Used by `--mode microbench` for per-kernel
-//     breakdowns. Works on Apple Metal, which does not support
-//     `TIMESTAMP_QUERY_INSIDE_PASSES`. `begin_compute_pass` overhead is paid
-//     per dispatch (~tens of µs), so this is bench-only.
+// ---------- step-encoder marker --------------------------------------------
+// Generic hook for instrumenting `encode_step_matvec` / `prefill_matmul_topk`
+// without forking them. Production passes `&mut NoMarker` (zero-cost: the
+// trait methods are `#[inline(always)]` with empty bodies, so the compiler
+// drops the calls entirely). Bench builds (`bench-internals`) provide two
+// alternative impls — `BenchMarker` (whole-pass begin/end timestamps via
+// `ComputePassDescriptor::timestamp_writes`, no per-dispatch overhead) and
+// `MicroMarker` (per-dispatch `pass.write_timestamp` for kernel breakdowns);
+// see further down.
 
-pub trait DispatchCtx {
-    /// Run a labeled dispatch. Implementations decide whether to reuse one
-    /// open pass or open a fresh pass with `timestamp_writes` for this label.
-    /// The closure receives the active compute pass.
-    fn dispatch<F>(&mut self, label: &'static str, f: F)
-    where
-        F: FnOnce(&mut wgpu::ComputePass<'_>);
+pub trait StepMarker {
+    /// Populate the pass descriptor before `begin_compute_pass`. `BenchMarker`
+    /// uses this hook to install whole-pass `timestamp_writes` (cheap, no
+    /// per-dispatch flushes); `NoMarker` and `MicroMarker` leave it untouched.
+    fn setup_desc<'a>(&'a self, desc: &mut wgpu::ComputePassDescriptor<'a>);
+
+    /// Write a per-dispatch timestamp inside an open pass. `MicroMarker` uses
+    /// this; `NoMarker` and `BenchMarker` are no-ops.
+    fn mark(&mut self, pass: &mut wgpu::ComputePass<'_>, label: &'static str);
 }
 
-/// Single open pass shared by all dispatches in one step.
-///
-/// Optionally installs whole-pass `timestamp_writes` on the descriptor when
-/// constructed — used by [`bench`] for pp/tg wall-vs-gpu measurements.
-pub struct PassCtx<'a> {
-    pass: wgpu::ComputePass<'a>,
-}
-
-impl<'a> PassCtx<'a> {
-    pub fn new(
-        encoder: &'a mut wgpu::CommandEncoder,
-        label: &'static str,
-        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'a>>,
-    ) -> Self {
-        let pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(label),
-            timestamp_writes,
-        });
-        Self { pass }
-    }
-}
-
-impl DispatchCtx for PassCtx<'_> {
+pub struct NoMarker;
+impl StepMarker for NoMarker {
     #[inline(always)]
-    fn dispatch<F>(&mut self, _label: &'static str, f: F)
-    where
-        F: FnOnce(&mut wgpu::ComputePass<'_>),
-    {
-        f(&mut self.pass);
-    }
+    fn setup_desc<'a>(&'a self, _desc: &mut wgpu::ComputePassDescriptor<'a>) {}
+    #[inline(always)]
+    fn mark(&mut self, _pass: &mut wgpu::ComputePass<'_>, _label: &'static str) {}
 }
 
 // ---------- per-step encoder ------------------------------------------------
@@ -654,23 +626,32 @@ pub fn wait_topk_readback(model: &Model, k: u32) -> Result<(Vec<f32>, Vec<u32>)>
 
 // ---------- single-token forward (matvec) ----------------------------------
 
-/// Encode one tg step into `ctx`. The input token is read from
+/// Encode one tg step into the given encoder. The input token is read from
 /// `sample[sample_in]`. If `topk_out = Some((base, k))`, the suffix
 /// (`output_norm` + LM head + `topk_reduce`) is appended and the top-K logits +
 /// indices land at `sample[base..base + 2*k]`. If `topk_out = None`, the
 /// suffix is skipped — useful for KV-fill-only steps (e.g. mid-prefill) where
 /// the sampled token isn't read.
-pub fn encode_step_matvec<C: DispatchCtx>(
-    ctx: &mut C,
-    m: &Model,
+pub fn encode_step_matvec<M: StepMarker>(
+    se: &mut StepEncoder,
     cfg: &Config,
     sample_in: u32,
     topk_out: Option<(u32, u32)>,
     pos: u32,
+    marker: &mut M,
 ) {
+    let StepEncoder { model: m, encoder } = se;
     let ot = &m.output_tensors;
+    let mut desc = wgpu::ComputePassDescriptor {
+        label: Some("step_matvec"),
+        timestamp_writes: None,
+    };
+    marker.setup_desc(&mut desc);
+    let mut pass = encoder.begin_compute_pass(&desc);
+    marker.mark(&mut pass, "start");
 
-    ctx.dispatch("embed", |pass| {
+    // embed
+    {
         let p = EmbedParams {
             k: cfg.n_embd,
             d_offset: ot.token_embd_d,
@@ -682,71 +663,69 @@ pub fn encode_step_matvec<C: DispatchCtx>(
         pass.set_bind_group(0, &m.cached.embed, &[]);
         pass.set_immediates(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(1, 1, 1);
-    });
+    }
+    marker.mark(&mut pass, "embed");
 
     for il in 0..cfg.n_layer {
-        layer_pre_kv(ctx, m, cfg, il, pos);
+        layer_pre_kv_in_pass(m, cfg, &mut pass, il, pos, marker);
         // Fused: K (rms_norm + *w_k_norm + RoPE + Q8_0 quantize) and V (Q8_0
         // quantize) → write both into kv_{k,v}. Replaces the previous
         // rms_norm(K) + rope(K) + kv_writeback trio (3 dispatches → 1).
         let lt = &m.layer_tensors[il as usize];
-        ctx.dispatch("kv_writeback", |pass| {
-            dispatch_kv_writeback_fused(
-                m,
-                cfg,
-                pass,
-                m.act_layout.k_cur,
-                m.act_layout.v_cur,
-                lt.attn_k_norm_off,
-                il,
-                pos,
-                1,
-            );
-        });
-        layer_post_kv(ctx, m, cfg, il, pos);
+        dispatch_kv_writeback_fused(
+            m,
+            cfg,
+            &mut pass,
+            m.act_layout.k_cur,
+            m.act_layout.v_cur,
+            lt.attn_k_norm_off,
+            il,
+            pos,
+            1,
+        );
+        marker.mark(&mut pass, "kv_writeback");
+        layer_post_kv_in_pass(m, cfg, &mut pass, il, pos, marker);
     }
     if let Some((topk_out_u32_base, k)) = topk_out {
         // output suffix: rms_norm in-place on x, then LM head reads
         // directly from x (saves one f16 vector round-trip vs. x_norm staging).
-        ctx.dispatch("output_norm", |pass| {
-            dispatch_rms_norm(
-                m,
-                cfg,
-                pass,
-                1,
-                cfg.n_embd,
-                m.act_layout.x,
-                m.act_layout.x,
-                ot.output_norm_off,
-            );
-        });
+        dispatch_rms_norm(
+            m,
+            cfg,
+            &mut pass,
+            1,
+            cfg.n_embd,
+            m.act_layout.x,
+            m.act_layout.x,
+            ot.output_norm_off,
+        );
+        marker.mark(&mut pass, "output_norm");
 
-        ctx.dispatch("lm_head", |pass| {
-            dispatch_matvec_q1_0(
-                m,
-                pass,
-                cfg.n_embd,
-                cfg.n_vocab,
-                WeightSet::Embed,
-                ot.lm_head_d,
-                ot.lm_head_qs,
-                m.act_layout.x,
-                m.act_layout.logits,
-                false,
-            );
-        });
+        dispatch_matvec_q1_0(
+            m,
+            &mut pass,
+            cfg.n_embd,
+            cfg.n_vocab,
+            WeightSet::Embed,
+            ot.lm_head_d,
+            ot.lm_head_qs,
+            m.act_layout.x,
+            m.act_layout.logits,
+            false,
+        );
+        marker.mark(&mut pass, "lm_head");
 
-        ctx.dispatch("topk_reduce", |pass| {
-            dispatch_topk_reduce(
-                m,
-                pass,
-                cfg.n_vocab,
-                k,
-                m.act_layout.logits,
-                topk_out_u32_base,
-            );
-        });
+        dispatch_topk_reduce(
+            m,
+            &mut pass,
+            cfg.n_vocab,
+            k,
+            m.act_layout.logits,
+            topk_out_u32_base,
+        );
+        marker.mark(&mut pass, "topk_reduce");
     }
+    drop(pass);
 }
 
 /// Build (but do not submit) one full tg-step `CommandBuffer`: staging upload →
@@ -763,10 +742,7 @@ pub fn build_step_matvec_topk_cb(model: &Model, pos: u32, k: u32) -> wgpu::Comma
     let k = k.clamp(1, TOPK_MAX);
     let mut se = StepEncoder::new(model);
     encode_sample_upload(model, &mut se.encoder, 0, 4);
-    {
-        let mut ctx = PassCtx::new(&mut se.encoder, "step_matvec", None);
-        encode_step_matvec(&mut ctx, model, &model.cfg, 0, Some((0, k)), pos);
-    }
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, k)), pos, &mut NoMarker);
     let bytes = u64::from(k) * 8;
     se.copy_sample_to_readback(bytes);
     se.schedule_topk_map(bytes);
@@ -796,10 +772,7 @@ pub fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
     upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&token_id));
     // We still encode the topk_reduce dispatch (with k=1, the single argmax case)
     // so the timing reflects real generation cost; we just skip the readback.
-    {
-        let mut ctx = PassCtx::new(&mut se.encoder, "step_matvec", None);
-        encode_step_matvec(&mut ctx, model, &model.cfg, 0, Some((0, 1)), pos);
-    }
+    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut NoMarker);
     let cb = se.finish();
     model.queue.submit(Some(cb));
     // Drive the staging-buffer remap callback so `staging` is mapped for the next call.
@@ -807,57 +780,69 @@ pub fn step_matvec_no_sample(model: &Model, token_id: u32, pos: u32) {
 }
 
 /// Pre-KV-copy block of one layer: `rms_norm` → QKV fused → q/k norms → rope.
-fn layer_pre_kv<C: DispatchCtx>(ctx: &mut C, model: &Model, cfg: &Config, il: u32, pos: u32) {
+fn layer_pre_kv_in_pass<M: StepMarker>(
+    model: &Model,
+    cfg: &Config,
+    pass: &mut wgpu::ComputePass<'_>,
+    il: u32,
+    pos: u32,
+    marker: &mut M,
+) {
     let lt = &model.layer_tensors[il as usize];
     // Fused: rms_norm(x) * w_attn_norm → matvec_q1_0_fused (QKV).
     // Replaces a 2-dispatch sequence (rms_norm, matvec_q1_0_fused).
     // x is read directly (NOT x_norm); the kernel stages x to LDS, normalizes
     // in place, and runs the matvec inner loop off the normed shmem.
-    ctx.dispatch("qkv_fused_normed", |pass| {
-        dispatch_matvec_q1_0_fused_normed(
-            model,
-            cfg,
-            pass,
-            cfg.n_embd,
-            model.act_layout.x,
-            lt.attn_norm_off,
-            WeightSet::Attn,
-            &[
-                (lt.wq.0, lt.wq.1, cfg.q_dim, model.act_layout.q),
-                (lt.wk.0, lt.wk.1, cfg.kv_dim, model.act_layout.k_cur),
-                (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
-            ],
-        );
-    });
+    dispatch_matvec_q1_0_fused_normed(
+        model,
+        cfg,
+        pass,
+        cfg.n_embd,
+        model.act_layout.x,
+        lt.attn_norm_off,
+        WeightSet::Attn,
+        &[
+            (lt.wq.0, lt.wq.1, cfg.q_dim, model.act_layout.q),
+            (lt.wk.0, lt.wk.1, cfg.kv_dim, model.act_layout.k_cur),
+            (lt.wv.0, lt.wv.1, cfg.kv_dim, model.act_layout.v_cur),
+        ],
+    );
+    marker.mark(pass, "qkv_fused_normed");
 
     // Q's rms_norm + *w_q_norm + NEOX-RoPE, written back into act.q in place.
     // K's rms_norm + RoPE + Q8_0 quantize + writeback into kv_k, plus V's
     // quantize + writeback into kv_v, all happen inside dispatch_kv_writeback_fused
     // (called from encode_step_matvec).
-    ctx.dispatch("q_norm_rope", |pass| {
-        dispatch_q_norm_rope_fused(
-            model,
-            cfg,
-            pass,
-            model.act_layout.q,
-            lt.attn_q_norm_off,
-            pos,
-            1,
-        );
-    });
+    dispatch_q_norm_rope_fused(
+        model,
+        cfg,
+        pass,
+        model.act_layout.q,
+        lt.attn_q_norm_off,
+        pos,
+        1,
+    );
+    marker.mark(pass, "q_norm_rope");
 }
 
 /// Post-KV-copy block of one layer: attention → Wo (resid) → `ffn_norm`
 /// → gate-up fused → `silu_mul` → Wd (resid).
-fn layer_post_kv<C: DispatchCtx>(ctx: &mut C, model: &Model, cfg: &Config, il: u32, pos: u32) {
+fn layer_post_kv_in_pass<M: StepMarker>(
+    model: &Model,
+    cfg: &Config,
+    pass: &mut wgpu::ComputePass<'_>,
+    il: u32,
+    pos: u32,
+    marker: &mut M,
+) {
     let lt = &model.layer_tensors[il as usize];
 
     // Split-K + GQA-batched flash-attention for tg (m_tokens=1).
-    let cur_pos = pos + 1;
-    let n_chunks_active = cur_pos.div_ceil(ATTN_CHUNK_SIZE);
-    let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, il);
+    {
+        let cur_pos = pos + 1;
+        let n_chunks_active = cur_pos.div_ceil(ATTN_CHUNK_SIZE);
+        let (d_word, qs_byte) = kv_layer_offsets(cfg, model.max_seq, il);
 
-    ctx.dispatch("attn_split", |pass| {
         let ps = AttnSplitParams {
             head_dim: cfg.head_dim,
             n_head: cfg.n_head,
@@ -876,9 +861,8 @@ fn layer_post_kv<C: DispatchCtx>(ctx: &mut C, model: &Model, cfg: &Config, il: u
         pass.set_bind_group(0, &model.cached.attn_split, &[]);
         pass.set_immediates(0, bytemuck::bytes_of(&ps));
         pass.dispatch_workgroups(cfg.n_kv_head, n_chunks_active, 1);
-    });
+        marker.mark(pass, "attn_split");
 
-    ctx.dispatch("attn_merge", |pass| {
         let pm = AttnMergeParams {
             head_dim: cfg.head_dim,
             n_head: cfg.n_head,
@@ -889,60 +873,58 @@ fn layer_post_kv<C: DispatchCtx>(ctx: &mut C, model: &Model, cfg: &Config, il: u
         pass.set_bind_group(0, &model.cached.attn_merge, &[]);
         pass.set_immediates(0, bytemuck::bytes_of(&pm));
         pass.dispatch_workgroups(cfg.n_head, 1, 1);
-    });
+        marker.mark(pass, "attn_merge");
+    }
 
-    ctx.dispatch("wo", |pass| {
-        dispatch_matvec_q1_0(
-            model,
-            pass,
-            cfg.q_dim,
-            cfg.n_embd,
-            WeightSet::Attn,
-            lt.wo.0,
-            lt.wo.1,
-            model.act_layout.attn_out,
-            model.act_layout.x,
-            true, /*accumulate*/
-        );
-    });
+    dispatch_matvec_q1_0(
+        model,
+        pass,
+        cfg.q_dim,
+        cfg.n_embd,
+        WeightSet::Attn,
+        lt.wo.0,
+        lt.wo.1,
+        model.act_layout.attn_out,
+        model.act_layout.x,
+        true, /*accumulate*/
+    );
+    marker.mark(pass, "wo");
 
     // Fused: rms_norm(x) * w_ffn_norm → matvec_q1_0_fused (gate+up).
     // Replaces a 2-dispatch sequence (rms_norm, matvec_q1_0_fused).
-    ctx.dispatch("gate_up_fused_normed", |pass| {
-        dispatch_matvec_q1_0_fused_normed(
-            model,
-            cfg,
-            pass,
-            cfg.n_embd,
-            model.act_layout.x,
-            lt.ffn_norm_off,
-            WeightSet::FfnGU,
-            &[
-                (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
-                (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
-            ],
-        );
-    });
+    dispatch_matvec_q1_0_fused_normed(
+        model,
+        cfg,
+        pass,
+        cfg.n_embd,
+        model.act_layout.x,
+        lt.ffn_norm_off,
+        WeightSet::FfnGU,
+        &[
+            (lt.wg.0, lt.wg.1, cfg.n_ff, model.act_layout.gate),
+            (lt.wu.0, lt.wu.1, cfg.n_ff, model.act_layout.up),
+        ],
+    );
+    marker.mark(pass, "gate_up_fused_normed");
 
     // Fused: silu(gate) * up on the input side of Wd, in one dispatch (no
     // ffn_in round-trip, no standalone silu_mul). The standalone silu_mul
     // shader and the matmul-prefill path's `silu_mul -> matmul_q1_0_q8_0`
     // pair are unchanged — this fusion is matvec-path-only.
-    ctx.dispatch("wd_silu", |pass| {
-        dispatch_matvec_q1_0_silu(
-            model,
-            pass,
-            cfg.n_ff,
-            cfg.n_embd,
-            WeightSet::FfnD,
-            lt.wd.0,
-            lt.wd.1,
-            model.act_layout.gate,
-            model.act_layout.up,
-            model.act_layout.x,
-            true, /*accumulate*/
-        );
-    });
+    dispatch_matvec_q1_0_silu(
+        model,
+        pass,
+        cfg.n_ff,
+        cfg.n_embd,
+        WeightSet::FfnD,
+        lt.wd.0,
+        lt.wd.1,
+        model.act_layout.gate,
+        model.act_layout.up,
+        model.act_layout.x,
+        true, /*accumulate*/
+    );
+    marker.mark(pass, "wd_silu");
 }
 
 /// Run the matvec single-token path over every token in `prompt`, advancing
@@ -986,14 +968,13 @@ pub fn prefill_matvec_loop_topk(
         let mut se = StepEncoder::new(model);
         upload_sample(model, &mut se.encoder, 0, bytemuck::cast_slice(chunk));
         for (i, t) in (chunk_start..chunk_end).enumerate() {
-            let mut ctx = PassCtx::new(&mut se.encoder, "step_matvec", None);
             encode_step_matvec(
-                &mut ctx,
-                model,
+                &mut se,
                 &model.cfg,
                 /*sample_in=*/ i as u32,
                 /*topk_out=*/ None,
                 /*pos=*/ pos_base + t as u32,
+                &mut NoMarker,
             );
         }
         let cb = se.finish();
@@ -1008,22 +989,42 @@ pub fn prefill_matvec_loop_topk(
 
 /// Batched matmul prefill of `prompt` starting from KV-cache position
 /// `pos_base`. Advances pos from `pos_base` to `pos_base + prompt.len()`.
-/// Returns top-K candidates from the last token's logits. The caller supplies
-/// the [`DispatchCtx`] that determines whether all dispatches share one pass
-/// (production / whole-pass benching) or each gets its own pass with timestamps
-/// (microbench).
-pub fn prefill_matmul_with_ctx<C: DispatchCtx>(
-    ctx: &mut C,
+/// Returns top-K candidates from the last token's logits.
+pub fn prefill_matmul_topk<M: StepMarker>(
     model: &Model,
-    cfg: &Config,
-    m: u32,
+    prompt: &[u32],
     pos_base: u32,
     k: u32,
-) {
+    marker: &mut M,
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    let m = prompt.len() as u32;
+    if m == 0 || m > model.m_max {
+        return Err(PotError::PrefillTooLarge {
+            n: m,
+            max: model.m_max,
+        });
+    }
+    let cfg = &model.cfg;
     let ot = &model.output_tensors;
+    let k = k.clamp(1, TOPK_MAX);
 
-    // Phase 1: embed all M tokens (one dispatch).
-    ctx.dispatch("embed", |pass| {
+    // ---- All phases (embed → per-layer transformer → final norm/LM-head/topk
+    //      → readback copy) into ONE command buffer / ONE submit, with all
+    //      compute dispatches sharing ONE pass to amortize the
+    //      begin_compute_pass cost (~25us each on RADV).
+    let mut se = StepEncoder::new(model);
+    upload_sample(model, &mut se.encoder, 0, bytemuck::cast_slice(prompt));
+
+    {
+        let mut desc = wgpu::ComputePassDescriptor {
+            label: Some("prefill_matmul"),
+            timestamp_writes: None,
+        };
+        marker.setup_desc(&mut desc);
+        let mut pass = se.encoder.begin_compute_pass(&desc);
+        marker.mark(&mut pass, "start");
+
+        // Phase 1: embed all M tokens (one dispatch).
         let p = EmbedParams {
             k: cfg.n_embd,
             d_offset: ot.token_embd_d,
@@ -1035,31 +1036,30 @@ pub fn prefill_matmul_with_ctx<C: DispatchCtx>(
         pass.set_bind_group(0, &model.cached.embed, &[]);
         pass.set_immediates(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(m, 1, 1);
-    });
 
-    // Phase 2: per-layer transformer.
-    for il in 0..cfg.n_layer {
-        layer_step_matmul(ctx, model, cfg, il, m, pos_base);
-    }
+        marker.mark(&mut pass, "embed");
 
-    // Phase 3: output_norm (last token, in-place) + LM head + topk_reduce.
-    let last_x = model.act_layout.x + (m - 1) * cfg.n_embd;
-    ctx.dispatch("output_norm", |pass| {
+        // Phase 2: per-layer transformer.
+        for il in 0..cfg.n_layer {
+            layer_step_matmul_in_pass(model, cfg, &mut pass, il, m, pos_base, marker);
+        }
+
+        // Phase 3: output_norm (last token, in-place) + LM head + topk_reduce.
+        let last_x = model.act_layout.x + (m - 1) * cfg.n_embd;
         dispatch_rms_norm(
             model,
             cfg,
-            pass,
+            &mut pass,
             1,
             cfg.n_embd,
             last_x,
             last_x,
             ot.output_norm_off,
         );
-    });
-    ctx.dispatch("lm_head", |pass| {
+        marker.mark(&mut pass, "output_norm");
         dispatch_matvec_q1_0(
             model,
-            pass,
+            &mut pass,
             cfg.n_embd,
             cfg.n_vocab,
             WeightSet::Embed,
@@ -1069,42 +1069,9 @@ pub fn prefill_matmul_with_ctx<C: DispatchCtx>(
             model.act_layout.logits,
             false,
         );
-    });
-    ctx.dispatch("topk_reduce", |pass| {
-        dispatch_topk_reduce(model, pass, cfg.n_vocab, k, model.act_layout.logits, 0);
-    });
-}
-
-/// Batched matmul prefill (single-pass). Convenience wrapper used by both
-/// production code (no instrumentation) and the bench helpers (whole-pass
-/// timestamp via the supplied `timestamp_writes`).
-pub fn prefill_matmul_topk(
-    model: &Model,
-    prompt: &[u32],
-    pos_base: u32,
-    k: u32,
-    timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
-) -> Result<(Vec<f32>, Vec<u32>)> {
-    let m = prompt.len() as u32;
-    if m == 0 || m > model.m_max {
-        return Err(PotError::PrefillTooLarge {
-            n: m,
-            max: model.m_max,
-        });
-    }
-    let cfg = &model.cfg;
-    let k = k.clamp(1, TOPK_MAX);
-
-    // ---- All phases (embed → per-layer transformer → final norm/LM-head/topk
-    //      → readback copy) into ONE command buffer / ONE submit, with all
-    //      compute dispatches sharing ONE pass to amortize the
-    //      begin_compute_pass cost (~25us each on RADV).
-    let mut se = StepEncoder::new(model);
-    upload_sample(model, &mut se.encoder, 0, bytemuck::cast_slice(prompt));
-
-    {
-        let mut ctx = PassCtx::new(&mut se.encoder, "prefill_matmul", timestamp_writes);
-        prefill_matmul_with_ctx(&mut ctx, model, cfg, m, pos_base, k);
+        marker.mark(&mut pass, "lm_head");
+        dispatch_topk_reduce(model, &mut pass, cfg.n_vocab, k, model.act_layout.logits, 0);
+        marker.mark(&mut pass, "topk_reduce");
     }
 
     // Phase 4: append readback copy + schedule map, all in the same command buffer.
@@ -1118,211 +1085,183 @@ pub fn prefill_matmul_topk(
     wait_topk_readback(model, k)
 }
 
-fn layer_step_matmul<C: DispatchCtx>(
-    ctx: &mut C,
+fn layer_step_matmul_in_pass<M: StepMarker>(
     model: &Model,
     cfg: &Config,
+    pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     m: u32,
     pos_base: u32,
+    marker: &mut M,
 ) {
     let lt = &model.layer_tensors[il as usize];
 
     // attn_norm fused with Q8_0 quantize (writes act_q8 directly).
-    let mut a_d = 0u32;
-    let mut a_qs = 0u32;
-    ctx.dispatch("rms_norm_q8", |pass| {
-        let (d, qs) = dispatch_rms_norm_q8_0(
-            model,
-            cfg,
-            pass,
-            cfg.n_embd,
-            m,
-            model.act_layout.x,
-            lt.attn_norm_off,
-        );
-        a_d = d;
-        a_qs = qs;
-    });
-    ctx.dispatch("wq_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.n_embd,
-            cfg.q_dim,
-            m,
-            WeightSet::Attn,
-            lt.wq.0,
-            lt.wq.1,
-            a_d,
-            a_qs,
-            model.act_layout.q,
-            false,
-        );
-    });
-    ctx.dispatch("wk_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.n_embd,
-            cfg.kv_dim,
-            m,
-            WeightSet::Attn,
-            lt.wk.0,
-            lt.wk.1,
-            a_d,
-            a_qs,
-            model.act_layout.k_cur,
-            false,
-        );
-    });
-    ctx.dispatch("wv_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.n_embd,
-            cfg.kv_dim,
-            m,
-            WeightSet::Attn,
-            lt.wv.0,
-            lt.wv.1,
-            a_d,
-            a_qs,
-            model.act_layout.v_cur,
-            false,
-        );
-    });
+    let (a_d, a_qs) = dispatch_rms_norm_q8_0(
+        model,
+        cfg,
+        pass,
+        cfg.n_embd,
+        m,
+        model.act_layout.x,
+        lt.attn_norm_off,
+    );
+    marker.mark(pass, "rms_norm_q8");
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.n_embd,
+        cfg.q_dim,
+        m,
+        WeightSet::Attn,
+        lt.wq.0,
+        lt.wq.1,
+        a_d,
+        a_qs,
+        model.act_layout.q,
+        false,
+    );
+    marker.mark(pass, "wq_matmul");
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.n_embd,
+        cfg.kv_dim,
+        m,
+        WeightSet::Attn,
+        lt.wk.0,
+        lt.wk.1,
+        a_d,
+        a_qs,
+        model.act_layout.k_cur,
+        false,
+    );
+    marker.mark(pass, "wk_matmul");
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.n_embd,
+        cfg.kv_dim,
+        m,
+        WeightSet::Attn,
+        lt.wv.0,
+        lt.wv.1,
+        a_d,
+        a_qs,
+        model.act_layout.v_cur,
+        false,
+    );
+    marker.mark(pass, "wv_matmul");
 
     // Q/K rms+rope (in-place) + KV writeback into kv_{k,v}.
-    ctx.dispatch("q_norm_rope", |pass| {
-        dispatch_q_norm_rope_fused(
-            model,
-            cfg,
-            pass,
-            model.act_layout.q,
-            lt.attn_q_norm_off,
-            pos_base,
-            m,
-        );
-    });
-    ctx.dispatch("kv_writeback", |pass| {
-        dispatch_kv_writeback_fused(
-            model,
-            cfg,
-            pass,
-            model.act_layout.k_cur,
-            model.act_layout.v_cur,
-            lt.attn_k_norm_off,
-            il,
-            pos_base,
-            m,
-        );
-    });
+    dispatch_q_norm_rope_fused(
+        model,
+        cfg,
+        pass,
+        model.act_layout.q,
+        lt.attn_q_norm_off,
+        pos_base,
+        m,
+    );
+    marker.mark(pass, "q_norm_rope");
+    dispatch_kv_writeback_fused(
+        model,
+        cfg,
+        pass,
+        model.act_layout.k_cur,
+        model.act_layout.v_cur,
+        lt.attn_k_norm_off,
+        il,
+        pos_base,
+        m,
+    );
+    marker.mark(pass, "kv_writeback");
 
     // Attention (Q-tiled FA-2 prefill, Q8_0 output written directly to act_q8).
-    let mut a_d2 = 0u32;
-    let mut a_qs2 = 0u32;
-    ctx.dispatch("attention", |pass| {
-        let (d, qs) =
-            dispatch_attention_prefill_tiled(model, cfg, pass, il, model.max_seq, m, pos_base);
-        a_d2 = d;
-        a_qs2 = qs;
-    });
+    let (a_d2, a_qs2) =
+        dispatch_attention_prefill_tiled(model, cfg, pass, il, model.max_seq, m, pos_base);
+    marker.mark(pass, "attention");
 
     // Wo (residual) + ffn_norm + gate/up + silu_mul_q8 + Wd (residual).
-    ctx.dispatch("wo_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.q_dim,
-            cfg.n_embd,
-            m,
-            WeightSet::Attn,
-            lt.wo.0,
-            lt.wo.1,
-            a_d2,
-            a_qs2,
-            model.act_layout.x,
-            true,
-        );
-    });
-    let mut a_d3 = 0u32;
-    let mut a_qs3 = 0u32;
-    ctx.dispatch("rms_norm_q8", |pass| {
-        let (d, qs) = dispatch_rms_norm_q8_0(
-            model,
-            cfg,
-            pass,
-            cfg.n_embd,
-            m,
-            model.act_layout.x,
-            lt.ffn_norm_off,
-        );
-        a_d3 = d;
-        a_qs3 = qs;
-    });
-    ctx.dispatch("wg_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.n_embd,
-            cfg.n_ff,
-            m,
-            WeightSet::FfnGU,
-            lt.wg.0,
-            lt.wg.1,
-            a_d3,
-            a_qs3,
-            model.act_layout.gate,
-            false,
-        );
-    });
-    ctx.dispatch("wu_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.n_embd,
-            cfg.n_ff,
-            m,
-            WeightSet::FfnGU,
-            lt.wu.0,
-            lt.wu.1,
-            a_d3,
-            a_qs3,
-            model.act_layout.up,
-            false,
-        );
-    });
-    let mut a_d4 = 0u32;
-    let mut a_qs4 = 0u32;
-    ctx.dispatch("silu_mul_q8", |pass| {
-        let (d, qs) = dispatch_silu_mul_q8_0(
-            model,
-            pass,
-            cfg.n_ff,
-            m,
-            model.act_layout.gate,
-            model.act_layout.up,
-        );
-        a_d4 = d;
-        a_qs4 = qs;
-    });
-    ctx.dispatch("wd_matmul", |pass| {
-        dispatch_matmul_q1_0(
-            model,
-            pass,
-            cfg.n_ff,
-            cfg.n_embd,
-            m,
-            WeightSet::FfnD,
-            lt.wd.0,
-            lt.wd.1,
-            a_d4,
-            a_qs4,
-            model.act_layout.x,
-            true,
-        );
-    });
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.q_dim,
+        cfg.n_embd,
+        m,
+        WeightSet::Attn,
+        lt.wo.0,
+        lt.wo.1,
+        a_d2,
+        a_qs2,
+        model.act_layout.x,
+        true,
+    );
+    marker.mark(pass, "wo_matmul");
+    let (a_d3, a_qs3) = dispatch_rms_norm_q8_0(
+        model,
+        cfg,
+        pass,
+        cfg.n_embd,
+        m,
+        model.act_layout.x,
+        lt.ffn_norm_off,
+    );
+    marker.mark(pass, "rms_norm_q8");
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.n_embd,
+        cfg.n_ff,
+        m,
+        WeightSet::FfnGU,
+        lt.wg.0,
+        lt.wg.1,
+        a_d3,
+        a_qs3,
+        model.act_layout.gate,
+        false,
+    );
+    marker.mark(pass, "wg_matmul");
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.n_embd,
+        cfg.n_ff,
+        m,
+        WeightSet::FfnGU,
+        lt.wu.0,
+        lt.wu.1,
+        a_d3,
+        a_qs3,
+        model.act_layout.up,
+        false,
+    );
+    marker.mark(pass, "wu_matmul");
+    let (a_d4, a_qs4) = dispatch_silu_mul_q8_0(
+        model,
+        pass,
+        cfg.n_ff,
+        m,
+        model.act_layout.gate,
+        model.act_layout.up,
+    );
+    marker.mark(pass, "silu_mul_q8");
+    dispatch_matmul_q1_0(
+        model,
+        pass,
+        cfg.n_ff,
+        cfg.n_embd,
+        m,
+        WeightSet::FfnD,
+        lt.wd.0,
+        lt.wd.1,
+        a_d4,
+        a_qs4,
+        model.act_layout.x,
+        true,
+    );
+    marker.mark(pass, "wd_matmul");
 }
 
 // =========================================================================
@@ -1332,119 +1271,127 @@ fn layer_step_matmul<C: DispatchCtx>(
 // here via `super::`.
 // =========================================================================
 
-/// Per-dispatch [`DispatchCtx`] for microbench: each labeled dispatch is
-/// recorded into its own compute pass with a `(begin, end)` timestamp pair on
-/// the pass descriptor. Works on Apple Metal (which lacks
-/// `TIMESTAMP_QUERY_INSIDE_PASSES`) because timestamps live on the descriptor,
-/// not as `pass.write_timestamp` calls inside an open pass.
+/// Per-dispatch GPU timestamp marker for microbench (per-kernel breakdown).
 ///
-/// `begin_compute_pass` overhead is paid per dispatch (~tens of µs on most
-/// drivers), so this is bench-only — production / pp / tg use [`PassCtx`].
+/// Call [`MicroMarker::mark`] between dispatches inside a compute pass to write
+/// GPU-side timestamps. After the command buffer containing those dispatches has
+/// been submitted and fully polled (GPU done), call [`MicroMarker::resolve`] to
+/// read the per-span durations in nanoseconds.
 ///
-/// Each instance reuses `model.buffers.bench_query_set` starting from slot 0,
-/// so only one may be live at a time (the previous one must be resolved before
-/// a new one is created).
-#[cfg(feature = "bench-internals")]
-pub struct PerDispatchCtx<'a> {
-    model: &'a Model,
-    encoder: &'a mut wgpu::CommandEncoder,
+/// Each `pass.write_timestamp` forces a flush at the dispatch boundary on most
+/// drivers (RADV included), which slows the GPU work itself — so this marker is
+/// only appropriate when you actually want a per-kernel breakdown. For clean
+/// whole-pass timing of pp/tg, use [`BenchMarker`] instead, which installs the
+/// timestamps via the pass descriptor (no per-dispatch flushes).
+///
+/// Each `MicroMarker` reuses `model.buffers.bench_query_set` starting from slot 0,
+/// so only one `MicroMarker` may be live at a time (the previous one must be
+/// resolved before a new one is marked into the same query set).
+#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+pub struct MicroMarker<'m> {
+    model: &'m Model,
+    next_idx: u32,
     labels: Vec<&'static str>,
 }
 
-#[cfg(feature = "bench-internals")]
-impl<'a> PerDispatchCtx<'a> {
-    pub fn new(model: &'a Model, encoder: &'a mut wgpu::CommandEncoder) -> Self {
+#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+impl<'m> MicroMarker<'m> {
+    pub const fn new(model: &'m Model) -> Self {
         Self {
             model,
-            encoder,
+            next_idx: 0,
             labels: Vec::new(),
         }
     }
 
-    /// Consume the ctx and hand back the recorded labels. Releases the
-    /// encoder borrow so the caller can finish + submit the command buffer
-    /// before calling [`resolve_per_dispatch`].
-    pub fn into_labels(self) -> Vec<&'static str> {
-        self.labels
+    /// After the step CB has been submitted and polled (GPU work done),
+    /// resolve all timestamps and return `(label, duration_ns)` spans.
+    /// Each span is the GPU time between the previous and current mark.
+    /// The "start" sentinel is consumed but not returned as a span.
+    pub fn resolve(self) -> Result<Vec<(&'static str, f32)>> {
+        let n = self.next_idx;
+        if n < 2 {
+            return Ok(vec![]);
+        }
+        let ticks = bench_resolve_ticks(self.model, n)?;
+        let period = self.model.bench_ts_period_ns;
+        let mut spans: Vec<(&'static str, f32)> = Vec::with_capacity((n - 1) as usize);
+        for i in 1..n as usize {
+            let dt_ns = ticks[i].saturating_sub(ticks[i - 1]) as f32 * period;
+            spans.push((self.labels[i], dt_ns));
+        }
+        Ok(spans)
     }
 }
 
-#[cfg(feature = "bench-internals")]
-impl DispatchCtx for PerDispatchCtx<'_> {
-    fn dispatch<F>(&mut self, label: &'static str, f: F)
-    where
-        F: FnOnce(&mut wgpu::ComputePass<'_>),
-    {
+#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+impl StepMarker for MicroMarker<'_> {
+    #[inline(always)]
+    fn setup_desc<'a>(&'a self, _desc: &mut wgpu::ComputePassDescriptor<'a>) {}
+
+    /// Write a GPU timestamp at the current slot and associate `label` with it.
+    /// The label conventionally names the kernel that just COMPLETED (the slot
+    /// before the first label is the pass start sentinel named "start").
+    fn mark(&mut self, pass: &mut wgpu::ComputePass<'_>, label: &'static str) {
         use crate::model::BENCH_QS_SLOTS;
-        let next_idx = (self.labels.len() as u32) * 2;
         assert!(
-            next_idx + 2 <= BENCH_QS_SLOTS,
-            "PerDispatchCtx: exceeded BENCH_QS_SLOTS"
+            self.next_idx < BENCH_QS_SLOTS,
+            "MicroMarker: exceeded BENCH_QS_SLOTS"
         );
-        let begin_idx = next_idx;
-        let end_idx = begin_idx + 1;
-        let mut pass = self
-            .encoder
-            .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(label),
-                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                    query_set: &self.model.buffers.bench_query_set,
-                    beginning_of_pass_write_index: Some(begin_idx),
-                    end_of_pass_write_index: Some(end_idx),
-                }),
-            });
-        f(&mut pass);
-        drop(pass);
+        pass.write_timestamp(&self.model.buffers.bench_query_set, self.next_idx);
         self.labels.push(label);
+        self.next_idx += 1;
     }
 }
 
-/// Resolve the per-dispatch begin/end timestamps recorded by a
-/// [`PerDispatchCtx`] and return `(label, duration_ns)` per dispatch. Call
-/// after the command buffer has been submitted and the GPU work has
-/// completed.
+/// Whole-pass GPU timestamp marker for end-to-end pp/tg timing.
+///
+/// Installs `timestamp_writes` on the [`wgpu::ComputePassDescriptor`] (slots
+/// 0=begin, 1=end of pass) via [`StepMarker::setup_desc`]; [`mark`] is a no-op.
+/// Unlike [`MicroMarker`], no per-dispatch `pass.write_timestamp` calls are
+/// inserted, so the GPU work itself isn't slowed by mid-pass flushes — what we
+/// measure is the bare execution time of the pass.
+///
+/// Reuses `model.buffers.bench_query_set` slots 0/1, so only one `BenchMarker`
+/// may be live at a time and the pass it instruments must be the only one to
+/// write those slots between `new` and `resolve`.
+///
+/// [`mark`]: BenchMarker::mark
 #[cfg(feature = "bench-internals")]
-pub fn resolve_per_dispatch(
-    model: &Model,
-    labels: &[&'static str],
-) -> Result<Vec<(&'static str, f32)>> {
-    if labels.is_empty() {
-        return Ok(vec![]);
-    }
-    let n = (labels.len() as u32) * 2;
-    let ticks = bench_resolve_ticks(model, n)?;
-    let period = model.bench_ts_period_ns;
-    let mut spans: Vec<(&'static str, f32)> = Vec::with_capacity(labels.len());
-    for (i, label) in labels.iter().enumerate() {
-        let begin = ticks[2 * i];
-        let end = ticks[2 * i + 1];
-        let dt_ns = end.saturating_sub(begin) as f32 * period;
-        spans.push((*label, dt_ns));
-    }
-    Ok(spans)
+pub struct BenchMarker<'m> {
+    model: &'m Model,
 }
 
-/// Build the `Some(ComputePassTimestampWrites)` value installed on the pass
-/// descriptor for whole-pass pp/tg timing (slots 0=begin, 1=end). The caller
-/// passes the result into [`PassCtx::new`] / [`prefill_matmul_topk`].
 #[cfg(feature = "bench-internals")]
-pub fn whole_pass_timestamp_writes(model: &Model) -> wgpu::ComputePassTimestampWrites<'_> {
-    wgpu::ComputePassTimestampWrites {
-        query_set: &model.buffers.bench_query_set,
-        beginning_of_pass_write_index: Some(0),
-        end_of_pass_write_index: Some(1),
+impl<'m> BenchMarker<'m> {
+    pub const fn new(model: &'m Model) -> Self {
+        Self { model }
+    }
+
+    /// After the instrumented pass has been submitted and polled (GPU done),
+    /// resolve the begin/end timestamps and return total GPU duration in
+    /// nanoseconds.
+    pub fn resolve(self) -> Result<f32> {
+        let ticks = bench_resolve_ticks(self.model, 2)?;
+        Ok(ticks[1].saturating_sub(ticks[0]) as f32 * self.model.bench_ts_period_ns)
     }
 }
 
-/// Resolve the begin/end pair from a whole-pass instrumented submission and
-/// return GPU duration in nanoseconds.
 #[cfg(feature = "bench-internals")]
-pub fn resolve_whole_pass_ns(model: &Model) -> Result<f32> {
-    let ticks = bench_resolve_ticks(model, 2)?;
-    Ok(ticks[1].saturating_sub(ticks[0]) as f32 * model.bench_ts_period_ns)
+impl StepMarker for BenchMarker<'_> {
+    fn setup_desc<'a>(&'a self, desc: &mut wgpu::ComputePassDescriptor<'a>) {
+        desc.timestamp_writes = Some(wgpu::ComputePassTimestampWrites {
+            query_set: &self.model.buffers.bench_query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
+    }
+    #[inline(always)]
+    fn mark(&mut self, _pass: &mut wgpu::ComputePass<'_>, _label: &'static str) {}
 }
 
-/// Resolve `n` timestamps from `bench_query_set[0..n]` to host memory.
+/// Resolve `n` timestamps from `bench_query_set[0..n]` to host memory. Shared
+/// by [`MicroMarker::resolve`] and [`BenchMarker::resolve`].
 #[cfg(feature = "bench-internals")]
 fn bench_resolve_ticks(model: &Model, n: u32) -> Result<Vec<u64>> {
     let bytes = u64::from(n) * 8;
