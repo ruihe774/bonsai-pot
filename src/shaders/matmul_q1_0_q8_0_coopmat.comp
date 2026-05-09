@@ -27,10 +27,23 @@
 //     multiply-adds.
 //
 // Scaling. KHR cooperative matrices have no element-wise scale primitive
-// (scope is Subgroup; element layout is opaque). So per Q8_0 sub-block we
-// `coopMatStore` the i32 partial into a 64 × 64 shared-memory dump, then
-// every thread reads its 4 × 4 cell footprint, applies `a_d[r]·w_d[c]`,
-// and folds into a register-resident fp32 accumulator.
+// (scope is Subgroup; element layout is opaque), so per Q8_0 sub-block we
+// `coopMatStore` the i32 partial into shared memory, then every thread
+// reads its cell footprint, applies `a_d[r]·w_d[c]`, and folds into a
+// register-resident fp32 accumulator.
+//
+// To keep the scale-and-accumulate step from costing a workgroup barrier
+// per sub-block, the i32 dump is **subgroup-private** (one 32 × 32 region
+// per subgroup, contiguous in `i32_dump_sg`), and the per-thread cell
+// layout is aligned with the 2 × 2 subgroup grid: each subgroup's 32 lanes
+// are arranged as an 8 × 4 (lx_sg × ly_sg) thread grid over its 32 × 32
+// sub-tile, so each thread owns 4 (TN) × 8 (TM) cells inside the
+// subgroup's private region. The s-loop's barriers are then `subgroupBarrier()`
+// calls (intra-subgroup memory + execution sync) instead of full
+// workgroup barriers — total per Q1_0 block: 1 WG barrier (after
+// cooperative loads) + 8 subgroup barriers + 1 WG barrier (before next
+// block's cooperative loads). The previous layout had 9 WG barriers per
+// block.
 //
 // Caller bind-group layout matches `matmul_q1_0_q8_0.comp`
 // (the `bgls.matmul` BGL): {weights ro, acts ro, y rw}, with the same
@@ -66,27 +79,45 @@ const uint SG_TILE_N = TILE_N / SG_N_GRID;   // 32
 const uint SG_MMA_M = SG_TILE_M / MMA;       // 2
 const uint SG_MMA_N = SG_TILE_N / MMA;       // 2
 
-// Per-thread cells (independent of subgroup grid) for the i32 → fp32
-// scale-and-accumulate step. The 16×16 thread grid mirrors the dp4a
-// sibling for direct comparability.
-const uint WG_LX = 16u;            // = TILE_N / 4
-const uint WG_LY = 16u;            // = TILE_M / 4
-const uint TM = 4u;
-const uint TN = 4u;
+// Per-subgroup thread grid: 32 lanes laid out 16 (n) × 2 (m) over the
+// subgroup's 32 × 32 sub-tile, so each thread owns a TM × TN = 16 × 2
+// cell block (32 cells/thread). The wide n-direction lane count (16)
+// keeps the dump-read bank-conflict pattern at 2-way per wave32 (matching
+// the legacy WG-wide 16×8 layout); a narrower n-direction grid like 8 × 4
+// would land on a 4-way conflict because the 32-bank LDS modulo-aliases
+// columns at stride 4.
+const uint SG_LX = 16u;            // n-direction lanes within a subgroup
+const uint SG_LY = 2u;             // m-direction lanes within a subgroup
+const uint TM = SG_TILE_M / SG_LY; // 16
+const uint TN = SG_TILE_N / SG_LX; // 2
 
-// Shared memory. Total ≈ 35 KiB — fits within the 64 KiB LDS budget on
+// Shared memory. Total ≈ 33 KiB — fits within the 64 KiB LDS budget on
 // every adapter we target. Layouts:
-//   * a_i8_lds : [M=64, K=128] row-major
-//   * b_i8_lds : [N=64, K=128] row-major (= K-major view of B^T; coopmat
-//                B-side load uses ColumnMajor layout to read [K, N]).
-//   * a_d_lds  : [4, M=64], indexed [s*64 + m_local].
-//   * w_d_lds  : [N=64].
-//   * i32_dump : [M=64, N=64] row-major, reused per sub-block.
-shared int8_t a_i8_lds[TILE_M * TILE_K];
-shared int8_t b_i8_lds[TILE_N * TILE_K];
+//   * a_lds_u : [M=64, K_u=32] row-major (8 KiB) — Q8_0 i8 acts packed
+//               4-per-uint (each uint is one Q8_0 4-byte word).
+//   * b_lds_u : [N=64, K_u=32] row-major (8 KiB) — ±1 i8 weights packed
+//               4-per-uint after sign-bit expansion. coopmat B-side loads
+//               use ColumnMajor with stride = K_U (uints).
+//   * a_d_lds  : [4, M=64], indexed [s*64 + m_local] (1 KiB)
+//   * w_d_lds  : [N=64] (256 B)
+//   * i32_dump_sg : NUM_SG × [SG_TILE_M=32, SG_TILE_N=32] row-major (16 KiB).
+//                   Each subgroup writes only its own 4 KiB slice; reads
+//                   stay subgroup-local, so the s-loop never needs a
+//                   workgroup barrier.
+//
+// LDS is declared as `uint[]` rather than `int8_t[]` so the cooperative
+// loads (4 i8 per uint) collapse to a single 32-bit shared store instead
+// of four `ds_write_b8` instructions. The cooperative-matrix load reads
+// the matrix as int8 elements; glslang lowers `coopMatLoad(mat_i8, uint[],
+// elemOffset, stride, ...)` with elemOffset/stride measured in *buffer*
+// elements (i.e. uints), so K-direction offsets/strides are scaled by 4
+// at the call site.
+const uint K_U = TILE_K / 4u;     // 32 uints per row of A or B^T LDS view
+shared uint a_lds_u[TILE_M * K_U];
+shared uint b_lds_u[TILE_N * K_U];
 shared float a_d_lds[TILE_M * 4u];
 shared float w_d_lds[TILE_N];
-shared int32_t i32_dump[TILE_M * TILE_N];
+shared int32_t i32_dump_sg[NUM_SG * SG_TILE_M * SG_TILE_N];
 
 float load_w_f16(uint b_offset) {
     uint word = weights[b_offset >> 2];
@@ -94,16 +125,13 @@ float load_w_f16(uint b_offset) {
     return unpackFloat2x16(half_bits).x;
 }
 
-// Spread 4 sign bits into a packed `i8vec4` of ±1: bit=1 → +1, bit=0 → -1.
-// Same convention as `expand_4_bits` in the dp4a sibling — bit i lands at
-// the LSB of byte i. The two values 0x01 / 0xFF cast to int8 ±1 directly.
-i8vec4 expand_4_bits_to_i8(uint bits) {
+// Spread 4 sign bits into a packed u32 of ±1 bytes: bit=1 → +1, bit=0 → -1.
+// Same trick as `expand_4_bits` in the dp4a sibling — bit i lands at the
+// LSB of byte i, then `~(x * 0xFE)` yields 0x01 / 0xFF which cast to int8
+// is ±1.
+uint expand_4_bits(uint bits) {
     uint spread = (bits * 0x00204081u) & 0x01010101u;
-    uint packed = ~(spread * 0xFEu);
-    return i8vec4(int8_t( packed        & 0xFFu),
-                  int8_t((packed >>  8u) & 0xFFu),
-                  int8_t((packed >> 16u) & 0xFFu),
-                  int8_t((packed >> 24u) & 0xFFu));
+    return ~(spread * 0xFEu);
 }
 
 layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
@@ -120,9 +148,11 @@ void main() {
     uint sg_n_idx = sg_id % SG_N_GRID;     // [0, 2)
     uint sg_m_off = sg_m_idx * SG_TILE_M;
     uint sg_n_off = sg_n_idx * SG_TILE_N;
+    uint sg_dump_base = sg_id * (SG_TILE_M * SG_TILE_N);
 
-    uint lx = tid % WG_LX;
-    uint ly = tid / WG_LX;
+    uint inv = gl_SubgroupInvocationID;
+    uint lx_sg = inv % SG_LX;              // [0, 8)
+    uint ly_sg = inv / SG_LX;              // [0, 4)
 
     float acc[TM * TN];
     [[unroll]] for (uint i = 0u; i < TM * TN; ++i) acc[i] = 0.0;
@@ -149,11 +179,11 @@ void main() {
             a_d_lds[idx] = uintBitsToFloat(acts[off >> 2]);
         }
 
-        // b_i8: expand Q1_0 sign bits → ±1 int8. Each Q1_0 row is 16 bytes
-        // = 4 u32 of sign bits (32 K-elements per u32). Layout in shmem is
-        // [N=64, K=128] row-major, so each u32-load expands into 32
-        // contiguous shmem bytes — written via i8vec4 packs (8 packs/u32).
-        // Total work = 64 × 4 = 256 u32 reads → 2 per thread.
+        // b_lds_u: expand Q1_0 sign bits → ±1 packed-byte u32. Each Q1_0
+        // row is 16 bytes = 4 u32 of sign bits (32 K-elements per u32).
+        // Layout in shmem is [N=64, K_U=32] row-major (each uint = 4 ±1
+        // bytes), so each weight u32-load expands into 8 packed-byte u32
+        // stores. Total work = 64 × 4 = 256 u32 reads → 2 per thread.
         [[unroll]] for (uint i = 0u; i < 2u; ++i) {
             uint idx = i * WG + tid;
             uint n_local = idx / 4u;
@@ -161,32 +191,26 @@ void main() {
             uint n_idx = n_base + n_local;
             uint off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + w_word * 4u;
             uint bits = weights[off >> 2];
-            uint dst = n_local * TILE_K + w_word * 32u;
-            // 32 bits → 8 × i8vec4 of ±1.
+            // Each w_word covers 32 i8 = 8 uints in the [N, K_U] LDS view.
+            uint dst_u = n_local * K_U + w_word * 8u;
             [[unroll]] for (uint q = 0u; q < 8u; ++q) {
-                i8vec4 v = expand_4_bits_to_i8((bits >> (q * 4u)) & 0xFu);
-                b_i8_lds[dst + q * 4u + 0u] = v.x;
-                b_i8_lds[dst + q * 4u + 1u] = v.y;
-                b_i8_lds[dst + q * 4u + 2u] = v.z;
-                b_i8_lds[dst + q * 4u + 3u] = v.w;
+                b_lds_u[dst_u + q] = expand_4_bits((bits >> (q * 4u)) & 0xFu);
             }
         }
 
-        // a_i8: load Q8_0 i8 acts. [M=64, K=128] row-major, 8192 bytes;
-        // each m row has 32 u32 = 128 i8 K-elements per Q1_0 block.
-        // Total work = 64 × 32 = 2048 u32 reads → 16 per thread.
+        // a_lds_u: load Q8_0 i8 acts. [M=64, K_U=32] row-major (each uint
+        // = one Q8_0 4-byte word), 8192 bytes; each m row has 32 u32 =
+        // 128 i8 K-elements per Q1_0 block. Total work = 64 × 32 = 2048
+        // u32 reads → 16 per thread. Storing the raw u32 keeps the i8
+        // values byte-aligned for the cooperative load that interprets
+        // them as int8 elements.
         [[unroll]] for (uint i = 0u; i < 16u; ++i) {
             uint idx = i * WG + tid;
             uint m_local = idx / 32u;
             uint k_word = idx & 31u;
             uint m_idx = m_base + m_local;
             uint off = p.a_qs_offset + m_idx * p.k + b * 128u + k_word * 4u;
-            uint w = acts[off >> 2];
-            uint dst = m_local * TILE_K + k_word * 4u;
-            a_i8_lds[dst + 0u] = int8_t(int( w        << 24) >> 24);
-            a_i8_lds[dst + 1u] = int8_t(int((w >>  8u) << 24) >> 24);
-            a_i8_lds[dst + 2u] = int8_t(int((w >> 16u) << 24) >> 24);
-            a_i8_lds[dst + 3u] = int8_t(int( w >> 24u));
+            a_lds_u[m_local * K_U + k_word] = acts[off >> 2];
         }
         barrier();
 
@@ -195,7 +219,9 @@ void main() {
             uint k_block = s * 32u;
 
             // Each subgroup MMAs its 32 × 32 sub-tile → 4 spatial 16×16
-            // i32 partials → coopMatStore into i32_dump.
+            // i32 partials → coopMatStore into the subgroup's private
+            // region of `i32_dump_sg` (no overlap with other subgroups,
+            // so the only sync needed is intra-subgroup).
             [[unroll]] for (uint mma_m = 0u; mma_m < SG_MMA_M; ++mma_m) {
                 [[unroll]] for (uint mma_n = 0u; mma_n < SG_MMA_N; ++mma_n) {
                     uint m_off = sg_m_off + mma_m * MMA;
@@ -210,49 +236,71 @@ void main() {
                         coopmat<int8_t, gl_ScopeSubgroup, MMA, MMA, gl_MatrixUseA> a_mat;
                         coopmat<int8_t, gl_ScopeSubgroup, MMA, MMA, gl_MatrixUseB> b_mat;
 
-                        // a_i8_lds is [M, K] row-major, stride = TILE_K.
-                        coopMatLoad(a_mat, a_i8_lds,
-                                    m_off * TILE_K + k_off, TILE_K,
+                        // a_lds_u / b_lds_u are uint[]; glslang scales
+                        // elemOffset & stride by the buffer element size,
+                        // so K-direction quantities are in uint units
+                        // (i8s / 4). k_off is always uint-aligned (32-elem
+                        // sub-block × 16-elem MMA chunks).
+                        uint k_off_u = k_off >> 2;
+                        coopMatLoad(a_mat, a_lds_u,
+                                    m_off * K_U + k_off_u, K_U,
                                     gl_CooperativeMatrixLayoutRowMajor);
-                        // b_i8_lds is [N, K] row-major in shmem; we want
-                        // matrix B(K, N), so use ColumnMajor with stride
-                        // along K = TILE_K.
-                        coopMatLoad(b_mat, b_i8_lds,
-                                    n_off * TILE_K + k_off, TILE_K,
+                        coopMatLoad(b_mat, b_lds_u,
+                                    n_off * K_U + k_off_u, K_U,
                                     gl_CooperativeMatrixLayoutColumnMajor);
 
                         partial = coopMatMulAdd(a_mat, b_mat, partial);
                     }
 
-                    // Store i32 partial into a 64 × 64 dump. Stride = TILE_N.
-                    coopMatStore(partial, i32_dump,
-                                 m_off * TILE_N + n_off, TILE_N,
+                    // Subgroup-local store: stride = SG_TILE_N (=32).
+                    uint dump_off =
+                        sg_dump_base + (mma_m * MMA) * SG_TILE_N + (mma_n * MMA);
+                    coopMatStore(partial, i32_dump_sg, dump_off, SG_TILE_N,
                                  gl_CooperativeMatrixLayoutRowMajor);
                 }
             }
-            barrier();
+            // Make the coopMatStore visible to the per-thread reads below
+            // within this subgroup. Other subgroups are independent — no
+            // workgroup barrier needed.
+            subgroupBarrier();
 
-            // Per-thread scale and accumulate into the fp32 register tile.
+            // Per-thread scale and accumulate. Each thread reads only its
+            // own subgroup's private region, so the layout of (m_local,
+            // n_local) addresses is `sg_m_off + ly_sg*TM + tm`,
+            // `sg_n_off + lx_sg*TN + tn`. The Q1_0 weight scale `w_d` is
+            // per-(n, b), and the Q8_0 activation scale `a_d` is
+            // per-(m, b, s); both are loaded once per b-iteration.
+            // Hoist a_d / w_d into registers to skip per-iteration LDS reads.
+            float a_d_reg[TM];
             [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
-                uint r = ly * TM + tm;
-                float a_d_val = a_d_lds[s * TILE_M + r];
+                uint m_local = sg_m_off + ly_sg * TM + tm;
+                a_d_reg[tm] = a_d_lds[s * TILE_M + m_local];
+            }
+            float w_d_reg[TN];
+            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                uint n_local = sg_n_off + lx_sg * TN + tn;
+                w_d_reg[tn] = w_d_lds[n_local];
+            }
+            [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
+                uint r = ly_sg * TM + tm;
                 [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-                    uint c = lx * TN + tn;
-                    float w_d_val = w_d_lds[c];
-                    int32_t pi = i32_dump[r * TILE_N + c];
-                    acc[tm * TN + tn] += a_d_val * w_d_val * float(pi);
+                    uint c = lx_sg * TN + tn;
+                    int32_t pi = i32_dump_sg[sg_dump_base + r * SG_TILE_N + c];
+                    acc[tm * TN + tn] += a_d_reg[tm] * w_d_reg[tn] * float(pi);
                 }
             }
-            barrier();
+            // WAR fence: ensure all reads above complete before the next
+            // sub-block's coopMatStore overwrites this subgroup's region.
+            subgroupBarrier();
         }
     }
 
     // ---- output write ----------------------------------------------------
     [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
-        uint m_idx = m_base + ly * TM + tm;
+        uint m_idx = m_base + sg_m_off + ly_sg * TM + tm;
         if (m_idx >= p.m) continue;
         [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-            uint n_idx = n_base + lx * TN + tn;
+            uint n_idx = n_base + sg_n_off + lx_sg * TN + tn;
             if (n_idx >= p.n) continue;
             uint yi = p.out_offset + m_idx * p.n + n_idx;
             float val = acc[tm * TN + tn];
