@@ -22,10 +22,16 @@ using namespace metal;
 // Accumulators are fp32 (`simdgroup_matrix<float, 8, 8>`) — fp16 C would
 // overflow for K up to ~5760.
 //
-// Threadgroup memory: 16 KB a_sh (Q8_0 dequantized) + 8 KB w_sh (B tile)
-// + 0.13 KB w_d_sh = 24 KB, fits the 32 KB per-WG limit on Apple GPUs.
-// Each Q1_0 block (128 K) is processed in two halves of 64 K each so the
-// B-staging buffer stays at 8 KB.
+// Threadgroup memory: 16 KB a_sh (Q8_0 dequantized) + 16 KB w_sh (full Q1_0
+// block, two contiguous 8 KB halves) = 32 KB, exactly the per-WG limit on
+// Apple GPUs. Materializing the full block in one cooperative pass lets all
+// 256 threads participate (the previous half-at-a-time scheme idled half the
+// WG) and removes the per-half threadgroup barriers: 2 barriers per block
+// iteration instead of 5. Weight scales `dw` are loaded inline per
+// materialization thread rather than staged through shmem; the 4 threads
+// sharing an n_local hit the same address so the load is cache-resident.
+// Sign-word loads are coalesced by mapping (n_local = tid/4, s = tid%4) —
+// 4 adjacent lanes hit one row's 16 contiguous bytes.
 
 struct Params {
     uint k;
@@ -46,6 +52,7 @@ constant uint TM_SG = 4u;
 constant uint TN_SG = 2u;
 constant uint TILE_M = 64u;          // SG_GRID_M * TM_SG * 8
 constant uint TILE_N = 64u;          // SG_GRID_N * TN_SG * 8
+constant uint W_HALF = 64u * TILE_N;
 
 // Load a single fp16 (as float) from a 16-bit-aligned offset within `weights`.
 static inline float load_w_f16(device const uint* weights, uint b_offset) {
@@ -64,12 +71,12 @@ kernel void cs_main(
     uint sg_id [[simdgroup_index_in_threadgroup]],
     uint sg_lane [[thread_index_in_simdgroup]])
 {
-    // Half-Q1_0-block fp16 weight tile, row-major as B[k_in_half, n_local].
-    // 64 K-rows × 64 N-cols = 4096 fp16 = 8 KB. Each Q1_0 block (128 K) is
-    // processed in two halves to keep total threadgroup memory under 32 KB.
-    threadgroup half w_sh[64u * TILE_N];
-    // Per-N-row Q1_0 fp16 scale (broadcast across the 128 K-elements of this block).
-    threadgroup half w_d_sh[TILE_N];
+    // Full-Q1_0-block fp16 weight tile, row-major as B[k_in_block, n_local],
+    // laid out as two contiguous halves of 64 K-rows × 64 N-cols each (8 KB
+    // per half, 16 KB total). The MMA inner loop walks the halves
+    // sequentially; materialization fills both at once so all 256 threads
+    // are active.
+    threadgroup half w_sh[2u * W_HALF];
     // Activations as half4, dequantized from Q8_0 once per Q1_0 block.
     // Layout: a_sh[m_local * 32 + v4_local], v4_local = sub*8 + i covers
     // [b*128 + sub*32 + i*4 .. i*4 + 3] in element space. 64 tokens × 32 half4
@@ -97,14 +104,10 @@ kernel void cs_main(
         }
     }
 
-    for (uint b = 0u; b < nb_q1; ++b) {
-        // ---- Cooperative loads: weight scales (one fp16 per N-row) ----
-        if (tid < TILE_N) {
-            uint n_idx = n_base + tid;
-            float dw = load_w_f16(weights, p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
-            w_d_sh[tid] = half(dw);
-        }
+    threadgroup const half* a_base = (threadgroup const half*)a_sh
+                                     + sg_m_base * 128u;   // (sg_m_base) M-rows offset
 
+    for (uint b = 0u; b < nb_q1; ++b) {
         // ---- Cooperative load: activations (dequant Q8_0 -> half4) ----
         // 2048 half4 across 256 threads -> 8 half4 per thread.
         #pragma unroll
@@ -128,48 +131,45 @@ kernel void cs_main(
             float4 q_f = float4(float(q_chars[0]), float(q_chars[1]), float(q_chars[2]), float(q_chars[3])) * a_d;
             a_sh[idx] = half4(q_f);
         }
+
+        // ---- Cooperative materialize: full Q1_0 block (both halves) ----
+        // Each of 256 threads owns one (n_local, s) pair where
+        //   n_local = tid / 4   (0..63, the N-col)
+        //   s       = tid % 4   (0..3, the sign-byte chunk in the 16-byte block)
+        // s = 2*half_idx + kc_in_half — s=0,1 → half 0; s=2,3 → half 1.
+        // Adjacent lanes (varying s) read 4 consecutive uints from the same
+        // row, coalescing the 16-byte row into one transaction; the 4 lanes
+        // sharing an n_local hit the same `dw` address so the inline scale
+        // load is cache-resident.
+        {
+            uint n_local = tid / 4u;
+            uint s = tid % 4u;
+            uint half_idx = s >> 1u;
+            uint kc = s & 1u;
+            uint n_idx = n_base + n_local;
+            uint sign_off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
+            uint sign_word = weights[sign_off >> 2];
+            half dw = half(load_w_f16(weights, p.w_d_offset + (n_idx * nb_q1 + b) * 2u));
+            half neg_dw = -dw;
+            threadgroup half* w_dst = w_sh + half_idx * W_HALF;
+            uint k0 = kc * 32u;
+            #pragma unroll
+            for (uint i = 0u; i < 32u; ++i) {
+                bool bit = ((sign_word >> i) & 1u) != 0u;
+                w_dst[(k0 + i) * TILE_N + n_local] = bit ? dw : neg_dw;
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Process the Q1_0 block in two K-halves of 64 each ----
-        // For each half: cooperatively materialize 64 K × 64 N fp16 weights
-        // into w_sh, barrier, then run 8 simdgroup K-steps.
-        threadgroup const half* a_base = (threadgroup const half*)a_sh
-                                         + sg_m_base * 128u;   // (sg_m_base) M-rows offset
-        threadgroup const half* b_base_sg = w_sh + sg_n_base;  // (sg_n_base) N-cols offset
-
+        // ---- MMA both halves; no inter-half barrier needed ----
         #pragma unroll
         for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-            // Materialize this half. Each thread handles (k_chunk, n_local)
-            // where k_chunk in 0..2 covers 32 K-rows of one half, n_local in
-            // 0..64 covers one N-col. 32 sign bits = 1 uint. Sign-byte offset
-            // within the 16-byte Q1_0 sign block: half_idx*8 + k_chunk*4.
-            {
-                uint n_local = tid % TILE_N;       // 0..63
-                uint k_chunk = tid / TILE_N;       // 0..3
-                if (k_chunk < 2u) {
-                    uint n_idx = n_base + n_local;
-                    uint byte_off_in_block = half_idx * 8u + k_chunk * 4u;
-                    uint sign_off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + byte_off_in_block;
-                    uint sign_word = weights[sign_off >> 2];
-                    half dw = w_d_sh[n_local];
-                    half neg_dw = -dw;
-                    uint k0 = k_chunk * 32u;
-                    #pragma unroll
-                    for (uint i = 0u; i < 32u; ++i) {
-                        bool bit = ((sign_word >> i) & 1u) != 0u;
-                        half v = bit ? dw : neg_dw;
-                        w_sh[(k0 + i) * TILE_N + n_local] = v;
-                    }
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // 8 K-steps within this half, advancing K-offset within the block.
+            threadgroup const half* b_base_sg = w_sh + half_idx * W_HALF + sg_n_base;
             uint k_base_in_block = half_idx * 64u;
             #pragma unroll
             for (uint ks = 0u; ks < 8u; ++ks) {
                 uint k_off_in_block = k_base_in_block + ks * 8u;
-                uint k_off_in_w_sh = ks * 8u;
+                uint k_off_in_half = ks * 8u;
 
                 simdgroup_matrix<half, 8, 8> Atiles[TM_SG];
                 #pragma unroll
@@ -181,7 +181,7 @@ kernel void cs_main(
                 simdgroup_matrix<half, 8, 8> Btiles[TN_SG];
                 #pragma unroll
                 for (uint in_ = 0u; in_ < TN_SG; ++in_) {
-                    threadgroup const half* b_ptr = b_base_sg + k_off_in_w_sh * TILE_N + in_ * 8u;
+                    threadgroup const half* b_ptr = b_base_sg + k_off_in_half * TILE_N + in_ * 8u;
                     simdgroup_load(Btiles[in_], b_ptr, TILE_N);
                 }
 
@@ -193,8 +193,8 @@ kernel void cs_main(
                     }
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // ---- Store accumulators to global y ----
