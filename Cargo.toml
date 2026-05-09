@@ -52,7 +52,7 @@ wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "staging", defau
 
 [dev-dependencies]
 env_logger = "0.11"
-tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 [profile.dev]
 opt-level = 1
