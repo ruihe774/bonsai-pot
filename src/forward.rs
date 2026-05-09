@@ -1287,14 +1287,22 @@ fn layer_step_matmul_in_pass<M: StepMarker>(
 /// Each `MicroMarker` reuses `model.buffers.bench_query_set` starting from slot 0,
 /// so only one `MicroMarker` may be live at a time (the previous one must be
 /// resolved before a new one is marked into the same query set).
-#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+#[cfg(all(
+    feature = "bench-internals",
+    not(feature = "ci"),
+    not(target_vendor = "apple")
+))]
 pub struct MicroMarker<'m> {
     model: &'m Model,
     next_idx: u32,
     labels: Vec<&'static str>,
 }
 
-#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+#[cfg(all(
+    feature = "bench-internals",
+    not(feature = "ci"),
+    not(target_vendor = "apple")
+))]
 impl<'m> MicroMarker<'m> {
     pub const fn new(model: &'m Model) -> Self {
         Self {
@@ -1324,7 +1332,11 @@ impl<'m> MicroMarker<'m> {
     }
 }
 
-#[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+#[cfg(all(
+    feature = "bench-internals",
+    not(feature = "ci"),
+    not(target_vendor = "apple")
+))]
 impl StepMarker for MicroMarker<'_> {
     #[inline(always)]
     fn setup_desc<'a>(&'a self, _desc: &mut wgpu::ComputePassDescriptor<'a>) {}
@@ -1357,12 +1369,12 @@ impl StepMarker for MicroMarker<'_> {
 /// write those slots between `new` and `resolve`.
 ///
 /// [`mark`]: BenchMarker::mark
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(feature = "ci")))]
 pub struct BenchMarker<'m> {
     model: &'m Model,
 }
 
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(feature = "ci")))]
 impl<'m> BenchMarker<'m> {
     pub const fn new(model: &'m Model) -> Self {
         Self { model }
@@ -1377,7 +1389,7 @@ impl<'m> BenchMarker<'m> {
     }
 }
 
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(feature = "ci")))]
 impl StepMarker for BenchMarker<'_> {
     fn setup_desc<'a>(&'a self, desc: &mut wgpu::ComputePassDescriptor<'a>) {
         desc.timestamp_writes = Some(wgpu::ComputePassTimestampWrites {
@@ -1392,7 +1404,7 @@ impl StepMarker for BenchMarker<'_> {
 
 /// Resolve `n` timestamps from `bench_query_set[0..n]` to host memory. Shared
 /// by [`MicroMarker::resolve`] and [`BenchMarker::resolve`].
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(feature = "ci")))]
 fn bench_resolve_ticks(model: &Model, n: u32) -> Result<Vec<u64>> {
     let bytes = u64::from(n) * 8;
     let mut enc = model

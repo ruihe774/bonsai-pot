@@ -717,11 +717,11 @@ pub struct Buffers {
     pub(crate) sample: wgpu::Buffer, // u32 storage: input token id @ [0..M], topk output @ [0..2K]
     pub(crate) staging: wgpu::Buffer, // MAP_WRITE | COPY_SRC staging for sample uploads
     pub(crate) readback: wgpu::Buffer, // u32 readback (mappable)
-    #[cfg(feature = "bench-internals")]
+    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
     pub(crate) bench_query_set: wgpu::QuerySet,
-    #[cfg(feature = "bench-internals")]
+    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
     pub(crate) bench_resolve: wgpu::Buffer, // QUERY_RESOLVE | COPY_SRC
-    #[cfg(feature = "bench-internals")]
+    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
     pub(crate) bench_readback: wgpu::Buffer, // COPY_DST | MAP_READ
 }
 
@@ -845,7 +845,7 @@ pub struct Model {
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
     pub(crate) lost: Arc<OnceLock<DeviceLostInfo>>,
-    #[cfg(feature = "bench-internals")]
+    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
     pub(crate) bench_ts_period_ns: f32,
 }
 
@@ -857,7 +857,7 @@ const DEFAULT_MAX_SEQ: u32 = 1024;
 const STAGING_CHUNK: u64 = (M_MAX as u64 * 4).next_power_of_two();
 /// Number of timestamp query slots allocated for bench/microbench.
 /// Must be >= max marks per step (`n_layer` * 8 + 5 for the matvec path).
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", not(feature = "ci")))]
 pub const BENCH_QS_SLOTS: u32 = 2048;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.comp`.
@@ -1292,11 +1292,15 @@ impl Model {
         if !features.contains(wgpu::Features::PASSTHROUGH_SHADERS) {
             return Err(PotError::FeatureUnsupported("PASSTHROUGH_SHADERS"));
         }
-        #[cfg(feature = "bench-internals")]
+        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
         if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
             return Err(PotError::FeatureUnsupported("TIMESTAMP_QUERY"));
         }
-        #[cfg(all(feature = "bench-internals", not(target_vendor = "apple")))]
+        #[cfg(all(
+            not(feature = "ci"),
+            feature = "bench-internals",
+            not(target_vendor = "apple")
+        ))]
         if !features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
             return Err(PotError::FeatureUnsupported(
                 "TIMESTAMP_QUERY_INSIDE_PASSES",
@@ -1332,32 +1336,23 @@ impl Model {
         let required_features = wgpu::Features::SHADER_F16
             | wgpu::Features::SUBGROUP
             | {
-                #[cfg(not(target_vendor = "apple"))]
-                {
-                    wgpu::Features::SUBGROUP_SIZE_CONTROL
-                }
-                #[cfg(target_vendor = "apple")]
-                {
+                if cfg!(target_vendor = "apple") {
                     wgpu::Features::empty()
+                } else {
+                    wgpu::Features::SUBGROUP_SIZE_CONTROL
                 }
             }
             | wgpu::Features::IMMEDIATES
             | wgpu::Features::PASSTHROUGH_SHADERS
             | {
-                #[cfg(feature = "bench-internals")]
-                {
-                    let f = wgpu::Features::TIMESTAMP_QUERY;
-                    #[cfg(not(target_vendor = "apple"))]
-                    {
-                        f | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                if cfg!(all(feature = "bench-internals", not(feature = "ci"))) {
+                    if cfg!(target_vendor = "apple") {
+                        wgpu::Features::TIMESTAMP_QUERY
+                    } else {
+                        wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
                     }
-                    #[cfg(target_vendor = "apple")]
-                    {
-                        f
-                    }
-                }
-                #[cfg(not(feature = "bench-internals"))]
-                {
+                } else {
                     wgpu::Features::empty()
                 }
             };
@@ -1679,20 +1674,20 @@ impl Model {
             mapped_at_creation: false,
         });
 
-        #[cfg(feature = "bench-internals")]
+        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
         let bench_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("bench_qs"),
             ty: wgpu::QueryType::Timestamp,
             count: BENCH_QS_SLOTS,
         });
-        #[cfg(feature = "bench-internals")]
+        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
         let bench_resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bench_resolve"),
             size: u64::from(BENCH_QS_SLOTS) * 8,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        #[cfg(feature = "bench-internals")]
+        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
         let bench_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bench_readback"),
             size: u64::from(BENCH_QS_SLOTS) * 8,
@@ -1715,11 +1710,11 @@ impl Model {
             sample,
             staging,
             readback,
-            #[cfg(feature = "bench-internals")]
+            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
             bench_query_set,
-            #[cfg(feature = "bench-internals")]
+            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
             bench_resolve,
-            #[cfg(feature = "bench-internals")]
+            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
             bench_readback,
         };
 
@@ -2137,7 +2132,7 @@ impl Model {
         // this size is correct for every dispatch that reuses the cached BG.
         let cached = build_cached_bind_groups(&device, &bgls, &buffers);
 
-        #[cfg(feature = "bench-internals")]
+        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
         let bench_ts_period_ns = queue.get_timestamp_period();
 
         Ok(Self {
@@ -2154,7 +2149,7 @@ impl Model {
             output_tensors,
             vocab,
             lost,
-            #[cfg(feature = "bench-internals")]
+            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
             bench_ts_period_ns,
         })
     }

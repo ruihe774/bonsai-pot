@@ -4,22 +4,26 @@
 //! Included as a child module of `forward` via `#[path]` so the helpers can
 //! reach `forward`'s private items via `super::`.
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use std::cmp::Ordering;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use std::collections::HashMap;
 use std::time::Instant;
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use wgpu::PollType;
 
+#[cfg(not(feature = "ci"))]
+use super::BenchMarker;
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+use super::MicroMarker;
+#[cfg(any(feature = "ci", not(target_vendor = "apple")))]
+use super::NoMarker;
 use super::{
-    BenchMarker, Model, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk,
-    step_matvec_no_sample, upload_sample, wait_topk_readback,
+    Model, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk, step_matvec_no_sample,
+    upload_sample, wait_topk_readback,
 };
-#[cfg(not(target_vendor = "apple"))]
-use super::{MicroMarker, NoMarker};
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use crate::error::PotError;
 use crate::session::{GenerateOptions, Sampler};
 
@@ -94,12 +98,17 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     // Run a full prefill of `prompt`, chunking into `m_max`-sized batches so any
     // `pp_n` is supported. Returns the total GPU ns summed across chunks.
     let run_full_prefill = |prompt: &[u32]| -> Result<f32> {
+        #[allow(unused, reason = "conditional compilation")]
         let mut total_gpu_ns = 0.0f32;
         let mut pos_base = 0u32;
         for slice in prompt.chunks(m_max) {
+            #[cfg(not(feature = "ci"))]
             let mut marker = BenchMarker::new(model);
+            #[cfg(feature = "ci")]
+            let mut marker = NoMarker;
             let _ = prefill_matmul_topk(model, slice, pos_base, 1, &mut marker)?;
-            total_gpu_ns += marker.resolve()?;
+            #[cfg(not(feature = "ci"))]
+            let _ = total_gpu_ns += marker.resolve()?;
             pos_base += slice.len() as u32;
         }
         Ok(total_gpu_ns)
@@ -130,17 +139,22 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     let tok: u32 = 1;
     for _ in 0..repeats {
         let t = Instant::now();
+        #[allow(unused, reason = "conditional compilation")]
         let mut total_gpu_ns = 0.0f32;
         for pos in 0..tg_n {
             let mut se = StepEncoder::new(model);
             upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
+            #[cfg(not(feature = "ci"))]
             let mut marker = BenchMarker::new(model);
+            #[cfg(feature = "ci")]
+            let mut marker = NoMarker;
             encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), pos, &mut marker);
             se.copy_sample_to_readback(8);
             se.schedule_topk_map(8);
             model.queue.submit(Some(se.finish()));
             wait_topk_readback(model, 1)?;
-            total_gpu_ns += marker.resolve()?;
+            #[cfg(not(feature = "ci"))]
+            let _ = total_gpu_ns += marker.resolve()?;
         }
         let wall_secs = t.elapsed().as_secs_f32();
         tg_wall_ts.push(tg_n as f32 / wall_secs);
@@ -227,7 +241,7 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
 /// attention scans a single KV entry, which is unrepresentative. The KV cache
 /// is pre-filled with `pos` no-readback steps before measurement so attention
 /// sees `pos+1` cached tokens on each measured step.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> Result<()> {
     if pos >= model.max_seq {
         return Err(PotError::ContextOverflow {
@@ -336,7 +350,7 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
 }
 
 /// Run one instrumented matvec step at `pos`, returning per-span GPU durations.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f32)>> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(model);
@@ -353,7 +367,7 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
 /// Like [`run_instrumented_step`] but with no per-kernel timestamp marker —
 /// used in `--no-marker` profiling mode so the measurement is exactly one submit
 /// with no resolve submit afterward.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 fn run_uninstrumented_step(model: &Model, pos: u32) -> Result<()> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(model);
@@ -374,7 +388,7 @@ fn run_uninstrumented_step(model: &Model, pos: u32) -> Result<()> {
 /// measurement so the measured prefill runs at `pos_base = m` — the matmul
 /// attention then scans `[0, m + m_tok]` per query, exercising the realistic
 /// "prefill into an existing context" path rather than always starting at 0.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Result<()> {
     let m = m.min(model.m_max);
     if m == 0 {
@@ -495,7 +509,7 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     Ok(())
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 fn run_instrumented_prefill(
     model: &Model,
     prompt: &[u32],

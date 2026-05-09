@@ -238,7 +238,7 @@ fn main() {
                 eprintln!("microbench mode is not supported on the Metal backend");
                 exit(3);
             }
-            #[cfg(not(target_vendor = "apple"))]
+            #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
             {
                 __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker)
                     .unwrap_or_else(|e| {
