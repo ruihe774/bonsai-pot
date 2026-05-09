@@ -182,6 +182,14 @@ fn run_spirv_cross_msl(spv_path: &Path, msl_path: &Path) {
         .arg("30000")
         .arg("--msl-fixed-subgroup-size")
         .arg("32")
+        // `--msl-decoration-binding` makes spirv-cross emit `[[buffer(N)]]`
+        // where N is the SPIR-V `Binding` decoration. Without it, slots are
+        // assigned in first-use order, which doesn't agree with wgpu's
+        // Metal HAL slot allocation (push at 0, SSBOs at 1+ in binding
+        // order). The push constant still lands at `[[buffer(0)]]` and
+        // collides with binding 0; `msl_shift_ssbo_buffer_indices` does
+        // the +1 shift at load time.
+        .arg("--msl-decoration-binding")
         .arg("--rename-entry-point")
         .arg("main")
         .arg("cs_main")

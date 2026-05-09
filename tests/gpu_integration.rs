@@ -129,6 +129,40 @@ fn greedy_is_byte_deterministic() {
     assert_eq!(toks1, toks2, "greedy generation is not byte-deterministic");
 }
 
+/// Coherence smoke test: greedy generation on a real natural-language prompt
+/// must not collapse into a low-entropy attractor. The MSL buffer-binding
+/// regression on Apple manifested as outputs like "OTOTOTOT…" — every layer
+/// read garbage, the LM head landed on the same handful of tokens, and the
+/// model oscillated between two ids forever. A soft entropy floor catches
+/// any future regression with that shape (or worse: `!!!!!!!!`) without
+/// pinning the exact baseline output, which is fragile across model and
+/// kernel changes.
+#[test]
+fn greedy_does_not_collapse_into_low_entropy_loop() {
+    let model = load_model();
+    // BPE encoding of "Once upon a time" against `./model`'s tokenizer.
+    // Hard-coded so the test doesn't depend on `scripts/bpe.py` at runtime.
+    let prompt: Vec<u32> = vec![12522, 5193, 264, 882];
+    let opts = greedy_opts(24);
+
+    let mut sess = model.new_session();
+    let first = sess.prefill(&prompt, &greedy_sampler()).unwrap();
+    let (toks, _) = sess.generate(first, &opts).unwrap();
+
+    let mut all = vec![first];
+    all.extend_from_slice(&toks);
+    let mut unique = all.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert!(
+        unique.len() >= 8,
+        "greedy generation collapsed: {} unique tokens in {} (sequence: {:?})",
+        unique.len(),
+        all.len(),
+        all,
+    );
+}
+
 #[test]
 fn matvec_matmul_parity_first_token() {
     // Both prefill paths must sample the same first token under greedy sampling.
