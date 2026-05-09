@@ -470,11 +470,7 @@ pub const fn pick_subgroup_config(
 fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
     let id = format!("SPIRV_CROSS_CONSTANT_ID_{slot}");
     if src.contains(&id) {
-        let prefix = format!("#define {id} {value}u\n");
-        let mut out = String::with_capacity(src.len() + prefix.len());
-        out.push_str(&prefix);
-        out.push_str(src);
-        return out;
+        return format!("#define {id} {value}u\n{src}");
     }
 
     let attr = format!("[[function_constant({slot})]]");
@@ -507,12 +503,11 @@ fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
             .expect("expected `;\\n` after function_constant ternary");
         let next_line_end = after + semi + 2;
 
-        let replacement = format!("constant uint {name} = {value}u;\n");
-        let mut out = String::with_capacity(src.len());
-        out.push_str(&src[..line_start]);
-        out.push_str(&replacement);
-        out.push_str(&src[next_line_end..]);
-        return out;
+        return format!(
+            "{}constant uint {name} = {value}u;\n{}",
+            &src[..line_start],
+            &src[next_line_end..]
+        );
     }
 
     panic!("spec constant slot {slot} ({id}) not found in MSL source");
@@ -599,7 +594,9 @@ fn msl_shift_ssbo_buffer_indices(src: &str) -> String {
         return src.to_owned();
     }
 
-    let mut new_sig = String::with_capacity(sig.len() + 16);
+    let mut out = String::with_capacity(src.len() + 16);
+    out.push_str(&src[..args_start]);
+
     let mut last = 0;
     let mut p = 0;
     while let Some(rel) = sig[p..].find(marker) {
@@ -616,16 +613,13 @@ fn msl_shift_ssbo_buffer_indices(src: &str) -> String {
         let is_ssbo = !sig[arg_start..abs].trim_start().starts_with("constant ");
         let new_slot = if is_ssbo { slot + 1 } else { slot };
 
-        new_sig.push_str(&sig[last..abs]);
-        let _ = write!(&mut new_sig, "[[buffer({new_slot})]]");
+        out.push_str(&sig[last..abs]);
+        let _ = write!(&mut out, "[[buffer({new_slot})]]");
         last = close + ")]]".len();
         p = last;
     }
-    new_sig.push_str(&sig[last..]);
 
-    let mut out = String::with_capacity(src.len() + 16);
-    out.push_str(&src[..args_start]);
-    out.push_str(&new_sig);
+    out.push_str(&sig[last..]);
     out.push_str(&src[args_end..]);
     out
 }
