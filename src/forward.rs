@@ -549,7 +549,15 @@ fn dispatch_matmul_q1_0(
         out_offset: out_off,
         accumulate: u32::from(accumulate),
     };
-    pass.set_pipeline(&model.pipes.matmul);
+    #[cfg(not(target_vendor = "apple"))]
+    let pipe = if model.use_coopmat_matmul {
+        &model.pipes.matmul_coopmat
+    } else {
+        &model.pipes.matmul
+    };
+    #[cfg(target_vendor = "apple")]
+    let pipe = &model.pipes.matmul;
+    pass.set_pipeline(pipe);
     pass.set_bind_group(0, matmul_bg(model, weights), &[]);
     pass.set_immediates(0, bytemuck::bytes_of(&p));
     pass.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);

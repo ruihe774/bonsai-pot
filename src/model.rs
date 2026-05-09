@@ -6,6 +6,7 @@
 //! `RoPE` cos/sin table are also f16; `Q8_0` scales remain f32.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs::{read, read_to_string};
 use std::mem::size_of;
 use std::path::Path;
@@ -691,6 +692,11 @@ pub struct Pipelines {
     pub(crate) matvec_silu: wgpu::ComputePipeline,
     pub(crate) matvec_fused_normed: wgpu::ComputePipeline,
     pub(crate) matmul: wgpu::ComputePipeline,
+    /// Alternate matmul pipeline using `VK_KHR_cooperative_matrix` int8 MMAs.
+    /// Selected at dispatch time when `Model::use_coopmat_matmul` is true.
+    /// Vulkan only — Apple uses its own hand-ported `simdgroup_matrix` MSL.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) matmul_coopmat: wgpu::ComputePipeline,
     pub(crate) attention_prefill_tiled: wgpu::ComputePipeline,
     pub(crate) attention_split: wgpu::ComputePipeline,
     pub(crate) attention_merge: wgpu::ComputePipeline,
@@ -845,6 +851,12 @@ pub struct Model {
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
     pub(crate) lost: Arc<OnceLock<DeviceLostInfo>>,
+    /// When true, `dispatch_matmul_q1_0` selects the `matmul_coopmat`
+    /// pipeline (int8 MMAs via `VK_KHR_cooperative_matrix`) instead of the
+    /// default dp4a one. Set at load time from the `POT_COOPMAT_MATMUL`
+    /// environment variable; intended as an A/B switch for benchmarking.
+    /// Always false on Apple (no cooperative-matrix path on Metal).
+    pub(crate) use_coopmat_matmul: bool,
     #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
     pub(crate) bench_ts_period_ns: f32,
 }
@@ -1378,6 +1390,7 @@ impl Model {
         #[cfg(not(target_vendor = "apple"))]
         let hal_open = unsafe {
             use ash::ext::global_priority;
+            use ash::khr::cooperative_matrix;
             use ash::vk;
             use wgpu::hal::api::Vulkan as VulkanApi;
 
@@ -1443,11 +1456,50 @@ impl Model {
             if gp_supported {
                 str_pointers.push(global_priority::NAME.as_ptr());
             }
+            // Manually request VK_KHR_cooperative_matrix; we don't go through
+            // wgpu's `EXPERIMENTAL_COOPERATIVE_MATRIX` feature because we
+            // bypass naga and feed SPIR-V directly via passthrough — wgpu has
+            // no need to know coopmat is in use.
+            str_pointers.push(cooperative_matrix::NAME.as_ptr());
 
             let pre_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_infos)
                 .enabled_extension_names(&str_pointers);
-            let info = enabled_phd_features.add_to_device_create(pre_info);
+            let mut info = enabled_phd_features.add_to_device_create(pre_info);
+
+            // VK_KHR_cooperative_matrix requires `vulkanMemoryModel` to be
+            // enabled. wgpu-hal already chains a
+            // `PhysicalDeviceVulkanMemoryModelFeatures` struct on the pNext
+            // chain (it does so unconditionally for Vulkan 1.2+ targets), but
+            // sets `vulkan_memory_model = VK_FALSE` because we did not request
+            // wgpu's `EXPERIMENTAL_COOPERATIVE_MATRIX` feature. Walk the chain
+            // and flip it to TRUE in place. Pushing a second structure of the
+            // same type would violate Vulkan's "no duplicate pNext" rule.
+            {
+                let mut cur = info.p_next as *mut vk::BaseOutStructure<'_>;
+                let mut patched = false;
+                while !cur.is_null() {
+                    if (*cur).s_type
+                        == vk::StructureType::PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES
+                    {
+                        let m =
+                            cur.cast::<vk::PhysicalDeviceVulkanMemoryModelFeaturesKHR<'_>>();
+                        (*m).vulkan_memory_model = vk::TRUE;
+                        patched = true;
+                        break;
+                    }
+                    cur = (*cur).p_next.cast();
+                }
+                assert!(
+                    patched,
+                    "vulkan_memory_model feature struct not found in pNext chain — \
+                     wgpu-hal may have changed how it chains Vulkan 1.2 features",
+                );
+            }
+
+            let mut coop_mat_features = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default()
+                .cooperative_matrix(true);
+            info = info.push_next(&mut coop_mat_features);
 
             let raw_device = match instance.create_device(pd, &info, None) {
                 Ok(d) => d,
@@ -1845,6 +1897,15 @@ impl Model {
             WG_MATVEC_FUSED_NORMED
         );
         let sh_matmul = load_shader!("matmul_q1_0_q8_0", no_spec, WG_MATMUL);
+        // Vulkan-only int8-coopmat matmul. Apple's compiled-MSL pipeline
+        // does not include this kernel (see `VULKAN_ONLY_SHADERS` in
+        // `build.rs`). The pinned 32-lane subgroup is required by KHR
+        // cooperative matrix scope=Subgroup with the (16,16,16,sint8,sint32)
+        // shape this shader uses; on a wave64-default adapter this requests
+        // the wave32 mode via `SubgroupSize::Fixed(32)`.
+        #[cfg(not(target_vendor = "apple"))]
+        let sh_matmul_coopmat =
+            load_shader!("matmul_q1_0_q8_0_coopmat", no_spec, WG_MATMUL);
         let sh_attn_prefill_tiled = load_shader!(
             "attention_prefill_tiled",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_prefill_tiled)],
@@ -1988,6 +2049,14 @@ impl Model {
                 "matmul",
                 size_of::<MatmulParams>() as u32,
                 wgpu::SubgroupSize::Varying,
+            ),
+            #[cfg(not(target_vendor = "apple"))]
+            matmul_coopmat: mk_pipe(
+                &bgls.matmul,
+                &sh_matmul_coopmat,
+                "matmul_coopmat",
+                size_of::<MatmulParams>() as u32,
+                wgpu::SubgroupSize::Fixed(32),
             ),
             attention_prefill_tiled: mk_pipe(
                 &bgls.attn_prefill_tiled,
@@ -2149,6 +2218,11 @@ impl Model {
             output_tensors,
             vocab,
             lost,
+            #[cfg(target_vendor = "apple")]
+            use_coopmat_matmul: false,
+            #[cfg(not(target_vendor = "apple"))]
+            use_coopmat_matmul: env::var_os("POT_COOPMAT_MATMUL")
+                .is_some_and(|v| !v.is_empty() && v != "0"),
             #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
             bench_ts_period_ns,
         })

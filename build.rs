@@ -24,11 +24,18 @@ const SHADERS: &[&str] = &[
     "matvec_q1_0_silu.comp",
     "matvec_q1_0_fused_normed.comp",
     "matmul_q1_0_q8_0.comp",
+    "matmul_q1_0_q8_0_coopmat.comp",
     "topk_partial.comp",
     "topk_merge.comp",
 ];
 
 const HAND_PORTED_MSL: &[&str] = &["matmul_q1_0_q8_0.comp"];
+
+// Shaders that exist only on the Vulkan path (e.g. those built around
+// `VK_KHR_cooperative_matrix`, which has no Metal counterpart in this
+// engine — Apple gets `matmul_q1_0_q8_0.metal` with `simdgroup_matrix`
+// instead).
+const VULKAN_ONLY_SHADERS: &[&str] = &["matmul_q1_0_q8_0_coopmat.comp"];
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -92,6 +99,9 @@ fn build_vulkan(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
 fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
     let define_metal = [("METAL_BACKEND", "1")];
     for name in SHADERS {
+        if VULKAN_ONLY_SHADERS.contains(name) {
+            continue;
+        }
         let src_path = manifest_dir.join("src/shaders").join(name);
         let msl_path = out_dir.join(format!("{name}.msl"));
         println!("cargo:rerun-if-changed={}", src_path.display());

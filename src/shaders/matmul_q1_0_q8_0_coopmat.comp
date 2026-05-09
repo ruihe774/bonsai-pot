@@ -1,0 +1,266 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Q1_0 weights × Q8_0 activations -> f16 output, using int8 cooperative
+// matrix MMAs (VK_KHR_cooperative_matrix). The int8 inputs (with int32
+// accumulator) replace the dotPacked4x8EXT inner loop in the dp4a sibling
+// kernel `matmul_q1_0_q8_0.comp`.
+//
+// Tiling:
+//   * 64 × 64 WG tile (TILE_M × TILE_N).
+//   * K accumulated in 128-element Q1_0 blocks; each Q1_0 block contains
+//     four 32-element Q8_0 sub-blocks. The sub-block boundary matters
+//     because Q8_0 activation scales `a_d[r,b,s]` change across `s` —
+//     per-block i32 partials must be scaled before being folded into the
+//     fp32 accumulator.
+//   * 4 subgroups per WG (WG=128, sg=32 fixed). Subgroups are arranged
+//     2 × 2 over the 64 × 64 WG tile, so each subgroup handles a 32 × 32
+//     sub-tile = 4 spatial 16 × 16 MMAs.
+//   * Per Q8_0 sub-block: each spatial MMA chains 2 K=16 cooperative
+//     multiply-adds.
+//
+// Scaling. KHR cooperative matrices have no element-wise scale primitive
+// (scope is Subgroup; element layout is opaque). So per Q8_0 sub-block we
+// `coopMatStore` the i32 partial into a 64 × 64 shared-memory dump, then
+// every thread reads its 4 × 4 cell footprint, applies `a_d[r]·w_d[c]`,
+// and folds into a register-resident fp32 accumulator.
+//
+// Caller bind-group layout matches `matmul_q1_0_q8_0.comp`
+// (the `bgls.matmul` BGL): {weights ro, acts ro, y rw}, with the same
+// `MatmulParams` push constant.
+layout(push_constant) uniform Params {
+    uint k;
+    uint n;
+    uint m;
+    uint w_d_offset;
+    uint w_qs_offset;
+    uint a_d_offset;
+    uint a_qs_offset;
+    uint out_offset;
+    uint accumulate;
+}
+p;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
+layout(set = 0, binding = 1, std430) readonly buffer ABuf { uint acts[]; };
+layout(set = 0, binding = 2, std430) buffer YBuf { float16_t y[]; };
+
+const uint TILE_M = 64u;
+const uint TILE_N = 64u;
+const uint TILE_K = 128u;          // one Q1_0 block
+const uint MMA = 16u;              // sint8 / sint8 / sint32 16×16×16
+const uint WG = 128u;
+const uint SG_SIZE = 32u;
+const uint NUM_SG = WG / SG_SIZE;  // 4
+const uint SG_M_GRID = 2u;
+const uint SG_N_GRID = 2u;
+const uint SG_TILE_M = TILE_M / SG_M_GRID;   // 32
+const uint SG_TILE_N = TILE_N / SG_N_GRID;   // 32
+const uint SG_MMA_M = SG_TILE_M / MMA;       // 2
+const uint SG_MMA_N = SG_TILE_N / MMA;       // 2
+
+// Per-thread cells (independent of subgroup grid) for the i32 → fp32
+// scale-and-accumulate step. The 16×16 thread grid mirrors the dp4a
+// sibling for direct comparability.
+const uint WG_LX = 16u;            // = TILE_N / 4
+const uint WG_LY = 16u;            // = TILE_M / 4
+const uint TM = 4u;
+const uint TN = 4u;
+
+// Shared memory. Total ≈ 35 KiB — fits within the 64 KiB LDS budget on
+// every adapter we target. Layouts:
+//   * a_i8_lds : [M=64, K=128] row-major
+//   * b_i8_lds : [N=64, K=128] row-major (= K-major view of B^T; coopmat
+//                B-side load uses ColumnMajor layout to read [K, N]).
+//   * a_d_lds  : [4, M=64], indexed [s*64 + m_local].
+//   * w_d_lds  : [N=64].
+//   * i32_dump : [M=64, N=64] row-major, reused per sub-block.
+shared int8_t a_i8_lds[TILE_M * TILE_K];
+shared int8_t b_i8_lds[TILE_N * TILE_K];
+shared float a_d_lds[TILE_M * 4u];
+shared float w_d_lds[TILE_N];
+shared int32_t i32_dump[TILE_M * TILE_N];
+
+float load_w_f16(uint b_offset) {
+    uint word = weights[b_offset >> 2];
+    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
+    return unpackFloat2x16(half_bits).x;
+}
+
+// Spread 4 sign bits into a packed `i8vec4` of ±1: bit=1 → +1, bit=0 → -1.
+// Same convention as `expand_4_bits` in the dp4a sibling — bit i lands at
+// the LSB of byte i. The two values 0x01 / 0xFF cast to int8 ±1 directly.
+i8vec4 expand_4_bits_to_i8(uint bits) {
+    uint spread = (bits * 0x00204081u) & 0x01010101u;
+    uint packed = ~(spread * 0xFEu);
+    return i8vec4(int8_t( packed        & 0xFFu),
+                  int8_t((packed >>  8u) & 0xFFu),
+                  int8_t((packed >> 16u) & 0xFFu),
+                  int8_t((packed >> 24u) & 0xFFu));
+}
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint n_base = gl_WorkGroupID.x * TILE_N;
+    uint m_base = gl_WorkGroupID.y * TILE_M;
+    uint nb_q1 = p.k / 128u;
+    uint nb_q8 = p.k / 32u;
+    uint tid = gl_LocalInvocationIndex;
+
+    uint sg_id = gl_SubgroupID;            // [0, 4)
+    uint sg_m_idx = sg_id / SG_N_GRID;     // [0, 2)
+    uint sg_n_idx = sg_id % SG_N_GRID;     // [0, 2)
+    uint sg_m_off = sg_m_idx * SG_TILE_M;
+    uint sg_n_off = sg_n_idx * SG_TILE_N;
+
+    uint lx = tid % WG_LX;
+    uint ly = tid / WG_LX;
+
+    float acc[TM * TN];
+    [[unroll]] for (uint i = 0u; i < TM * TN; ++i) acc[i] = 0.0;
+
+    [[unroll, min_iterations(4), iteration_multiple(1), dependency_length(1)]]
+    for (uint b = 0u; b < nb_q1; ++b) {
+        // ---- cooperative loads for one Q1_0 block ------------------------
+
+        // w_d (Q1_0 weight scales): one f16 per (n_idx, b). 64 entries.
+        if (tid < TILE_N) {
+            uint n_idx = n_base + tid;
+            w_d_lds[tid] = load_w_f16(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
+        }
+
+        // a_d (Q8_0 activation scales): one f32 per (m_idx, b, s). 4*64=256
+        // entries; WG=128 → 2 entries per thread.
+        [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+            uint idx = i * WG + tid;
+            uint s = idx / TILE_M;
+            uint m_local = idx % TILE_M;
+            uint m_idx = m_base + m_local;
+            uint a_block = b * 4u + s;
+            uint off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
+            a_d_lds[idx] = uintBitsToFloat(acts[off >> 2]);
+        }
+
+        // b_i8: expand Q1_0 sign bits → ±1 int8. Each Q1_0 row is 16 bytes
+        // = 4 u32 of sign bits (32 K-elements per u32). Layout in shmem is
+        // [N=64, K=128] row-major, so each u32-load expands into 32
+        // contiguous shmem bytes — written via i8vec4 packs (8 packs/u32).
+        // Total work = 64 × 4 = 256 u32 reads → 2 per thread.
+        [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+            uint idx = i * WG + tid;
+            uint n_local = idx / 4u;
+            uint w_word = idx & 3u;
+            uint n_idx = n_base + n_local;
+            uint off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + w_word * 4u;
+            uint bits = weights[off >> 2];
+            uint dst = n_local * TILE_K + w_word * 32u;
+            // 32 bits → 8 × i8vec4 of ±1.
+            [[unroll]] for (uint q = 0u; q < 8u; ++q) {
+                i8vec4 v = expand_4_bits_to_i8((bits >> (q * 4u)) & 0xFu);
+                b_i8_lds[dst + q * 4u + 0u] = v.x;
+                b_i8_lds[dst + q * 4u + 1u] = v.y;
+                b_i8_lds[dst + q * 4u + 2u] = v.z;
+                b_i8_lds[dst + q * 4u + 3u] = v.w;
+            }
+        }
+
+        // a_i8: load Q8_0 i8 acts. [M=64, K=128] row-major, 8192 bytes;
+        // each m row has 32 u32 = 128 i8 K-elements per Q1_0 block.
+        // Total work = 64 × 32 = 2048 u32 reads → 16 per thread.
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+            uint idx = i * WG + tid;
+            uint m_local = idx / 32u;
+            uint k_word = idx & 31u;
+            uint m_idx = m_base + m_local;
+            uint off = p.a_qs_offset + m_idx * p.k + b * 128u + k_word * 4u;
+            uint w = acts[off >> 2];
+            uint dst = m_local * TILE_K + k_word * 4u;
+            a_i8_lds[dst + 0u] = int8_t(int( w        << 24) >> 24);
+            a_i8_lds[dst + 1u] = int8_t(int((w >>  8u) << 24) >> 24);
+            a_i8_lds[dst + 2u] = int8_t(int((w >> 16u) << 24) >> 24);
+            a_i8_lds[dst + 3u] = int8_t(int( w >> 24u));
+        }
+        barrier();
+
+        // ---- Q8_0 sub-block loop -----------------------------------------
+        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+            uint k_block = s * 32u;
+
+            // Each subgroup MMAs its 32 × 32 sub-tile → 4 spatial 16×16
+            // i32 partials → coopMatStore into i32_dump.
+            [[unroll]] for (uint mma_m = 0u; mma_m < SG_MMA_M; ++mma_m) {
+                [[unroll]] for (uint mma_n = 0u; mma_n < SG_MMA_N; ++mma_n) {
+                    uint m_off = sg_m_off + mma_m * MMA;
+                    uint n_off = sg_n_off + mma_n * MMA;
+
+                    coopmat<int32_t, gl_ScopeSubgroup, MMA, MMA, gl_MatrixUseAccumulator> partial =
+                        coopmat<int32_t, gl_ScopeSubgroup, MMA, MMA, gl_MatrixUseAccumulator>(0);
+
+                    [[unroll]] for (uint tk = 0u; tk < 2u; ++tk) {
+                        uint k_off = k_block + tk * MMA;
+
+                        coopmat<int8_t, gl_ScopeSubgroup, MMA, MMA, gl_MatrixUseA> a_mat;
+                        coopmat<int8_t, gl_ScopeSubgroup, MMA, MMA, gl_MatrixUseB> b_mat;
+
+                        // a_i8_lds is [M, K] row-major, stride = TILE_K.
+                        coopMatLoad(a_mat, a_i8_lds,
+                                    m_off * TILE_K + k_off, TILE_K,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                        // b_i8_lds is [N, K] row-major in shmem; we want
+                        // matrix B(K, N), so use ColumnMajor with stride
+                        // along K = TILE_K.
+                        coopMatLoad(b_mat, b_i8_lds,
+                                    n_off * TILE_K + k_off, TILE_K,
+                                    gl_CooperativeMatrixLayoutColumnMajor);
+
+                        partial = coopMatMulAdd(a_mat, b_mat, partial);
+                    }
+
+                    // Store i32 partial into a 64 × 64 dump. Stride = TILE_N.
+                    coopMatStore(partial, i32_dump,
+                                 m_off * TILE_N + n_off, TILE_N,
+                                 gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            barrier();
+
+            // Per-thread scale and accumulate into the fp32 register tile.
+            [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
+                uint r = ly * TM + tm;
+                float a_d_val = a_d_lds[s * TILE_M + r];
+                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                    uint c = lx * TN + tn;
+                    float w_d_val = w_d_lds[c];
+                    int32_t pi = i32_dump[r * TILE_N + c];
+                    acc[tm * TN + tn] += a_d_val * w_d_val * float(pi);
+                }
+            }
+            barrier();
+        }
+    }
+
+    // ---- output write ----------------------------------------------------
+    [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
+        uint m_idx = m_base + ly * TM + tm;
+        if (m_idx >= p.m) continue;
+        [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+            uint n_idx = n_base + lx * TN + tn;
+            if (n_idx >= p.n) continue;
+            uint yi = p.out_offset + m_idx * p.n + n_idx;
+            float val = acc[tm * TN + tn];
+            if (p.accumulate != 0u) {
+                y[yi] = float16_t(float(y[yi]) + val);
+            } else {
+                y[yi] = float16_t(val);
+            }
+        }
+    }
+}
