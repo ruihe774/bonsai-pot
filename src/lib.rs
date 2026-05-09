@@ -45,6 +45,6 @@ pub use session::{GenerateOptions, Sampler, Session, StopReason};
 #[doc(hidden)]
 pub mod __bench {
     pub use crate::forward::bench_internals::bench;
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
     pub use crate::forward::bench_internals::{microbench_pp, microbench_tg};
 }

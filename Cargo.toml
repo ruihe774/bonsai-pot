@@ -32,6 +32,8 @@ default = []
 # the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
 # stable public library API.
 bench-internals = ["dep:env_logger"]
+# Disable timestamp query in CI
+ci = ["bench-internals"]
 
 [dependencies]
 # Library deps.
