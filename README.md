@@ -4,7 +4,7 @@ A from-scratch, dependency-light **Bonsai (Qwen3-architecture) Q1_0 inference en
 
 The defining property of this engine: **weights are never dequantized**. Q1_0 storage is consumed directly by the matvec/matmul kernels — there is no intermediate FP16 weight tensor, no on-the-fly unpack into shared memory, nothing. Each weight contributes to the dot product as a single sign bit selecting `+x` or `-x`, with one FP16 multiply per 128-weight block to apply the block scale. The hot inner loop has **zero multiplications** — every accumulation is an add or a sign-flipped add.
 
-No `llama.cpp`, no `ggml`, no PyTorch on the hot path. Weights are loaded from a custom flat-file layout (produced from a GGUF by `scripts/extract.py`), every kernel is hand-rolled WGSL, and the host side is plain Rust + wgpu 29 + pollster.
+No `llama.cpp`, no `ggml`, no PyTorch on the hot path. Weights are loaded from a custom flat-file layout (produced from a GGUF by `scripts/extract.py`), every kernel is hand-rolled GLSL (with one hand-ported `.metal` for the Apple `simdgroup_matrix` matmul), and the host side is plain Rust + wgpu 29.
 
 ## Performance
 
@@ -75,7 +75,7 @@ cargo run --release --example chat -- ./model
 
 `--temperature`, `--top-k`, `--top-p`, `--seed`. Default is greedy (`--temperature 0.0`). Greedy runs are byte-deterministic; stochastic runs are reproducible per seed.
 
-Sampling is hybrid: a two-pass multi-WG reduction (`topk_partial.wgsl` + `topk_merge.wgsl`) reduces the full logits tensor to top-K candidates (`K = TOPK_MAX = 32`) on the GPU; the CPU then does temperature → softmax → top-p → multinomial.
+Sampling is hybrid: a two-pass multi-WG reduction (`topk_partial.comp` + `topk_merge.comp`) reduces the full logits tensor to top-K candidates (`K = TOPK_MAX = 32`) on the GPU; the CPU then does temperature → softmax → top-p → multinomial.
 
 ## How it works
 
@@ -85,8 +85,8 @@ Q1_0 stores 128 weights per block as 16 bytes of sign bits (±1 per weight) plus
 
 The shaders consume these two arrays **directly**:
 
-- **Matvec (`shaders/matvec_q1_0.wgsl`)** — for each block, the kernel walks 128 sign bits and accumulates `±x` via `select(-xv, xv, bit_set)`. The block contributes one FP16 multiply at the end (`block_sum * d`). No weight is ever materialized as a real number; nothing is unpacked into shared memory; the inner loop has zero multiplications. `matvec_q1_0_fused_normed.wgsl` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup, amortizes the activation load across them, and additionally folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip. `matvec_q1_0_silu.wgsl` folds `silu(gate) * up` into the ffn_down matvec.
-- **Matmul (`shaders/matmul_q1_0_q8_0.wgsl`)** — used in batched prefill. Activations arrive Q8_0-quantized inline by the upstream fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, `attention_prefill_tiled`) — there is no separate quantize pass. The kernel then computes the dot product as `sum_of_signed_q8 * d_w * d_x` per block, using `dot4I8Packed` over the activation bytes with the weight sign bits selecting their sign. Again: no FP16 weight tensor, no dequantize step, weight bits are read straight from storage.
+- **Matvec (`shaders/matvec_q1_0.comp`)** — for each block, the kernel walks 128 sign bits and accumulates `±x` via `select(-xv, xv, bit_set)`. The block contributes one FP16 multiply at the end (`block_sum * d`). No weight is ever materialized as a real number; nothing is unpacked into shared memory; the inner loop has zero multiplications. `matvec_q1_0_fused_normed.comp` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup, amortizes the activation load across them, and additionally folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip. `matvec_q1_0_silu.comp` folds `silu(gate) * up` into the ffn_down matvec.
+- **Matmul (`shaders/matmul_q1_0_q8_0.comp`)** — used in batched prefill. Activations arrive Q8_0-quantized inline by the upstream fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, `attention_prefill_tiled`) — there is no separate quantize pass. The kernel then computes the dot product as `sum_of_signed_q8 * d_w * d_x` per block, using `dot4I8Packed` over the activation bytes with the weight sign bits selecting their sign. Again: no FP16 weight tensor, no dequantize step, weight bits are read straight from storage. (On Apple this kernel is hand-ported to MSL as `matmul_q1_0_q8_0.metal` around `simdgroup_matrix<half,8,8>` MMA instructions, since `simdgroup_matrix` has no GLSL surface; Q1_0 weights and Q8_0 activations are still read directly from storage and materialized to fp16 just-in-time into threadgroup memory.)
 
 ### Two execution paths
 
@@ -99,8 +99,8 @@ Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step bat
 
 Two attention kernels, both fused-softmax flash-attention variants:
 
-- **Generation (tg, m=1)** — split-K + GQA-batched (`attention_split.wgsl` + `attention_merge.wgsl`). Each `(kv_head, chunk)` workgroup scans an 8-position slice of the cache; the four Q-heads sharing the KV group are processed together so each K/V load is reused 4×. Per-chunk `(m, l, o)` partials are written to scratch; `attention_merge` does a flash-attention log-sum-exp combination across the chunks. This decouples per-step latency from KV length.
-- **Prefill (matmul, m>1)** — Q-tiled + GQA-batched FA-2 (`attention_prefill_tiled.wgsl`). Each workgroup handles `Q_TILE=2` consecutive query tokens × 4 GQA Q-heads sharing the KV head, so a single K[t] load is reused across 8 queries. The output is **inline Q8_0-quantized** and written directly to the activation Q8_0 buffer — the downstream Wo matmul reads it without a round-trip. Per-query state (Q registers, output accumulators, m/l) is manually unrolled rather than indexed dynamically out of an array (NVIDIA spills `array<…, Q_TILE>` with dynamic indexing to local memory; manual unrolling stays in registers).
+- **Generation (tg, m=1)** — split-K + GQA-batched (`attention_split.comp` + `attention_merge.comp`). Each `(kv_head, chunk)` workgroup scans an 8-position slice of the cache; the four Q-heads sharing the KV group are processed together so each K/V load is reused 4×. Per-chunk `(m, l, o)` partials are written to scratch; `attention_merge` does a flash-attention log-sum-exp combination across the chunks. This decouples per-step latency from KV length.
+- **Prefill (matmul, m>1)** — Q-tiled + GQA-batched FA-2 (`attention_prefill_tiled.comp`). Each workgroup handles `Q_TILE=2` consecutive query tokens × 4 GQA Q-heads sharing the KV head, so a single K[t] load is reused across 8 queries. The output is **inline Q8_0-quantized** and written directly to the activation Q8_0 buffer — the downstream Wo matmul reads it without a round-trip. Per-query state (Q registers, output accumulators, m/l) is manually unrolled rather than indexed dynamically out of an array (NVIDIA spills `array<…, Q_TILE>` with dynamic indexing to local memory; manual unrolling stays in registers).
 
 ### GPU memory layout
 
@@ -120,7 +120,7 @@ There is no UBO. Every dispatch's params struct (≤ 64 B) is passed as wgpu imm
 | `src/error.rs` | `PotError` / `Result` |
 | `src/decode.rs` | GPT-2 byte-level decode |
 | `src/bin/bonsai-pot.rs` | Demo CLI |
-| `src/shaders/*.wgsl` | One file per kernel |
+| `src/shaders/*.comp` (+ `matmul_q1_0_q8_0.metal`) | One GLSL source per kernel; one hand-ported MSL exception for the Apple `simdgroup_matrix` matmul |
 | `examples/chat.rs` | Interactive ChatML REPL on the public API |
 | `tests/gpu_integration.rs` | End-to-end GPU tests (load `./model`, prefill/generate, snapshot round-trip) |
 | `scripts/extract.py` | GGUF → flat-file converter |
