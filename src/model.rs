@@ -428,8 +428,8 @@ pub const fn pick_subgroup_config(
     (wgpu::SubgroupSize::Varying, 32)
 }
 
-/// Override the default of a spirv-cross-emitted SpecConstant in an MSL
-/// source string. spirv-cross emits Vulkan SpecConstants in one of two forms,
+/// Override the default of a spirv-cross-emitted `SpecConstant` in an MSL
+/// source string. spirv-cross emits Vulkan `SpecConstants` in one of two forms,
 /// and this function handles both:
 ///
 /// **Form A** (the simple substitution case):
@@ -462,7 +462,11 @@ pub const fn pick_subgroup_config(
 /// `layout(constant_id = N)` is caught at load time rather than silently
 /// shipping the default.
 #[cfg(target_vendor = "apple")]
-#[allow(clippy::panic, reason = "shaders are written by us")]
+#[allow(
+    clippy::panic,
+    clippy::expect_used,
+    reason = "shaders are written by us"
+)]
 fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
     let id = format!("SPIRV_CROSS_CONSTANT_ID_{slot}");
     if src.contains(&id) {
@@ -531,8 +535,14 @@ fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
 /// Detection: if no SSBO sits at `[[buffer(0)]]`, the source is already in
 /// wgpu form (e.g. hand-ported `.metal`) and we return it unchanged.
 #[cfg(target_vendor = "apple")]
-#[allow(clippy::panic, reason = "shaders are written by us")]
+#[allow(
+    clippy::panic,
+    clippy::expect_used,
+    reason = "shaders are written by us"
+)]
 fn msl_shift_ssbo_buffer_indices(src: &str) -> String {
+    use std::fmt::Write as _;
+
     let head = "kernel void cs_main(";
     let head_pos = src
         .find(head)
@@ -607,7 +617,7 @@ fn msl_shift_ssbo_buffer_indices(src: &str) -> String {
         let new_slot = if is_ssbo { slot + 1 } else { slot };
 
         new_sig.push_str(&sig[last..abs]);
-        new_sig.push_str(&format!("[[buffer({new_slot})]]"));
+        let _ = write!(&mut new_sig, "[[buffer({new_slot})]]");
         last = close + ")]]".len();
         p = last;
     }
