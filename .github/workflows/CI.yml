@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  - push
+  - pull_request
+  - workflow_dispatch
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-metal:
+    name: Build and test Metal backend in macOS
+    runs-on: macos-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Install dependencies
+      run: brew install glslang spirv-tools spirv-cross uv
+    - name: Download model
+      run: curl -L "https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf?download=true" -o Bonsai-4B-Q1_0.gguf
+    - name: Extract model
+      run: uv run scripts/extract.py Bonsai-4B-Q1_0.gguf
+    - name: Run tests
+      run: cargo test --all-features -- --test-threads=1
+    - name: Run prompt & gen
+      run: |
+        uv run scripts/bpe.py ./model "Once upon a time" | cargo run --all-features -- ./model --mode prompt --max-new-tokens 64 --temperature 0 --seed 0 | tee prompt.txt
+        uv run scripts/bpe.py ./model "Once upon a time" | cargo run --all-features -- ./model --mode gen --max-new-tokens 64 --temperature 0 --seed 0 | tee gen.txt
+        diff prompt.txt gen.txt
+    - name: Bench HEAD
+      run: for i in 1 2 3; do cargo run --all-features -- ./model --mode bench --pp 512 --tg 128; done
