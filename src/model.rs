@@ -475,38 +475,66 @@ fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
 
     let attr = format!("[[function_constant({slot})]]");
     if let Some(attr_pos) = src.find(&attr) {
-        // Locate the surrounding `constant uint NAME_tmp [[function_constant(N)]];` line.
-        let line_start = src[..attr_pos].rfind('\n').map_or(0, |p| p + 1);
-        let line_end = src[attr_pos..]
-            .find('\n')
-            .map_or(src.len(), |p| attr_pos + p + 1);
-        let decl_line = &src[line_start..line_end];
+        // The minifier collapses the two-statement Form B declaration to
+        // `constant uint NAME_tmp[[function_constant(N)]];constant uint NAME=
+        //  is_function_constant_defined(NAME_tmp)?NAME_tmp:<default>u;`
+        // — no whitespace around the attribute or between the two
+        // statements. Parse it character-positionally rather than by lines.
 
-        // Parse `<NAME>_tmp` from `constant uint <NAME>_tmp [[function_constant(N)]];`.
-        let after_uint = decl_line
-            .trim_start()
-            .strip_prefix("constant uint ")
-            .expect("expected 'constant uint ' prefix on function_constant decl");
-        let name_tmp = after_uint
-            .split_whitespace()
-            .next()
-            .expect("expected name token after 'constant uint '");
+        // Walk back from `attr_pos` over the `NAME_tmp` identifier (any run
+        // of identifier chars), then over the required whitespace, then over
+        // the `constant uint` keywords. The position right before
+        // `constant` is the start of the declaration we'll replace.
+        let bytes = src.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+        let mut name_end = attr_pos;
+        while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
+            name_end -= 1;
+        }
+        let mut name_start = name_end;
+        while name_start > 0 && is_ident(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        let name_tmp = &src[name_start..name_end];
         let name = name_tmp
             .strip_suffix("_tmp")
             .expect("expected '_tmp' suffix on function_constant name");
 
-        // The next line is the `is_function_constant_defined(...) ? ... : <default>u;`
-        // ternary that defines `NAME`. Consume it through the next `;\n`.
-        let after = line_end;
-        let semi = src[after..]
-            .find(";\n")
-            .expect("expected `;\\n` after function_constant ternary");
-        let next_line_end = after + semi + 2;
+        let mut cursor = name_start;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let uint_kw = "uint";
+        cursor = cursor
+            .checked_sub(uint_kw.len())
+            .filter(|&p| &src[p..p + uint_kw.len()] == uint_kw)
+            .expect("expected 'uint' keyword before function_constant name");
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let const_kw = "constant";
+        let decl_start = cursor
+            .checked_sub(const_kw.len())
+            .filter(|&p| &src[p..p + const_kw.len()] == const_kw)
+            .expect("expected 'constant' keyword before function_constant decl");
+
+        // Skip the first `;` (end of the `_tmp` decl), then the second `;`
+        // (end of the ternary that defines `NAME`).
+        let after_attr = attr_pos + attr.len();
+        let first_semi = src[after_attr..]
+            .find(';')
+            .expect("expected ';' after function_constant attribute");
+        let after_first = after_attr + first_semi + 1;
+        let second_semi = src[after_first..]
+            .find(';')
+            .expect("expected ';' after function_constant ternary");
+        let replace_end = after_first + second_semi + 1;
 
         return format!(
-            "{}constant uint {name} = {value}u;\n{}",
-            &src[..line_start],
-            &src[next_line_end..]
+            "{}constant uint {name} = {value}u;{}",
+            &src[..decl_start],
+            &src[replace_end..]
         );
     }
 
@@ -2564,6 +2592,21 @@ mod tests {
         // Surrounding context is preserved.
         assert!(s.contains("// preamble\n"));
         assert!(s.contains("constant bool _193 = (SUBGROUP_SIZE >= 32u);\n"));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn msl_patcher_rewrites_minified_function_constant_form() {
+        // build.rs minifies translated MSL — whitespace around the attribute
+        // and between the `_tmp` decl and the ternary disappears entirely.
+        let src = "// preamble\n\
+                   constant uint SUBGROUP_SIZE_tmp[[function_constant(0)]];constant uint SUBGROUP_SIZE=is_function_constant_defined(SUBGROUP_SIZE_tmp)?SUBGROUP_SIZE_tmp:32u;constant bool _193=(SUBGROUP_SIZE>=32u);kernel void cs_main(){}\n";
+        let s = super::msl_set_function_const_u32(src, 0, 32);
+        assert!(s.contains("constant uint SUBGROUP_SIZE = 32u;"));
+        assert!(!s.contains("[[function_constant("));
+        assert!(!s.contains("is_function_constant_defined"));
+        assert!(s.contains("// preamble\n"));
+        assert!(s.contains("constant bool _193=(SUBGROUP_SIZE>=32u);"));
     }
 
     #[cfg(target_vendor = "apple")]

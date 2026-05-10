@@ -56,6 +56,10 @@ wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "staging", defau
 env_logger = "0.11"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
+[build-dependencies]
+tree-sitter = "0.25"
+tree-sitter-cpp = "0.23"
+
 [profile.dev]
 opt-level = 1
 

@@ -1,4 +1,12 @@
-#![allow(clippy::panic, clippy::unwrap_used, reason = "build script")]
+#![allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "build script"
+)]
+
+#[path = "src/minify.rs"]
+mod minify;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -108,6 +116,7 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
                     msl_path.display()
                 )
             });
+            minify_msl(&msl_path);
             continue;
         }
 
@@ -116,6 +125,7 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         run_glslang(&src_path, &raw_path, &define_metal, debug_shaders);
         run_spirv_opt(&raw_path, &opt_path);
         run_spirv_cross_msl(&opt_path, &msl_path);
+        minify_msl(&msl_path);
     }
 }
 
@@ -169,6 +179,14 @@ fn run_spirv_opt(raw_path: &Path, opt_path: &Path) {
         "spirv-opt failed for {}",
         raw_path.display(),
     );
+}
+
+fn minify_msl(msl_path: &Path) {
+    let src = fs::read_to_string(msl_path).expect("read MSL for minification");
+    let out = minify::minify(&src).expect("minify MSL");
+    let tmp_path = msl_path.with_extension("msl.tmp");
+    fs::write(&tmp_path, out).expect("write minified MSL to tmp");
+    fs::rename(&tmp_path, msl_path).expect("rename minified MSL into place");
 }
 
 fn run_spirv_cross_msl(spv_path: &Path, msl_path: &Path) {
