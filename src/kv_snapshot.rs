@@ -21,6 +21,7 @@
 
 use crate::error::{PotError, Result};
 use crate::model::Model;
+use crate::session::Session;
 
 // ---- on-disk header ---------------------------------------------------------
 
@@ -198,7 +199,9 @@ pub const fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
 // ---- GPU paths --------------------------------------------------------------
 
 /// Read back the live `[0..pos)` slice of the GPU KV cache to a [`KvSnapshot`].
-pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
+pub fn capture(session: &Session<'_>) -> Result<KvSnapshot> {
+    let model = session.model;
+    let pos = session.pos;
     let cfg = &model.cfg;
     let n_layer = cfg.n_layer;
     let kv_dim = cfg.kv_dim;
@@ -238,9 +241,9 @@ pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
 
     for kind in 0u32..2 {
         let src_buf = if kind == 0 {
-            &model.buffers.kv_k
+            &session.state.kv_k
         } else {
-            &model.buffers.kv_v
+            &session.state.kv_v
         };
         for il in 0..n_layer {
             // d-section
@@ -292,11 +295,14 @@ pub fn capture(model: &Model, pos: u32) -> Result<KvSnapshot> {
     })
 }
 
-/// Upload `snap`'s payload into the GPU KV cache.
-pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
+/// Upload `snap`'s payload into the GPU KV cache and advance the session's
+/// position to match.
+pub fn apply(session: &mut Session<'_>, snap: &KvSnapshot) -> Result<()> {
+    let model = session.model;
     validate_against(snap, model)?;
 
     if snap.pos == 0 {
+        session.pos = 0;
         return Ok(());
     }
 
@@ -331,9 +337,9 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
         });
     for kind in 0u32..2 {
         let dst_buf = if kind == 0 {
-            &model.buffers.kv_k
+            &session.state.kv_k
         } else {
-            &model.buffers.kv_v
+            &session.state.kv_v
         };
         for il in 0..n_layer {
             // d-section
@@ -347,6 +353,7 @@ pub fn apply(model: &Model, snap: &KvSnapshot) -> Result<()> {
         }
     }
     model.queue.submit([enc.finish()]);
+    session.pos = snap.pos;
 
     Ok(())
 }

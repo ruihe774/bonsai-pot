@@ -730,27 +730,17 @@ pub struct Pipelines {
     pub(crate) q_norm_rope_fused: wgpu::ComputePipeline,
 }
 
+/// Truly shared / read-only GPU buffers held by [`Model`]. All weights plus
+/// the precomputed `RoPE` table live here; nothing in this struct is mutated
+/// during inference, so it can be aliased across any number of live
+/// [`crate::Session`]s without races.
 pub struct Buffers {
     pub(crate) w_attn: wgpu::Buffer,
     pub(crate) w_ffn_gu: wgpu::Buffer,
     pub(crate) w_ffn_d: wgpu::Buffer,
     pub(crate) w_norms: wgpu::Buffer,
     pub(crate) w_embed: wgpu::Buffer,
-    pub(crate) kv_k: wgpu::Buffer,
-    pub(crate) kv_v: wgpu::Buffer,
-    pub(crate) act: wgpu::Buffer,           // f16 activations
-    pub(crate) act_q8: wgpu::Buffer,        // Q8_0 activations (raw u32 buffer)
-    pub(crate) attn_partials: wgpu::Buffer, // f32 partials for split-K attention
     pub(crate) rope_table: wgpu::Buffer,
-    pub(crate) sample: wgpu::Buffer, // u32 storage: input token id @ [0..M], topk output @ [0..2K]
-    pub(crate) staging: wgpu::Buffer, // MAP_WRITE | COPY_SRC staging for sample uploads
-    pub(crate) readback: wgpu::Buffer, // u32 readback (mappable)
-    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-    pub(crate) bench_query_set: wgpu::QuerySet,
-    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-    pub(crate) bench_resolve: wgpu::Buffer, // QUERY_RESOLVE | COPY_SRC
-    #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-    pub(crate) bench_readback: wgpu::Buffer, // COPY_DST | MAP_READ
 }
 
 pub struct BindGroupLayouts {
@@ -770,34 +760,9 @@ pub struct BindGroupLayouts {
     pub(crate) q_norm_rope_fused: wgpu::BindGroupLayout,
 }
 
-/// Pre-built bind groups indexed by (BGL kind, weight buffer). One BG per
-/// (kind, weight buffer) is reused across every dispatch of that kind in a step.
-pub struct CachedBindGroups {
-    pub(crate) embed: wgpu::BindGroup,         // (w_embed, act, sample)
-    pub(crate) rms_norm: wgpu::BindGroup,      // (act, w_norms)
-    pub(crate) matvec_w_attn: wgpu::BindGroup, // (w_attn,   act)
-    pub(crate) matvec_w_ffn_gu: wgpu::BindGroup, // (w_ffn_gu, act)
-    pub(crate) matvec_w_ffn_d: wgpu::BindGroup, // (w_ffn_d,  act)
-    pub(crate) matvec_w_embed: wgpu::BindGroup, // (w_embed,  act) — LM head
-    pub(crate) matvec_fused_normed_w_attn: wgpu::BindGroup, // (w_attn,   act, w_norms)
-    pub(crate) matvec_fused_normed_w_ffn_gu: wgpu::BindGroup, // (w_ffn_gu, act, w_norms)
-    pub(crate) matmul_w_attn: wgpu::BindGroup, // (w_attn,   act_q8, act)
-    pub(crate) matmul_w_ffn_gu: wgpu::BindGroup,
-    pub(crate) matmul_w_ffn_d: wgpu::BindGroup,
-    pub(crate) matmul_w_embed: wgpu::BindGroup,
-    pub(crate) attn_prefill_tiled: wgpu::BindGroup, // (act ro, kv_k, kv_v, act_q8 rw)
-    pub(crate) attn_split: wgpu::BindGroup,         // (act, kv_k, kv_v, attn_partials)
-    pub(crate) attn_merge: wgpu::BindGroup,         // (act, attn_partials)
-    pub(crate) rms_norm_q8_0: wgpu::BindGroup,      // (act, w_norms, act_q8)
-    pub(crate) silu_mul_q8_0: wgpu::BindGroup,      // (act, act_q8)
-    pub(crate) topk_partial: wgpu::BindGroup,       // (act, sample)
-    pub(crate) topk_merge: wgpu::BindGroup,         // (sample)
-    pub(crate) kv_writeback_fused: wgpu::BindGroup, // (act, w_norms, rope_cs, kv_k, kv_v)
-    pub(crate) q_norm_rope_fused: wgpu::BindGroup,  // (act, w_norms, rope_cs)
-}
-
 /// Selects which weight buffer a matvec / matmul dispatch reads from. Maps
-/// directly to one of the cached bind groups in [`CachedBindGroups`].
+/// directly to one of the cached bind groups in
+/// [`crate::session::SessionBindGroups`].
 #[derive(Copy, Clone, Debug)]
 pub enum WeightSet {
     Attn,
@@ -855,10 +820,13 @@ pub struct DeviceLostInfo {
 
 /// GPU-bearing handle to a loaded Bonsai model.
 ///
-/// Holds weights, pipelines, activations, and the KV cache. Cheap to share
-/// across [`crate::Session`]s (they each carry only their own `pos` cursor);
-/// but only one inference can run at a time because they share the
-/// activation/KV/sample buffers.
+/// Holds the immutable GPU resources: weights, pipelines, bind-group layouts,
+/// the precomputed `RoPE` table, and host-side bookkeeping (vocab, manifest,
+/// device-lost flag). All per-conversation state — KV cache, activation
+/// scratch, sample/staging/readback buffers, split-K attention partials, and
+/// the bind groups bound to those buffers — lives on [`crate::Session`]
+/// (via the crate-private `SessionState`), so any number of `Session`s may
+/// safely run concurrently against one `Model`.
 pub struct Model {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
@@ -868,7 +836,7 @@ pub struct Model {
     pub(crate) max_seq: u32,
     pub(crate) buffers: Buffers,
     pub(crate) pipes: Pipelines,
-    pub(crate) cached: CachedBindGroups,
+    pub(crate) bgls: BindGroupLayouts,
     pub(crate) layer_tensors: Vec<LayerTensors>,
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
@@ -877,12 +845,12 @@ pub struct Model {
     pub(crate) bench_ts_period_ns: f32,
 }
 
-const M_MAX: u32 = 512;
+pub const M_MAX: u32 = 512;
 const DEFAULT_MAX_SEQ: u32 = 1024;
 // Largest single staging write is the matmul-prefill token chunk: M_MAX u32 token
 // ids. Tg path stages 4 B per submission (with up to 2 in flight from
 // `generate_streaming` pipelining).
-const STAGING_CHUNK: u64 = (M_MAX as u64 * 4).next_power_of_two();
+pub const STAGING_CHUNK: u64 = (M_MAX as u64 * 4).next_power_of_two();
 /// Number of timestamp query slots allocated for bench/microbench.
 /// Must be >= max marks per step (`n_layer` * 8 + 5 for the matvec path).
 #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
@@ -1243,22 +1211,9 @@ impl Model {
     /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
     /// subgroup size is unsupported, or the vocab files are malformed.
     pub fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
-        // Hoisted constants/items so we don't trip items-after-statements lints.
-        // Sample buffer roles (max footprint dictates size):
-        //   - input (matmul prefill): M_MAX u32 token ids
-        //   - output: 2*TOPK_MAX u32 (K f32 logits + K u32 indices) at offset 0
-        //   - partials scratch: TOPK_NUM_PARTIAL_WG * 2*TOPK_MAX u32 at offset 2*TOPK_MAX
-        const SAMPLE_OUT_AND_PARTIALS: u64 =
-            ((1 + TOPK_NUM_PARTIAL_WG as u64) * 2 * TOPK_MAX as u64) * 4;
-        const SAMPLE_INPUT: u64 = M_MAX as u64 * 4;
-        const SAMPLE_RAW: u64 = if SAMPLE_INPUT > SAMPLE_OUT_AND_PARTIALS {
-            SAMPLE_INPUT
-        } else {
-            SAMPLE_OUT_AND_PARTIALS
-        };
-        const SAMPLE_BYTES: u64 = SAMPLE_RAW.next_power_of_two();
-        // Readback holds exactly the topk output: K f32 logits + K u32 indices.
-        const READBACK_BYTES: u64 = 2 * TOPK_MAX as u64 * 4;
+        // Per-session buffer sizing constants (sample / staging / readback /
+        // bench query-set) live in `SessionState::new`. Only the BGL helper
+        // is hoisted here so we don't trip items-after-statements lints.
         const fn ssbo(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             wgpu::BindGroupLayoutEntry {
                 binding,
@@ -1581,13 +1536,11 @@ impl Model {
             .collect();
         let rope_buf = make_storage("rope_table", cast_slice(&rope_table_f16));
 
-        // ---- KV cache (Q8_0), activations, scratch -------------------------
-        // Layout per buffer (kv_k / kv_v):
-        //   d-section  (FP32 scales): bytes [0, d_total_bytes)
-        //   qs-section (i8 packed):   bytes [d_total_bytes, d_total_bytes + qs_total_bytes)
-        // Block size = 32 elements; one FP32 scale per block. The two sections
-        // are u32-aligned (4 | block-bytes; 4 | row-bytes given kv_dim % 32 == 0
-        // and kv_dim >= 32), so reads/writes are clean word loads.
+        // ---- KV cache shape sanity (per-session buffers themselves are
+        //      allocated by `SessionState::new`; we still validate the
+        //      load-time invariants and the adapter buffer-size budget here so
+        //      a too-large `max_seq` errors out before the first session is
+        //      created).
         if !cfg.kv_dim.is_multiple_of(32) {
             return Err(PotError::Config(
                 "kv_dim must be a multiple of 32 (Q8_0 block size)",
@@ -1614,103 +1567,8 @@ impl Model {
                 ));
             }
         }
-        let kv_k = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kv_k"),
-            size: kv_total,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let kv_v = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kv_v"),
-            size: kv_total,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
 
         let act_layout = ActLayout::build(&cfg, M_MAX);
-        let act_size = (u64::from(act_layout.total_elems) * size_of::<half::f16>() as u64 + 3) & !3;
-        let act_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("act"),
-            size: act_size,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let max_k = cfg.n_ff;
-        let q8_d_section_bytes = M_MAX * (max_k / 32) * 4;
-        let q8_qs_section_bytes = M_MAX * max_k;
-        let act_q8_size = q8_d_section_bytes + q8_qs_section_bytes;
-        let act_q8_size = act_q8_size.div_ceil(16) * 16;
-        let act_q8_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("act_q8"),
-            size: u64::from(act_q8_size),
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        // Split-K attention partials: per layer, n_head * n_chunks_max chunks of
-        // (head_dim + 2) f32 each. Reused across layers within a step.
-        let n_chunks_max = opts.max_seq.div_ceil(ATTN_CHUNK_SIZE);
-        let attn_partials_size =
-            u64::from(cfg.n_head) * u64::from(n_chunks_max) * (u64::from(cfg.head_dim) + 2) * 4;
-        let attn_partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("attn_partials"),
-            size: attn_partials_size,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        // Sample storage + readback. Roles of `sample` (see SAMPLE_BYTES above):
-        //   - input: M_MAX prompt token ids during matmul prefill (M_MAX*4 = 2048 B);
-        //   - intermediate: pass-1 partial top-K scratch at u32 offset 2*TOPK_MAX
-        //     (TOPK_NUM_PARTIAL_WG * 2 * TOPK_MAX u32s = 8192 B);
-        //   - output: 2*TOPK_MAX u32 entries (K f32 logits + K u32 indices,
-        //     written by topk_merge at offset 0, 256 B).
-        let sample = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sample"),
-            size: SAMPLE_BYTES,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: STAGING_CHUNK,
-            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: READBACK_BYTES,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-        let bench_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("bench_qs"),
-            ty: wgpu::QueryType::Timestamp,
-            count: BENCH_QS_SLOTS,
-        });
-        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-        let bench_resolve = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bench_resolve"),
-            size: u64::from(BENCH_QS_SLOTS) * 8,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-        let bench_readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bench_readback"),
-            size: u64::from(BENCH_QS_SLOTS) * 8,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
 
         let buffers = Buffers {
             w_attn,
@@ -1718,21 +1576,7 @@ impl Model {
             w_ffn_d,
             w_norms,
             w_embed,
-            kv_k,
-            kv_v,
-            act: act_buf,
-            act_q8: act_q8_buf,
-            attn_partials: attn_partials_buf,
             rope_table: rope_buf,
-            sample,
-            staging,
-            readback,
-            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-            bench_query_set,
-            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-            bench_resolve,
-            #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
-            bench_readback,
         };
 
         // ---- shaders & pipelines -------------------------------------------
@@ -2143,11 +1987,9 @@ impl Model {
             }
         };
 
-        // ---- build cached bind groups --------------------------------------
-        // The UBO binding is sized to one full uniform slot (256 B). Every
-        // params struct is <= 64 B and is packed into a 256-B-aligned slot, so
-        // this size is correct for every dispatch that reuses the cached BG.
-        let cached = build_cached_bind_groups(&device, &bgls, &buffers);
+        // Bind groups now live on `SessionState` (rebuilt per session) — see
+        // `SessionState::new`. `bgls` is stored on `Model` so each session can
+        // build its own bind groups without rebuilding the layouts.
 
         #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
         let bench_ts_period_ns = queue.get_timestamp_period();
@@ -2161,7 +2003,7 @@ impl Model {
             max_seq: opts.max_seq,
             buffers,
             pipes,
-            cached,
+            bgls,
             layer_tensors,
             output_tensors,
             vocab,
@@ -2183,9 +2025,19 @@ impl Model {
         self.m_max
     }
 
-    /// Open a fresh inference session. Cheap; does no GPU work.
+    /// Open a fresh inference session.
+    ///
+    /// Allocates this session's per-conversation GPU buffers (KV cache,
+    /// activation scratch, sample/staging/readback, split-K attention
+    /// partials) and builds the bind groups bound to them. Cost scales with
+    /// `LoadOptions::max_seq`: at the default `max_seq=1024`, roughly 170 MB
+    /// for the KV cache plus a few tens of MB for activation/sample buffers.
+    /// Subsequent inference calls on this session do no allocation.
+    ///
+    /// Multiple sessions on one `Model` are independent — they own disjoint
+    /// GPU resources and may safely run concurrently.
     #[must_use]
-    pub const fn new_session(&self) -> crate::Session<'_> {
+    pub fn new_session(&self) -> crate::Session<'_> {
         crate::Session::new(self)
     }
 
@@ -2283,146 +2135,6 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
 )]
 pub fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
     cfg.manifest.get(name).unwrap()
-}
-
-/// Build the full set of cached bind groups in one go. Called once at load.
-fn build_cached_bind_groups(
-    device: &wgpu::Device,
-    bgls: &BindGroupLayouts,
-    buffers: &Buffers,
-) -> CachedBindGroups {
-    let mk = |label: &str,
-              layout: &wgpu::BindGroupLayout,
-              storages: &[&wgpu::Buffer]|
-     -> wgpu::BindGroup {
-        let entries: Vec<wgpu::BindGroupEntry<'_>> = storages
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(label),
-            layout,
-            entries: &entries,
-        })
-    };
-    CachedBindGroups {
-        embed: mk(
-            "cached_embed",
-            &bgls.embed,
-            &[&buffers.w_embed, &buffers.act, &buffers.sample],
-        ),
-        rms_norm: mk(
-            "cached_rms_norm",
-            &bgls.rms_norm,
-            &[&buffers.act, &buffers.w_norms],
-        ),
-        matvec_w_attn: mk(
-            "cached_matvec_attn",
-            &bgls.matvec,
-            &[&buffers.w_attn, &buffers.act],
-        ),
-        matvec_w_ffn_gu: mk(
-            "cached_matvec_ffngu",
-            &bgls.matvec,
-            &[&buffers.w_ffn_gu, &buffers.act],
-        ),
-        matvec_w_ffn_d: mk(
-            "cached_matvec_ffnd",
-            &bgls.matvec,
-            &[&buffers.w_ffn_d, &buffers.act],
-        ),
-        matvec_w_embed: mk(
-            "cached_matvec_embed",
-            &bgls.matvec,
-            &[&buffers.w_embed, &buffers.act],
-        ),
-        matvec_fused_normed_w_attn: mk(
-            "cached_matvec_fused_normed_attn",
-            &bgls.matvec_fused_normed,
-            &[&buffers.w_attn, &buffers.act, &buffers.w_norms],
-        ),
-        matvec_fused_normed_w_ffn_gu: mk(
-            "cached_matvec_fused_normed_ffngu",
-            &bgls.matvec_fused_normed,
-            &[&buffers.w_ffn_gu, &buffers.act, &buffers.w_norms],
-        ),
-        matmul_w_attn: mk(
-            "cached_matmul_attn",
-            &bgls.matmul,
-            &[&buffers.w_attn, &buffers.act_q8, &buffers.act],
-        ),
-        matmul_w_ffn_gu: mk(
-            "cached_matmul_ffngu",
-            &bgls.matmul,
-            &[&buffers.w_ffn_gu, &buffers.act_q8, &buffers.act],
-        ),
-        matmul_w_ffn_d: mk(
-            "cached_matmul_ffnd",
-            &bgls.matmul,
-            &[&buffers.w_ffn_d, &buffers.act_q8, &buffers.act],
-        ),
-        matmul_w_embed: mk(
-            "cached_matmul_embed",
-            &bgls.matmul,
-            &[&buffers.w_embed, &buffers.act_q8, &buffers.act],
-        ),
-        attn_prefill_tiled: mk(
-            "cached_attn_prefill_tiled",
-            &bgls.attn_prefill_tiled,
-            &[&buffers.act, &buffers.kv_k, &buffers.kv_v, &buffers.act_q8],
-        ),
-        attn_split: mk(
-            "cached_attn_split",
-            &bgls.attn_split,
-            &[
-                &buffers.act,
-                &buffers.kv_k,
-                &buffers.kv_v,
-                &buffers.attn_partials,
-            ],
-        ),
-        attn_merge: mk(
-            "cached_attn_merge",
-            &bgls.attn_merge,
-            &[&buffers.act, &buffers.attn_partials],
-        ),
-        rms_norm_q8_0: mk(
-            "cached_rms_norm_q8_0",
-            &bgls.rms_norm_q8_0,
-            &[&buffers.act, &buffers.w_norms, &buffers.act_q8],
-        ),
-        silu_mul_q8_0: mk(
-            "cached_silu_mul_q8_0",
-            &bgls.silu_mul_q8_0,
-            &[&buffers.act, &buffers.act_q8],
-        ),
-        topk_partial: mk(
-            "cached_topk_partial",
-            &bgls.topk_partial,
-            &[&buffers.act, &buffers.sample],
-        ),
-        topk_merge: mk("cached_topk_merge", &bgls.topk_merge, &[&buffers.sample]),
-        kv_writeback_fused: mk(
-            "cached_kv_writeback_fused",
-            &bgls.kv_writeback_fused,
-            &[
-                &buffers.act,
-                &buffers.w_norms,
-                &buffers.rope_table,
-                &buffers.kv_k,
-                &buffers.kv_v,
-            ],
-        ),
-        q_norm_rope_fused: mk(
-            "cached_q_norm_rope_fused",
-            &bgls.q_norm_rope_fused,
-            &[&buffers.act, &buffers.w_norms, &buffers.rope_table],
-        ),
-    }
 }
 
 #[cfg(test)]

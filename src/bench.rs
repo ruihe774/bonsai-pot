@@ -14,17 +14,18 @@ use std::time::Instant;
 use wgpu::PollType;
 
 #[cfg(not(feature = "ci"))]
-use super::BenchMarker;
+use super::{BenchMarker, Session};
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use super::MicroMarker;
 #[cfg(any(feature = "ci", not(target_vendor = "apple")))]
 use super::NoMarker;
 use super::{
-    Model, Result, StepEncoder, encode_step_matvec, prefill_matmul_topk, step_matvec_no_sample,
+    Result, StepEncoder, encode_step_matvec, prefill_matmul_topk, step_matvec_no_sample,
     upload_sample, wait_topk_readback,
 };
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use crate::error::PotError;
+use crate::model::Model;
 use crate::session::{GenerateOptions, Sampler};
 
 // ChatML-wrapped: system instructs the model to write very long responses,
@@ -95,6 +96,11 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
     let prompt: Vec<u32> = (0..pp_n).map(|i| (i % (cfg.n_vocab - 1)) + 1).collect();
     let m_max = model.m_max as usize;
 
+    // Reuse one session for all pp/tg measurements. The e2e tests below open
+    // their own (sequential) sessions because they explicitly time
+    // Session::prefill / Session::generate from a fresh state.
+    let bench_sess = model.new_session();
+
     // Run a full prefill of `prompt`, chunking into `m_max`-sized batches so any
     // `pp_n` is supported. Returns the total GPU ns summed across chunks.
     let run_full_prefill = |prompt: &[u32]| -> Result<f32> {
@@ -103,10 +109,10 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         let mut pos_base = 0u32;
         for slice in prompt.chunks(m_max) {
             #[cfg(not(feature = "ci"))]
-            let mut marker = BenchMarker::new(model);
+            let mut marker = BenchMarker::new(&bench_sess);
             #[cfg(feature = "ci")]
             let mut marker = NoMarker;
-            let _ = prefill_matmul_topk(model, slice, pos_base, 1, &mut marker)?;
+            let _ = prefill_matmul_topk(&bench_sess, slice, pos_base, 1, &mut marker)?;
             #[cfg(not(feature = "ci"))]
             let _ = total_gpu_ns += marker.resolve()?;
             pos_base += slice.len() as u32;
@@ -116,7 +122,7 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
 
     // warm up
     let _ = run_full_prefill(&prompt)?;
-    step_matvec_no_sample(model, 1u32, 0);
+    step_matvec_no_sample(&bench_sess, 1u32, 0);
 
     // ----- pp{pp_n} -----
     let mut pp_wall_ts: Vec<f32> = Vec::with_capacity(repeats as usize);
@@ -142,17 +148,17 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
         #[allow(unused, reason = "conditional compilation")]
         let mut total_gpu_ns = 0.0f32;
         for pos in 0..tg_n {
-            let mut se = StepEncoder::new(model);
-            upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
+            let mut se = StepEncoder::new(&bench_sess);
+            upload_sample(&bench_sess, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
             #[cfg(not(feature = "ci"))]
-            let mut marker = BenchMarker::new(model);
+            let mut marker = BenchMarker::new(&bench_sess);
             #[cfg(feature = "ci")]
             let mut marker = NoMarker;
             encode_step_matvec(&mut se, cfg, 0, Some((0, 1)), pos, &mut marker);
             se.copy_sample_to_readback(8);
             se.schedule_topk_map(8);
             model.queue.submit(Some(se.finish()));
-            wait_topk_readback(model, 1)?;
+            wait_topk_readback(&bench_sess, 1)?;
             #[cfg(not(feature = "ci"))]
             let _ = total_gpu_ns += marker.resolve()?;
         }
@@ -255,11 +261,13 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
         if no_marker { ", NO MARKER" } else { "" }
     );
 
+    let session = model.new_session();
+
     // Pre-fill KV cache so attention scans `pos+1` cached tokens on each
     // measured step. `step_matvec_no_sample` skips the topk readback but polls
     // internally to drive the staging-buffer remap callback.
     for p in 0..pos {
-        step_matvec_no_sample(model, 1, p);
+        step_matvec_no_sample(&session, 1, p);
     }
 
     // No-marker mode: switch to NoMarker so per-step timing isn't recorded.
@@ -268,17 +276,17 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
     // GPU Trace, which select work via --start-after-submits / --limit-to-submits.
     if no_marker {
         // warmup
-        run_uninstrumented_step(model, pos)?;
+        run_uninstrumented_step(&session, pos)?;
         eprintln!(">>> PROFILE BEGIN: tg measurement ({repeats} submit(s)) <<<");
         for _ in 0..repeats {
-            run_uninstrumented_step(model, pos)?;
+            run_uninstrumented_step(&session, pos)?;
         }
         eprintln!(">>> PROFILE END: tg measurement <<<");
         return Ok(());
     }
 
     // warm up: one instrumented step at the measurement pos
-    let _ = run_instrumented_step(model, pos)?;
+    let _ = run_instrumented_step(&session, pos)?;
 
     // Per-label, per-repeat aggregate: sum of all occurrences in one step
     // (i.e. n_layer for per-layer labels, 1 for globals). Storing per-step
@@ -288,7 +296,7 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
     let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
 
     for _ in 0..repeats {
-        let spans = run_instrumented_step(model, pos)?;
+        let spans = run_instrumented_step(&session, pos)?;
         let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
         for (label, ns) in &spans {
             let e = step_label_sum.entry(*label).or_insert((0, 0.0));
@@ -351,16 +359,23 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
 
 /// Run one instrumented matvec step at `pos`, returning per-span GPU durations.
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
-fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f32)>> {
+fn run_instrumented_step(session: &Session<'_>, pos: u32) -> Result<Vec<(&'static str, f32)>> {
     let tok: u32 = 1;
-    let mut se = StepEncoder::new(model);
-    upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
-    let mut marker = MicroMarker::new(model);
-    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut marker);
+    let mut se = StepEncoder::new(session);
+    upload_sample(session, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
+    let mut marker = MicroMarker::new(session);
+    encode_step_matvec(
+        &mut se,
+        &session.model.cfg,
+        0,
+        Some((0, 1)),
+        pos,
+        &mut marker,
+    );
     se.copy_sample_to_readback(8);
     se.schedule_topk_map(8);
-    model.queue.submit(Some(se.finish()));
-    wait_topk_readback(model, 1)?;
+    session.model.queue.submit(Some(se.finish()));
+    wait_topk_readback(session, 1)?;
     marker.resolve()
 }
 
@@ -368,15 +383,22 @@ fn run_instrumented_step(model: &Model, pos: u32) -> Result<Vec<(&'static str, f
 /// used in `--no-marker` profiling mode so the measurement is exactly one submit
 /// with no resolve submit afterward.
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
-fn run_uninstrumented_step(model: &Model, pos: u32) -> Result<()> {
+fn run_uninstrumented_step(session: &Session<'_>, pos: u32) -> Result<()> {
     let tok: u32 = 1;
-    let mut se = StepEncoder::new(model);
-    upload_sample(model, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
-    encode_step_matvec(&mut se, &model.cfg, 0, Some((0, 1)), pos, &mut NoMarker);
+    let mut se = StepEncoder::new(session);
+    upload_sample(session, &mut se.encoder, 0, bytemuck::bytes_of(&tok));
+    encode_step_matvec(
+        &mut se,
+        &session.model.cfg,
+        0,
+        Some((0, 1)),
+        pos,
+        &mut NoMarker,
+    );
     se.copy_sample_to_readback(8);
     se.schedule_topk_map(8);
-    model.queue.submit(Some(se.finish()));
-    wait_topk_readback(model, 1)?;
+    session.model.queue.submit(Some(se.finish()));
+    wait_topk_readback(session, 1)?;
     Ok(())
 }
 
@@ -412,9 +434,11 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     let cfg = &model.cfg;
     let prompt: Vec<u32> = (0..m).map(|i| (i % (cfg.n_vocab - 1)) + 1).collect();
 
+    let session = model.new_session();
+
     // Pre-fill KV[0..m] so the measured prefills land at pos_base=m. One
     // un-instrumented matmul prefill (NoMarker) does this in a single dispatch.
-    let _ = prefill_matmul_topk(model, &prompt, 0, 1, &mut NoMarker)?;
+    let _ = prefill_matmul_topk(&session, &prompt, 0, 1, &mut NoMarker)?;
     if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
         model.check_device()?;
         return Err(PotError::Poll(e));
@@ -426,14 +450,14 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     // GPU Trace, which select work via --start-after-submits / --limit-to-submits.
     if no_marker {
         // warmup
-        let _ = prefill_matmul_topk(model, &prompt, pos_base, 1, &mut NoMarker)?;
+        let _ = prefill_matmul_topk(&session, &prompt, pos_base, 1, &mut NoMarker)?;
         if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
             model.check_device()?;
             return Err(PotError::Poll(e));
         }
         eprintln!(">>> PROFILE BEGIN: pp measurement ({repeats} submit(s)) <<<");
         for _ in 0..repeats {
-            let _ = prefill_matmul_topk(model, &prompt, pos_base, 1, &mut NoMarker)?;
+            let _ = prefill_matmul_topk(&session, &prompt, pos_base, 1, &mut NoMarker)?;
             if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
                 model.check_device()?;
                 return Err(PotError::Poll(e));
@@ -444,14 +468,14 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     }
 
     // warm up
-    let _ = run_instrumented_prefill(model, &prompt, pos_base)?;
+    let _ = run_instrumented_prefill(&session, &prompt, pos_base)?;
 
     let mut per_step_label_ns: HashMap<&'static str, Vec<f32>> = HashMap::new();
     let mut calls_per_step: HashMap<&'static str, u32> = HashMap::new();
     let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
 
     for _ in 0..repeats {
-        let spans = run_instrumented_prefill(model, &prompt, pos_base)?;
+        let spans = run_instrumented_prefill(&session, &prompt, pos_base)?;
         let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
         for (label, ns) in &spans {
             let e = step_label_sum.entry(*label).or_insert((0, 0.0));
@@ -511,14 +535,14 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
 
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 fn run_instrumented_prefill(
-    model: &Model,
+    session: &Session<'_>,
     prompt: &[u32],
     pos_base: u32,
 ) -> Result<Vec<(&'static str, f32)>> {
-    let mut marker = MicroMarker::new(model);
-    let _ = prefill_matmul_topk(model, prompt, pos_base, 1, &mut marker)?;
-    if let Err(e) = model.device.poll(PollType::wait_indefinitely()) {
-        model.check_device()?;
+    let mut marker = MicroMarker::new(session);
+    let _ = prefill_matmul_topk(session, prompt, pos_base, 1, &mut marker)?;
+    if let Err(e) = session.model.device.poll(PollType::wait_indefinitely()) {
+        session.model.check_device()?;
         return Err(PotError::Poll(e));
     }
     marker.resolve()
