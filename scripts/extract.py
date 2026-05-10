@@ -1,15 +1,10 @@
 #!/usr/bin/env -S uv run --quiet
 # /// script
-# requires-python = ">=3.10"
+# requires-python = "~=3.10"
 # dependencies = [
-#   "gguf",
-#   "numpy",
+#   "gguf~=0.19",
+#   "numpy~=2.4",
 # ]
-#
-# [tool.uv.sources]
-# # PyPI's `gguf` lags upstream and (as of this writing) doesn't ship the
-# # Q1_0 quantization type. Pull from llama.cpp master, which does.
-# gguf = { git = "https://github.com/ggml-org/llama.cpp", rev = "a95a11e", subdirectory = "gguf-py" }
 # ///
 """
 Extract a Bonsai (Qwen3-family) Q1_0 GGUF into a flat directory the Rust runtime can load.
