@@ -13,12 +13,12 @@ use std::time::Instant;
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use wgpu::PollType;
 
-#[cfg(not(feature = "ci"))]
-use super::{BenchMarker, Session};
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
 use super::MicroMarker;
 #[cfg(any(feature = "ci", not(target_vendor = "apple")))]
 use super::NoMarker;
+#[cfg(not(feature = "ci"))]
+use super::{BenchMarker, Session};
 use super::{
     Result, StepEncoder, encode_step_matvec, prefill_matmul_topk, step_matvec_no_sample,
     upload_sample, wait_topk_readback,
@@ -114,6 +114,11 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
             let mut marker = NoMarker;
             let _ = prefill_matmul_topk(&bench_sess, slice, pos_base, 1, &mut marker)?;
             #[cfg(not(feature = "ci"))]
+            #[allow(
+                clippy::let_unit_value,
+                clippy::ignored_unit_patterns,
+                reason = "conditional compilation"
+            )]
             let _ = total_gpu_ns += marker.resolve()?;
             pos_base += slice.len() as u32;
         }
@@ -160,6 +165,11 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
             model.queue.submit(Some(se.finish()));
             wait_topk_readback(&bench_sess, 1)?;
             #[cfg(not(feature = "ci"))]
+            #[allow(
+                clippy::let_unit_value,
+                clippy::ignored_unit_patterns,
+                reason = "conditional compilation"
+            )]
             let _ = total_gpu_ns += marker.resolve()?;
         }
         let wall_secs = t.elapsed().as_secs_f32();
