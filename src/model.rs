@@ -1196,7 +1196,7 @@ impl Model {
     /// # Errors
     ///
     /// See [`Model::load_with_options`].
-    pub fn load(model_dir: &Path) -> Result<Self> {
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
         Self::load_with_options(model_dir, LoadOptions::default())
     }
 
@@ -1210,7 +1210,7 @@ impl Model {
     /// or parsed, no suitable wgpu adapter is available, the adapter does not
     /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
     /// subgroup size is unsupported, or the vocab files are malformed.
-    pub fn load_with_options(model_dir: &Path, opts: LoadOptions) -> Result<Self> {
+    pub fn load_with_options(model_dir: impl AsRef<Path>, opts: LoadOptions) -> Result<Self> {
         // Per-session buffer sizing constants (sample / staging / readback /
         // bench query-set) live in `SessionState::new`. Only the BGL helper
         // is hoisted here so we don't trip items-after-statements lints.
@@ -1230,6 +1230,7 @@ impl Model {
         if opts.max_seq == 0 {
             return Err(PotError::Config("max_seq must be > 0"));
         }
+        let model_dir = model_dir.as_ref();
         let cfg_path = model_dir.join("config.ini");
         let cfg_text = read_to_string(&cfg_path).map_err(|e| PotError::Io {
             path: cfg_path.clone(),

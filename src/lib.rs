@@ -4,18 +4,25 @@
 //! engine as a library; the `bonsai-pot` binary is a thin CLI on top of this
 //! API that reads pre-tokenized prompts from stdin.
 //!
-//! ```ignore
+//! ```no_run
 //! use bonsai_pot::{Model, GenerateOptions, Sampler};
 //!
-//! pollster::block_on(async {
-//!     let model = Model::load(std::path::Path::new("./model")).unwrap();
-//!     let mut sess = model.new_session();
-//!     let prompt: &[u32] = &[/* token ids ... */];
-//!     let first = sess.prefill(prompt, &Sampler::default()).unwrap();
-//!     let opts = GenerateOptions { max_new_tokens: 64, ..Default::default() };
-//!     let (toks, _stop) = sess.generate(first, &opts).unwrap();
-//!     print!("{}", model.decode_tokens(&[&[first][..], &toks].concat()));
-//! });
+//! // `Model::load` is synchronous; wgpu device init is internal.
+//! let model = Model::load("./model").unwrap();
+//! let mut sess = model.new_session();
+//!
+//! // Tokenization is out-of-crate — pass pre-tokenized ids (e.g. from scripts/bpe.py).
+//! let prompt: &[u32] = &[/* token ids … */];
+//! let sampler = Sampler { temperature: 0.7, ..Default::default() };
+//! let first_tok = sess.prefill(prompt, &sampler).unwrap();
+//!
+//! // `generate_streaming` feeds `first_tok` as input and fires the callback
+//! // for every subsequent token; emit the prefill-sampled token manually first.
+//! let opts = GenerateOptions { max_new_tokens: 64, sampler: sampler.clone(), ..Default::default() };
+//! print!("{}", String::from_utf8_lossy(&model.decode_token(first_tok)));
+//! sess.generate_streaming(first_tok, &opts, |id| {
+//!     print!("{}", String::from_utf8_lossy(&model.decode_token(id)));
+//! }).unwrap();
 //! ```
 //!
 //! Tokenization is **not** included — pass pre-tokenized `&[u32]` to
