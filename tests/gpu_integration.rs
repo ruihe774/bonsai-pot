@@ -307,6 +307,105 @@ fn restore_pos_zero_snapshot_leaves_session_ready_for_prefill() {
     assert_eq!(sess2.pos(), prompt.len() as u32);
 }
 
+// ---- shared model / multiple sessions ---------------------------------------
+
+/// Two sessions borrowing the same `Model` must be fully independent: interleaving
+/// their prefill and generation calls must not corrupt either session's KV state
+/// or activation buffers, and each must produce the same tokens it would produce
+/// if run alone.
+#[test]
+fn two_sessions_interleaved_are_independent() {
+    let model = load_model();
+    let prompt_a = short_prompt();
+    // A distinct prompt for session B so the test exercises two different KV states.
+    let prompt_b: Vec<u32> = vec![9u32, 8, 7, 6, 5, 4, 3, 2];
+    let greedy = greedy_sampler();
+    let opts = greedy_opts(8);
+
+    // Establish baselines by running each prompt in isolation.
+    let baseline_a = {
+        let mut s = model.new_session();
+        let first = s.prefill(&prompt_a, &greedy).unwrap();
+        let (toks, _) = s.generate(first, &opts).unwrap();
+        (first, toks)
+    };
+    let baseline_b = {
+        let mut s = model.new_session();
+        let first = s.prefill(&prompt_b, &greedy).unwrap();
+        let (toks, _) = s.generate(first, &opts).unwrap();
+        (first, toks)
+    };
+
+    // Now run the two sessions interleaved: prefill A, prefill B, generate A,
+    // generate B.  If the shared activation buffers are not properly
+    // re-initialised between sessions this will produce garbage for at least
+    // one of them.
+    let mut sess_a = model.new_session();
+    let mut sess_b = model.new_session();
+
+    let first_a = sess_a.prefill(&prompt_a, &greedy).unwrap();
+    let first_b = sess_b.prefill(&prompt_b, &greedy).unwrap();
+
+    assert_eq!(
+        first_a, baseline_a.0,
+        "session A prefill diverged when interleaved with session B"
+    );
+    assert_eq!(
+        first_b, baseline_b.0,
+        "session B prefill diverged when interleaved with session A"
+    );
+
+    let (toks_a, _) = sess_a.generate(first_a, &opts).unwrap();
+    let (toks_b, _) = sess_b.generate(first_b, &opts).unwrap();
+
+    assert_eq!(
+        toks_a, baseline_a.1,
+        "session A generation diverged when interleaved with session B"
+    );
+    assert_eq!(
+        toks_b, baseline_b.1,
+        "session B generation diverged when interleaved with session A"
+    );
+}
+
+/// After session A finishes, creating a third session from the same model and
+/// running the same prompt must still yield the baseline output.
+#[test]
+fn session_reuse_after_prior_session_dropped() {
+    let model = load_model();
+    let prompt = short_prompt();
+    let greedy = greedy_sampler();
+    let opts = greedy_opts(8);
+
+    let baseline = {
+        let mut s = model.new_session();
+        let first = s.prefill(&prompt, &greedy).unwrap();
+        let (toks, _) = s.generate(first, &opts).unwrap();
+        (first, toks)
+    };
+
+    // Run a second session that leaves the GPU in an arbitrary state.
+    {
+        let mut s = model.new_session();
+        let first = s.prefill(&prompt, &greedy).unwrap();
+        let _ = s.generate(first, &opts).unwrap();
+    }
+
+    // Third session must still match baseline.
+    let mut s3 = model.new_session();
+    let first3 = s3.prefill(&prompt, &greedy).unwrap();
+    let (toks3, _) = s3.generate(first3, &opts).unwrap();
+
+    assert_eq!(
+        first3, baseline.0,
+        "prefill diverged on third session after prior session dropped"
+    );
+    assert_eq!(
+        toks3, baseline.1,
+        "generation diverged on third session after prior session dropped"
+    );
+}
+
 // ---- device-lost handling ---------------------------------------------------
 
 #[test]
