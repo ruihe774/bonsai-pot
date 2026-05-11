@@ -3,10 +3,10 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
 #ifndef METAL_BACKEND
 #extension GL_EXT_integer_dot_product : require
 #endif
-#extension GL_EXT_control_flow_attributes : require
 
 // Q1_0 matvec.
 //
@@ -162,11 +162,11 @@ void main() {
                         uint bits = (qword >> (i * 4u)) & 0xFu;
                         f16vec4 a4 = a_sh[x_block_base + s * 8u + i];
                         // Q1_0 sign convention: bit=1 → +a, bit=0 → -a.
-                        f16vec4 signs = f16vec4(((bits & 1u) != 0u) ? float16_t(1.0) : float16_t(-1.0),
-                                                ((bits & 2u) != 0u) ? float16_t(1.0) : float16_t(-1.0),
-                                                ((bits & 4u) != 0u) ? float16_t(1.0) : float16_t(-1.0),
-                                                ((bits & 8u) != 0u) ? float16_t(1.0) : float16_t(-1.0));
-                        acc4 += a4 * signs;
+                        // SWAR-spread the 4 sign bits into 4 byte lanes (bit i
+                        // → byte i, value 0 or 1), then map {0,1}→{−1,+1}
+                        // arithmetically. Avoids 4 per-lane selects.
+                        bvec4 sb = bvec4((bits & 1u) != 0u, (bits & 2u) != 0u, (bits & 4u) != 0u, (bits & 8u) != 0u);
+                        acc4 += mix(-a4, a4, sb);
                     }
                 }
                 float sub_acc = float(acc4.x) + float(acc4.y) + float(acc4.z) + float(acc4.w);

@@ -121,10 +121,8 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         }
 
         let raw_path = out_dir.join(format!("{name}.raw.spv"));
-        let opt_path = out_dir.join(format!("{name}.opt.spv"));
         run_glslang(&src_path, &raw_path, &define_metal, debug_shaders);
-        run_spirv_opt(&raw_path, &opt_path);
-        run_spirv_cross_msl(&opt_path, &msl_path);
+        run_spirv_cross_msl(&raw_path, &msl_path);
         minify_msl(&msl_path);
     }
 }
