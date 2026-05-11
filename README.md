@@ -30,6 +30,16 @@ End-to-end throughput from `--mode bench --pp 512 --tg 128` (5 timed reps after 
 
 Tokenization is intentionally outside the Rust crate.
 
+## Prerequisites
+
+- **Rust** ≥ 1.87
+- **`glslangValidator`** ≥ 14 — ships in the `glslang-tools` package (`apt install glslang-tools` / `brew install glslang`)
+- **`spirv-opt`** — ships in the `spirv-tools` package (`apt install spirv-tools` / `brew install spirv-tools`)
+- **`uv`** — see <https://docs.astral.sh/uv/getting-started/installation/>
+- **`spirv-cross`** — Apple builds only (`brew install spirv-cross` / `apt install spirv-cross`)
+
+All tools must be on `$PATH` at build time.
+
 ## Building the model directory
 
 ```sh
