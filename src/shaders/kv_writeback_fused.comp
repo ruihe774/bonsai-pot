@@ -154,10 +154,8 @@ void main() {
     }
 
     uint block_in_head = tid >> 5; // 0..3
-    float dk = ak / 127.0;
-    float dv = av / 127.0;
-    float inv_dk = (dk > 0.0) ? (1.0 / dk) : 0.0;
-    float inv_dv = (dv > 0.0) ? (1.0 / dv) : 0.0;
+    float inv_dk = mix(0.0, 127.0 / ak, ak != 0);
+    float inv_dv = mix(0.0, 127.0 / av, av != 0);
 
     uint qk = uint(int(clamp(round(k_post * inv_dk), -127.0, 127.0))) & 0xFFu;
     uint qv = uint(int(clamp(round(v_raw * inv_dv), -127.0, 127.0))) & 0xFFu;
@@ -188,7 +186,7 @@ void main() {
     // d (FP32 scale) — one writer per block.
     if ((tid & 31u) == 0u) {
         uint block_global = pos_abs * p.nb_per_row + head * NB_PER_HEAD + block_in_head;
-        kv_k[p.dst_d_word_offset + block_global] = floatBitsToUint(dk);
-        kv_v[p.dst_d_word_offset + block_global] = floatBitsToUint(dv);
+        kv_k[p.dst_d_word_offset + block_global] = floatBitsToUint(ak / 127.0);
+        kv_v[p.dst_d_word_offset + block_global] = floatBitsToUint(av / 127.0);
     }
 }

@@ -50,7 +50,7 @@ void main() {
         uint qb = load_byte_at(qs_b + k);
         for (uint bit = 0u; bit < 8u; ++bit) {
             // bit==1 → +d; bit==0 → -d (XOR sign).
-            uint signed_bits = d_bits ^ (((qb >> bit) & 1u) != 0u ? 0u : 0x8000u);
+            uint signed_bits = d_bits ^ (0x8000u & (((qb >> bit) & 1u) - 1));
             // unpackFloat2x16 reinterprets the low 16 bits as f16 (returned as
             // float); the high 16 bits are zero so .x is exactly ±d. The
             // float→float16_t cast is bit-exact since f16→f32 widens losslessly.

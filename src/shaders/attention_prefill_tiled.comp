@@ -142,8 +142,7 @@ uint pack4(uint qv) {
 void write_block(float v, uint block_global) {
     uint lane_in_block = gl_SubgroupInvocationID & 31u;
     float max_abs = block_max_abs(v);
-    float d = max_abs / 127.0;
-    float id_inv = (d > 0.0) ? (1.0 / d) : 0.0;
+    float id_inv = mix(0.0, 127.0 / max_abs, max_abs != 0.0);
     uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
     uint packed = pack4(qv);
     if ((lane_in_block & 3u) == 0u) {
@@ -151,7 +150,7 @@ void write_block(float v, uint block_global) {
         outbuf[qs_byte >> 2] = packed;
     }
     if (lane_in_block == 0u) {
-        outbuf[(p.out_d_offset >> 2) + block_global] = floatBitsToUint(d);
+        outbuf[(p.out_d_offset >> 2) + block_global] = floatBitsToUint(max_abs / 127.0);
     }
 }
 
@@ -173,7 +172,7 @@ void main() {
     uint m_idx1 = m_base + 1u;
     bool valid1 = m_idx1 < p.m_tokens;
 
-    uint t_max = p.pos_base + (valid1 ? (m_idx1 + 1u) : (m_idx0 + 1u));
+    uint t_max = p.pos_base + mix(m_idx0, m_idx1, valid1) + 1u;
 
     uint q_base0 = p.q_offset + m_idx0 * q_stride + g * Q_PER_GROUP * hd;
     uint q_base1 = p.q_offset + m_idx1 * q_stride + g * Q_PER_GROUP * hd;

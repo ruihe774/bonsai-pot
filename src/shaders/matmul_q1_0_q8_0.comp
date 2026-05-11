@@ -158,11 +158,7 @@ void main() {
                 continue;
             uint yi = p.out_offset + m_idx * p.n + n_idx;
             float val = acc[tm * TN + tn];
-            if (p.accumulate != 0u) {
-                y[yi] = float16_t(float(y[yi]) + val);
-            } else {
-                y[yi] = float16_t(val);
-            }
+            y[yi] = float16_t(mix(0.0, float(y[yi]), p.accumulate != 0u) + val);
         }
     }
 }

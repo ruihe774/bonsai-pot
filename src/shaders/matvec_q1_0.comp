@@ -185,10 +185,6 @@ void main() {
     acc += subgroupShuffleXor(acc, 4u);
     if (tx == 0u && valid) {
         uint yi = p.output_offset + row;
-        if (p.accumulate != 0u) {
-            act[yi] = float16_t(float(act[yi]) + acc);
-        } else {
-            act[yi] = float16_t(acc);
-        }
+        act[yi] = float16_t(mix(0.0, float(act[yi]), p.accumulate != 0u) + acc);
     }
 }

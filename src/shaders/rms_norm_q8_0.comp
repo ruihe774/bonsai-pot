@@ -102,8 +102,7 @@ void main() {
         m = max(m, subgroupShuffleXor(m, 4u));
         m = max(m, subgroupShuffleXor(m, 8u));
         m = max(m, subgroupShuffleXor(m, 16u));
-        float d = m / 127.0;
-        float id_inv = (d > 0.0) ? (1.0 / d) : 0.0;
+        float id_inv = mix(0.0, 127.0 / m, m != 0.0);
         uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
 
         // Pack 4 bytes per u32 (subgroup-shuffle path or LDS-staging fallback).
@@ -125,7 +124,7 @@ void main() {
             outbuf[qs_byte >> 2] = packed;
         }
         if (lane_in_block == 0u) {
-            outbuf[d_token_word + block_global] = floatBitsToUint(d);
+            outbuf[d_token_word + block_global] = floatBitsToUint(m / 127.0);
         }
     }
 }
