@@ -46,6 +46,8 @@ uint expand_4_bits(uint bits) {
     uint spread = (bits * 0x00204081u) & 0x01010101u;
     return ~(spread * 0xFEu);
 }
+#else
+float reduce_add(vec4 v) { return v.x + v.y + v.z + v.w; }
 #endif
 
 const uint WG_X = 8u;
@@ -169,7 +171,7 @@ void main() {
                         acc4 += mix(-a4, a4, sb);
                     }
                 }
-                float sub_acc = float(acc4.x) + float(acc4.y) + float(acc4.z) + float(acc4.w);
+                float sub_acc = reduce_add(vec4(acc4));
 #endif
                 acc += d_w * sub_acc;
             }
