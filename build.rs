@@ -198,6 +198,7 @@ fn run_spirv_cross_msl(spv_path: &Path, msl_path: &Path) {
         .arg("30000")
         .arg("--msl-fixed-subgroup-size")
         .arg("32")
+        .arg("--relax-nan-checks")
         // `--msl-decoration-binding` makes spirv-cross emit `[[buffer(N)]]`
         // where N is the SPIR-V `Binding` decoration. Without it, slots are
         // assigned in first-use order, which doesn't agree with wgpu's
