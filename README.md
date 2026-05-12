@@ -32,9 +32,9 @@ Tokenization is intentionally outside the Rust crate.
 
 ## Prerequisites
 
-- **Rust** ≥ 1.87
-- **`glslangValidator`** ≥ 14 — ships in the `glslang-tools` package (`apt install glslang-tools` / `brew install glslang`)
-- **`spirv-opt`** — ships in the `spirv-tools` package (`apt install spirv-tools` / `brew install spirv-tools`)
+- **Rust** ≥ 1.87, and C compiler
+- **`glslangValidator`** ≥ 16 — ships in the `glslang-tools` package (`apt install glslang-tools` / `brew install glslang`)
+- **`spirv-opt`** >= 2026 — ships in the `spirv-tools` package (`apt install spirv-tools` / `brew install spirv-tools`)
 - **`uv`** — see <https://docs.astral.sh/uv/getting-started/installation/>
 - **`spirv-cross`** — Apple builds only (`brew install spirv-cross` / `apt install spirv-cross`)
 
