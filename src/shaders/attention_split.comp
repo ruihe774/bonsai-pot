@@ -120,21 +120,10 @@ void main() {
     uint chunk_end = min(chunk_start + CHUNK_SIZE, p.pos);
     uint g_off = g * hd;
 
-    uint q_base0 = p.q_offset + (g * Q_PER_GROUP + 0u) * hd;
-    uint q_base1 = p.q_offset + (g * Q_PER_GROUP + 1u) * hd;
-    uint q_base2 = p.q_offset + (g * Q_PER_GROUP + 2u) * hd;
-    uint q_base3 = p.q_offset + (g * Q_PER_GROUP + 3u) * hd;
+    uvec4 q_base = (uvec4(0u, 1u, 2u, 3u) + g * Q_PER_GROUP) * hd + p.q_offset;
 
-    float o0[ELEMS_PER_THREAD];
-    float o1[ELEMS_PER_THREAD];
-    float o2[ELEMS_PER_THREAD];
-    float o3[ELEMS_PER_THREAD];
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
-        o0[i] = 0.0;
-        o1[i] = 0.0;
-        o2[i] = 0.0;
-        o3[i] = 0.0;
-    }
+    vec4 o[ELEMS_PER_THREAD];
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) { o[i] = vec4(0.0); }
     vec4 m = vec4(-1e30);
     vec4 l = vec4(0.0);
 
@@ -148,11 +137,8 @@ void main() {
         [[unroll, min_iterations(2), max_iterations(2), dependency_length(1)]]
         for (uint d = tid; d < hd; d += WG) {
             float k = load_k(t, g_off + d);
-            float q0 = float(act[q_base0 + d]);
-            float q1 = float(act[q_base1 + d]);
-            float q2 = float(act[q_base2 + d]);
-            float q3 = float(act[q_base3 + d]);
-            local_v += k * vec4(q0, q1, q2, q3);
+            uvec4 q_idx = q_base + d;
+            local_v += k * vec4(f16vec4(act[q_idx.x], act[q_idx.y], act[q_idx.z], act[q_idx.w]));
         }
         vec4 dots = wg_sum_v4(local_v);
         vec4 scores = dots * p.scale;
@@ -166,37 +152,25 @@ void main() {
         [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
             uint d = tid + i * WG;
             float v = load_v(t, g_off + d);
-            o0[i] = o0[i] * correction.x + weight.x * v;
-            o1[i] = o1[i] * correction.y + weight.y * v;
-            o2[i] = o2[i] * correction.z + weight.z * v;
-            o3[i] = o3[i] * correction.w + weight.w * v;
+            o[i] = o[i] * correction + weight * v;
         }
     }
 
-    uint h0 = g * Q_PER_GROUP + 0u;
-    uint h1 = g * Q_PER_GROUP + 1u;
-    uint h2 = g * Q_PER_GROUP + 2u;
-    uint h3 = g * Q_PER_GROUP + 3u;
     uint stride_h = p.n_chunks_active * PARTIAL_STRIDE;
-    uint base0 = h0 * stride_h + chunk * PARTIAL_STRIDE;
-    uint base1 = h1 * stride_h + chunk * PARTIAL_STRIDE;
-    uint base2 = h2 * stride_h + chunk * PARTIAL_STRIDE;
-    uint base3 = h3 * stride_h + chunk * PARTIAL_STRIDE;
     [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
         uint d = tid + i * WG;
-        partials[base0 + d] = o0[i];
-        partials[base1 + d] = o1[i];
-        partials[base2 + d] = o2[i];
-        partials[base3 + d] = o3[i];
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            uint h = g * Q_PER_GROUP + j;
+            uint base = h * stride_h + chunk * PARTIAL_STRIDE;
+            partials[base + d] = o[i][j];
+        }
     }
     if (tid == 0u) {
-        partials[base0 + hd] = m.x;
-        partials[base0 + hd + 1u] = l.x;
-        partials[base1 + hd] = m.y;
-        partials[base1 + hd + 1u] = l.y;
-        partials[base2 + hd] = m.z;
-        partials[base2 + hd + 1u] = l.z;
-        partials[base3 + hd] = m.w;
-        partials[base3 + hd + 1u] = l.w;
+        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+            uint h = g * Q_PER_GROUP + j;
+            uint base = h * stride_h + chunk * PARTIAL_STRIDE;
+            partials[base + hd] = m[j];
+            partials[base + hd + 1u] = l[j];
+        }
     }
 }

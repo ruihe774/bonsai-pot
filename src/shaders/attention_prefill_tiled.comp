@@ -208,29 +208,13 @@ void main() {
     uint hd = p.head_dim;
     uint q_stride = p.n_head * hd;
     uint g_off = g * hd;
-    uint m_idx0 = m_base + 0u;
-    uint m_idx1 = m_base + 1u;
-    bool valid1 = m_idx1 < p.m_tokens;
-
-    uint t_max = p.pos_base + mix(m_idx0, m_idx1, valid1) + 1u;
-
-    uint q_base0 = p.q_offset + m_idx0 * q_stride + g * Q_PER_GROUP * hd;
-    uint q_base1 = p.q_offset + m_idx1 * q_stride + g * Q_PER_GROUP * hd;
+    uvec2 m_idx = m_base + uvec2(0u, 1u);
+    bvec2 ml_valid = bvec2(true, m_idx.y < p.m_tokens);
+    uvec2 q_base = m_idx * q_stride + p.q_offset + g * Q_PER_GROUP * hd;
+    uint t_max = p.pos_base + m_idx.y + uint(ml_valid.y);
 
     uint d_lane[ELEMS_PER_THREAD];
     [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { d_lane[e] = tid + e * WG; }
-
-    uint q_base[Q_TILE];
-    q_base[0] = q_base0;
-    q_base[1] = q_base1;
-
-    uint m_idx[Q_TILE];
-    m_idx[0] = m_idx0;
-    m_idx[1] = m_idx1;
-
-    bool ml_valid[Q_TILE];
-    ml_valid[0] = true;
-    ml_valid[1] = valid1;
 
     // Per-thread Q registers, online-softmax (m/l) state, and output accumulators.
     // [[unroll]] on every loop indexed into these arrays makes the indices
@@ -305,7 +289,7 @@ void main() {
     [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
         if (!ml_valid[ml])
             continue;
-        vec4 inv = vec4(1.0) / l_run[ml];
+        vec4 inv = 1.0 / l_run[ml];
         uint block_base = m_idx[ml] * nb_per_token + g * Q_PER_GROUP * 4u;
         [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
             [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {

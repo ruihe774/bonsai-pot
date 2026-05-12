@@ -3,6 +3,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_control_flow_attributes : require
 #ifndef METAL_BACKEND
@@ -175,11 +176,7 @@ void main() {
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
             vec4 v = vec4(x_sh[block_v4_base + i]);
             vec4 q = clamp(round(v * inv_max), vec4(-128.0), vec4(127.0));
-            uint q0 = uint(int(q.x)) & 0xFFu;
-            uint q1 = uint(int(q.y)) & 0xFFu;
-            uint q2 = uint(int(q.z)) & 0xFFu;
-            uint q3 = uint(int(q.w)) & 0xFFu;
-            a_qs_sh[i * NB_Q8 + tid] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+            a_qs_sh[i * NB_Q8 + tid] = pack32(u8vec4(i8vec4(q)));
         }
     }
     barrier();
