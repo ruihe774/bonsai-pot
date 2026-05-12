@@ -56,9 +56,12 @@ float wg_max(float local_v) {
         sg_partial[gl_SubgroupID] = sg_m;
     barrier();
     if (gl_SubgroupID == 0u) {
+        // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (WG=128 with SG=8 →
+        // NUM_SUBGROUPS=16). Fold every k*SUBGROUP_SIZE-th partial into
+        // the merging lane before the final subgroupMax.
         float combined = -1e30;
-        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
-            combined = sg_partial[gl_SubgroupInvocationID];
+        for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE)
+            combined = max(combined, sg_partial[i]);
         float final_m = subgroupMax(combined);
         if (gl_SubgroupInvocationID == 0u)
             sg_partial[0] = final_m;
@@ -75,9 +78,10 @@ float wg_sum(float local_v) {
         sg_partial[gl_SubgroupID] = sg_s;
     barrier();
     if (gl_SubgroupID == 0u) {
+        // Same NUM_SUBGROUPS > SUBGROUP_SIZE fan-in as wg_max above.
         float combined = 0.0;
-        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
-            combined = sg_partial[gl_SubgroupInvocationID];
+        for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE)
+            combined += sg_partial[i];
         float final_s = subgroupAdd(combined);
         if (gl_SubgroupInvocationID == 0u)
             sg_partial[0] = final_s;

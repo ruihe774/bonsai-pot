@@ -61,9 +61,13 @@ void main() {
             sg_partial[gl_SubgroupID] = sg_sum;
         barrier();
         if (gl_SubgroupID == 0u) {
+            // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (WG=128 with SG=8 →
+            // NUM_SUBGROUPS=16). Fold every k*SUBGROUP_SIZE-th partial into
+            // the merging lane before the final subgroupAdd.
             float c = 0.0;
-            if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
-                c = sg_partial[gl_SubgroupInvocationID];
+            for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE) {
+                c += sg_partial[i];
+            }
             float f = subgroupAdd(c);
             if (gl_SubgroupInvocationID == 0u)
                 sg_partial[0] = f;

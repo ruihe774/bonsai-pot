@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
 
 // Fused: y = rms_norm(x) * w  →  Q8_0 quantize  →  write to act_q8.
 //
@@ -50,9 +51,15 @@ float wg_sum_f32(float local_v) {
         sg_partial[gl_SubgroupID] = sg_sum;
     barrier();
     if (gl_SubgroupID == 0u) {
+        // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (e.g. WG=256 with SG=8 →
+        // NUM_SUBGROUPS=32). Each merging lane folds every k*SUBGROUP_SIZE-th
+        // partial before the final subgroupAdd. The loop bound is constant
+        // after specialization, so spirv-opt folds it for the common
+        // NUM_SUBGROUPS <= SUBGROUP_SIZE case.
         float c = 0.0;
-        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
-            c = sg_partial[gl_SubgroupInvocationID];
+        for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE) {
+            c += sg_partial[i];
+        }
         float f = subgroupAdd(c);
         if (gl_SubgroupInvocationID == 0u)
             sg_partial[0] = f;
@@ -95,13 +102,40 @@ void main() {
         uint elem_idx = it * WG + tid;
         float v = float(act[in_base + elem_idx]) * inv_h * float(w[p.weight_offset + elem_idx]);
 
-        // Per-32-lane max-abs reduction via shuffle-XOR butterfly (mask <= 16).
+        // Per-32-lane max-abs reduction. Masks 1/2/4 are always safe
+        // (SUBGROUP_SIZE >= 8 enforced at load time); masks 8/16 only when
+        // the subgroup is wide enough to keep the XOR partner in-subgroup.
+        // When the subgroup is smaller than 32, no single cluster covers a
+        // full 32-block, so we stitch the in-subgroup partials through
+        // `sg_partial` (same scheme as kv_writeback_fused).
         float m = abs(v);
         m = max(m, subgroupShuffleXor(m, 1u));
         m = max(m, subgroupShuffleXor(m, 2u));
         m = max(m, subgroupShuffleXor(m, 4u));
-        m = max(m, subgroupShuffleXor(m, 8u));
-        m = max(m, subgroupShuffleXor(m, 16u));
+        if (SUBGROUP_SIZE >= 16u) {
+            m = max(m, subgroupShuffleXor(m, 8u));
+        }
+        if (SUBGROUP_SIZE >= 32u) {
+            m = max(m, subgroupShuffleXor(m, 16u));
+        }
+        if (SUBGROUP_SIZE < 32u) {
+            uint sg_lane = tid % SUBGROUP_SIZE;
+            uint cluster_id = tid / SUBGROUP_SIZE;
+            if (sg_lane == 0u) {
+                sg_partial[cluster_id] = m;
+            }
+            barrier();
+            uint group_id = tid >> 5;             // which 32-block within the WG
+            uint per_group = 32u / SUBGROUP_SIZE; // 4 (sg=8) or 2 (sg=16)
+            uint g_base = group_id * per_group;
+            float mm = 0.0;
+            [[unroll]]
+            for (uint i = 0u; i < per_group; ++i) {
+                mm = max(mm, sg_partial[g_base + i]);
+            }
+            barrier();
+            m = mm;
+        }
         float id_inv = mix(0.0, 127.0 / m, m != 0.0);
         uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
 
