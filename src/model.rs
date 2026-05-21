@@ -352,6 +352,11 @@ const fn wg_pick(apple: (u32, u32, u32), vulkan: (u32, u32, u32)) -> (u32, u32, 
     }
 }
 
+/// Total lane count of a workgroup (product of its three dims).
+const fn wg_lanes(wg: (u32, u32, u32)) -> u32 {
+    wg.0 * wg.1 * wg.2
+}
+
 //                                                          apple          vulkan
 const WG_EMBED: (u32, u32, u32) = wg_pick((32, 1, 1), (32, 1, 1));
 const WG_RMS_NORM: (u32, u32, u32) = wg_pick((512, 1, 1), (512, 1, 1));
@@ -1592,23 +1597,28 @@ impl Model {
 
         // Per-shader subgroup choice + spec-const value, computed from each
         // shader's WG width via `pick_subgroup_config`.
-        let (sg_choice_rms, sg_spec_rms) = pick_subgroup_config(512, sg_min, sg_max);
+        let (sg_choice_rms, sg_spec_rms) =
+            pick_subgroup_config(wg_lanes(WG_RMS_NORM), sg_min, sg_max);
         let (sg_choice_attn_prefill_tiled, sg_spec_attn_prefill_tiled) =
-            pick_subgroup_config(32, sg_min, sg_max);
-        let (sg_choice_attn_split, sg_spec_attn_split) = pick_subgroup_config(64, sg_min, sg_max);
-        let (sg_choice_attn_merge, sg_spec_attn_merge) = pick_subgroup_config(128, sg_min, sg_max);
+            pick_subgroup_config(wg_lanes(WG_ATTN_PREFILL_TILED), sg_min, sg_max);
+        let (sg_choice_attn_split, sg_spec_attn_split) =
+            pick_subgroup_config(wg_lanes(WG_ATTN_SPLIT), sg_min, sg_max);
+        let (sg_choice_attn_merge, sg_spec_attn_merge) =
+            pick_subgroup_config(wg_lanes(WG_ATTN_MERGE), sg_min, sg_max);
         let (sg_choice_matvec_fused_normed, sg_spec_matvec_fused_normed) =
-            pick_subgroup_config(128, sg_min, sg_max);
+            pick_subgroup_config(wg_lanes(WG_MATVEC_FUSED_NORMED), sg_min, sg_max);
         let (sg_choice_kv_writeback_fused, sg_spec_kv_writeback_fused) =
-            pick_subgroup_config(128, sg_min, sg_max);
+            pick_subgroup_config(wg_lanes(WG_KV_WRITEBACK_FUSED), sg_min, sg_max);
         let (sg_choice_q_norm_rope_fused, sg_spec_q_norm_rope_fused) =
-            pick_subgroup_config(128, sg_min, sg_max);
-        let (sg_choice_rms_q8, sg_spec_rms_q8) = pick_subgroup_config(64, sg_min, sg_max);
-        let (sg_choice_silu_q8, _sg_spec_silu_q8) = pick_subgroup_config(64, sg_min, sg_max);
+            pick_subgroup_config(wg_lanes(WG_Q_NORM_ROPE_FUSED), sg_min, sg_max);
+        let (sg_choice_rms_q8, sg_spec_rms_q8) =
+            pick_subgroup_config(wg_lanes(WG_RMS_NORM_Q8), sg_min, sg_max);
+        let (sg_choice_silu_q8, _sg_spec_silu_q8) =
+            pick_subgroup_config(wg_lanes(WG_SILU_MUL_Q8), sg_min, sg_max);
 
         // Pre-flight: check the attention_merge LDS budget before shader compile.
         // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs NUM_SUBGROUPS f32 slots.
-        let merge_num_subgroups = 128u32.div_ceil(sg_spec_attn_merge);
+        let merge_num_subgroups = wg_lanes(WG_ATTN_MERGE).div_ceil(sg_spec_attn_merge);
         let merge_lds_bytes = 4 * u64::from(max_chunks) + 4 * u64::from(merge_num_subgroups);
         if merge_lds_bytes > u64::from(device.limits().max_compute_workgroup_storage_size) {
             return Err(PotError::Config(
