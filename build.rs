@@ -157,7 +157,9 @@ fn run_glslang(
         .arg("-S")
         .arg("comp")
         .arg("-V")
-        .arg(format!("-I{}", include_dir.display()));
+        .arg(format!("-I{}", include_dir.display()))
+        .arg("-P#extension GL_ARB_shading_language_include:require")
+        .arg("-P#include\"lib/preamble.glsl\"");
     if debug {
         // `-g` embeds OpSource (with the full GLSL source string),
         // OpString filenames, and OpLine debug info, so RGP / Nsight /

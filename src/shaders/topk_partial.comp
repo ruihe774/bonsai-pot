@@ -1,8 +1,4 @@
 #version 460
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
-#extension GL_EXT_control_flow_attributes2 : require
 
 // Multi-WG pass-1 of top-K reduction. Each workgroup processes a
 // `[wg.x * n_per_wg, min((wg.x+1)*n_per_wg, n))` slice of the f16 logits and

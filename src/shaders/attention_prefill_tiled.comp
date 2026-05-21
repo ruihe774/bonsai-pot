@@ -1,6 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#include "lib/preamble.glsl"
 
 // Q-tiled + GQA-batched FlashAttention-2 prefill kernel.
 //

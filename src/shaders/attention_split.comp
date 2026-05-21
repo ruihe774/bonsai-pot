@@ -1,7 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#extension GL_EXT_control_flow_attributes2 : require
-#include "lib/preamble.glsl"
 
 // Split-K + GQA-batched attention chunk pass for the matvec (m_tokens=1) path.
 //

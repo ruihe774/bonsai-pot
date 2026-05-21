@@ -1,8 +1,4 @@
 #version 460
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
-#extension GL_EXT_control_flow_attributes2 : require
 
 // Pass-2 of the multi-WG top-K reduction. Reads `num_partials * K_MAX`
 // already-sorted-descending (f32 value, u32 index) pairs that pass-1

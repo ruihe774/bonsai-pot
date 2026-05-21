@@ -1,6 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#include "lib/preamble.glsl"
 
 // Fused: y = rms_norm(x) * w  →  Q8_0 quantize  →  write to act_q8.
 //

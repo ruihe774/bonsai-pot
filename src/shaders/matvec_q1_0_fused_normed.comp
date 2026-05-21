@@ -1,9 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#ifndef METAL_BACKEND
-#extension GL_EXT_integer_dot_product : require
-#endif
-#include "lib/preamble.glsl"
 
 // Multi-range Q1_0 matvec **fused with the preceding RMS-norm + scale**:
 // one dispatch produces output rows for 2 or 3 separate weight tensors that

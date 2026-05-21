@@ -1,6 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#include "lib/preamble.glsl"
 
 // Combines per-chunk (m, l, o) partials produced by attention_split.comp into
 // the final attention output via a flash-attention-style log-sum-exp merge.

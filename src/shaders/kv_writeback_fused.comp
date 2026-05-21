@@ -1,6 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#include "lib/preamble.glsl"
 
 // Fused per-layer K-side pre-KV pipeline:
 //   rms_norm(K head) -> *w_k_norm -> NEOX-RoPE -> Q8_0 quantize -> write kv_k.

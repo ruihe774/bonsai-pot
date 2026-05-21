@@ -1,6 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#include "lib/preamble.glsl"
 
 // Fused per-layer Q-side pre-attention pipeline:
 //   rms_norm(Q head) -> *w_q_norm -> NEOX-RoPE -> write back to act.q (f16,

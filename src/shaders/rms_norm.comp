@@ -1,6 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#include "lib/preamble.glsl"
 
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * w
 // SUBGROUP_SIZE (SpecId 0) is the per-pipeline effective subgroup size,

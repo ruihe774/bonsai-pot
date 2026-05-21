@@ -1,9 +1,4 @@
 #version 460
-#extension GL_GOOGLE_include_directive : require
-#ifndef METAL_BACKEND
-#extension GL_EXT_integer_dot_product : require
-#endif
-#include "lib/preamble.glsl"
 
 // Q1_0 matvec with SiLU(gate) * up activation fold.
 //
