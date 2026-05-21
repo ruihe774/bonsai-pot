@@ -13,8 +13,12 @@
 //
 // dispatch: (m, 1, 1) — one workgroup per token. Caller must guarantee
 // `(k/32) % 8 == 0`, which holds for k = n_ff = 9728 on Bonsai 4B/8B.
-
-layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
+//
+// Threading: WG=64, one thread per **vec4** of input. Per iteration we cover
+// 256 elements = 8 Q8_0 blocks, with 8 threads contributing one vec4 each per
+// block. Per-block max-abs is an 8-lane subgroup butterfly (always in-sg,
+// since subgroup_min_size >= 8 is validated at load time). The 4-byte pack
+// is `packSnorm4x8`, so there is no cross-lane gather and no `qv_sh` smem.
 
 layout(push_constant) uniform Params {
     uint k;           // n_ff, multiple of 256
@@ -28,17 +32,13 @@ p;
 layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
 layout(set = 0, binding = 1, std430) buffer OutBuf { uint outbuf[]; };
 
-const uint WG = 256u;
+const uint WG = 64u;
 const uint BLOCK_SIZE = 32u;
-const uint BLOCKS_PER_ITER = WG / BLOCK_SIZE; // 8
-const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
+const uint LANES_PER_BLOCK = BLOCK_SIZE / 4u;       // 8
+const uint BLOCKS_PER_ITER = WG / LANES_PER_BLOCK;  // 8
+const uint ELEMS_PER_ITER = WG * 4u;                // 256
 
-shared uint qv_sh[256];
-shared float sg_partial_amax[NUM_SUBGROUPS];
-
-#include "lib/q8_0_quantize.glsl"
-
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     uint token_idx = gl_WorkGroupID.x;
@@ -46,38 +46,34 @@ void main() {
     uint nb_q8 = p.k / BLOCK_SIZE;
     uint g_base = p.gate_offset + token_idx * p.k;
     uint u_base = p.up_offset + token_idx * p.k;
-    uint qs_token_byte = p.qs_offset + token_idx * p.k;
+    uint qs_token_word = (p.qs_offset + token_idx * p.k) >> 2;
     uint d_token_word = (p.d_offset >> 2) + token_idx * nb_q8;
 
-    uint lane_in_block = tid & 31u;
-    uint block_within_iter = tid >> 5;
+    uint lane_in_block = tid & (LANES_PER_BLOCK - 1u); // 0..7
+    uint block_within_iter = tid / LANES_PER_BLOCK;    // 0..7
 
     uint n_iters = nb_q8 / BLOCKS_PER_ITER;
     for (uint it = 0u; it < n_iters; ++it) {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
-        uint elem_idx = it * WG + tid;
-        float g = float(act[g_base + elem_idx]);
-        float silu = g / (1.0 + exp(-g));
-        float v = silu * float(act[u_base + elem_idx]);
+        uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
 
-        float m = block_max_abs(v);
-        float id_inv = mix(0.0, 127.0 / m, m != 0.0);
-        uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
+        f16vec4 gh = f16vec4(act[g_base + elem_base + 0u], act[g_base + elem_base + 1u],
+                             act[g_base + elem_base + 2u], act[g_base + elem_base + 3u]);
+        f16vec4 uh = f16vec4(act[u_base + elem_base + 0u], act[u_base + elem_base + 1u],
+                             act[u_base + elem_base + 2u], act[u_base + elem_base + 3u]);
+        vec4 g = vec4(gh);
+        vec4 s = g / (vec4(1.0) + exp(-g));
+        vec4 v = s * vec4(uh);
 
-        uint packed;
-        if (SUBGROUP_SIZE >= 32u) {
-            packed = pack4(qv);
-        } else {
-            qv_sh[tid] = qv;
-            barrier();
-            uint base = (block_within_iter * 32u) + (lane_in_block & ~3u);
-            packed = qv_sh[base + 0u] | (qv_sh[base + 1u] << 8) | (qv_sh[base + 2u] << 16) | (qv_sh[base + 3u] << 24);
-            barrier();
-        }
-        if ((lane_in_block & 3u) == 0u) {
-            uint qs_byte = qs_token_byte + block_global * 32u + lane_in_block;
-            outbuf[qs_byte >> 2] = packed;
-        }
+        vec4 av = abs(v);
+        float m = max(max(av.x, av.y), max(av.z, av.w));
+        // 8-lane butterfly (xor 1/2/4) — masks all <= 4 stay in-subgroup
+        // because subgroup_min_size >= 8 is validated at Model::load.
+        m = max(m, subgroupShuffleXor(m, 1u));
+        m = max(m, subgroupShuffleXor(m, 2u));
+        m = max(m, subgroupShuffleXor(m, 4u));
+
+        outbuf[qs_token_word + block_global * 8u + lane_in_block] = packSnorm4x8(v / m);
         if (lane_in_block == 0u) {
             outbuf[d_token_word + block_global] = floatBitsToUint(m / 127.0);
         }

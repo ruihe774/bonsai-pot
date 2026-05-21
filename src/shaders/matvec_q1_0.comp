@@ -85,13 +85,10 @@ void main() {
             }
 
             float max_abs = float(max_abs_h);
-            float d = max_abs * (1.0 / 127.0);
-            q1_a_d_sh[tid] = d;
-            float inv_max = 127.0 / max(max_abs, 1.0e-30);
-
+            q1_a_d_sh[tid] = max_abs / 127.0;
+            float inv_max = 1.0 / max(max_abs, 1.0e-30);
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                vec4 q = clamp(round(vec4(v[i]) * inv_max), vec4(-128.0), vec4(127.0));
-                q1_a_qs_sh[i * Q1_NB_Q8 + tid] = pack32(u8vec4(i8vec4(q)));
+                q1_a_qs_sh[i * Q1_NB_Q8 + tid] = packSnorm4x8(vec4(v[i]) / max_abs);
             }
         }
 #else

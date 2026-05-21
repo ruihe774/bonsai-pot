@@ -362,8 +362,8 @@ const WG_MATMUL: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
 const WG_ATTN_PREFILL_TILED: (u32, u32, u32) = wg_pick((32, 1, 1), (32, 1, 1));
 const WG_ATTN_SPLIT: (u32, u32, u32) = wg_pick((32, 1, 1), (64, 1, 1));
 const WG_ATTN_MERGE: (u32, u32, u32) = wg_pick((32, 1, 1), (128, 1, 1));
-const WG_RMS_NORM_Q8: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
-const WG_SILU_MUL_Q8: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
+const WG_RMS_NORM_Q8: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
+const WG_SILU_MUL_Q8: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
 const WG_TOPK_PARTIAL: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
 const WG_TOPK_MERGE: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
 const WG_KV_WRITEBACK_FUSED: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
@@ -1603,8 +1603,8 @@ impl Model {
             pick_subgroup_config(128, sg_min, sg_max);
         let (sg_choice_q_norm_rope_fused, sg_spec_q_norm_rope_fused) =
             pick_subgroup_config(128, sg_min, sg_max);
-        let (sg_choice_rms_q8, sg_spec_rms_q8) = pick_subgroup_config(256, sg_min, sg_max);
-        let (sg_choice_silu_q8, sg_spec_silu_q8) = pick_subgroup_config(256, sg_min, sg_max);
+        let (sg_choice_rms_q8, sg_spec_rms_q8) = pick_subgroup_config(64, sg_min, sg_max);
+        let (sg_choice_silu_q8, _sg_spec_silu_q8) = pick_subgroup_config(64, sg_min, sg_max);
 
         // Pre-flight: check the attention_merge LDS budget before shader compile.
         // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs NUM_SUBGROUPS f32 slots.
@@ -1730,11 +1730,7 @@ impl Model {
             &[(SPEC_SUBGROUP_SIZE, sg_spec_rms_q8)],
             WG_RMS_NORM_Q8
         );
-        let sh_silu_q8 = load_shader!(
-            "silu_mul_q8_0",
-            &[(SPEC_SUBGROUP_SIZE, sg_spec_silu_q8)],
-            WG_SILU_MUL_Q8
-        );
+        let sh_silu_q8 = load_shader!("silu_mul_q8_0", no_spec, WG_SILU_MUL_Q8);
         let sh_topk_partial = load_shader!("topk_partial", no_spec, WG_TOPK_PARTIAL);
         let sh_topk_merge = load_shader!("topk_merge", no_spec, WG_TOPK_MERGE);
         let sh_kv_writeback_fused = load_shader!(
