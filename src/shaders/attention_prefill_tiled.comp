@@ -108,7 +108,7 @@ void write_block(float v, uint block_global) {
     // WG=32, so lane-in-block is exactly the local invocation id (0..31).
     uint lane_in_block = gl_LocalInvocationID.x;
     float max_abs = block_max_abs(v);
-    float id_inv = mix(0.0, 127.0 / max_abs, max_abs != 0.0);
+    float id_inv = 127.0 / max(max_abs, 1e-30);
     uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
     uint packed = pack4(qv);
     if ((lane_in_block & 3u) == 0u) {

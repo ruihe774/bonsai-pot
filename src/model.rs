@@ -371,7 +371,7 @@ const WG_RMS_NORM_Q8: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
 const WG_SILU_MUL_Q8: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
 const WG_TOPK_PARTIAL: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
 const WG_TOPK_MERGE: (u32, u32, u32) = wg_pick((64, 1, 1), (64, 1, 1));
-const WG_KV_WRITEBACK_FUSED: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
+const WG_KV_WRITEBACK_FUSED: (u32, u32, u32) = wg_pick((32, 1, 1), (32, 1, 1));
 const WG_Q_NORM_ROPE_FUSED: (u32, u32, u32) = wg_pick((128, 1, 1), (128, 1, 1));
 
 /// Rows of the output matrix processed per workgroup by `matvec_q1_0_silu`.

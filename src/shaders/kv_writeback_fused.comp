@@ -6,8 +6,20 @@
 // rope). Replaces a 3-dispatch sequence (rms_norm K, rope K, kv_writeback)
 // with 1.
 //
-// Workgroup = head_dim (128). One workgroup per (kv_head, token) writes one
-// head's worth of K and V into the cache. Dispatch (n_kv_head, m_tokens, 1).
+// Threading: WG=32, one thread per **vec4** of head_dim (head_dim=128 = 32*4).
+// Each thread holds 4 contiguous head_dim positions [t*4 .. t*4+3] for both K
+// and V, so:
+//   - the per-32-element Q8_0 block (block b = positions [b*32..b*32+31]) is
+//     covered by 8 contiguous threads, each owning 4 elements within the
+//     block. Per-block max-abs is a 4-elementwise + 8-lane subgroup butterfly
+//     (in-subgroup since subgroup_min_size >= 8). The 4-byte pack is
+//     `packSnorm4x8` — no cross-lane gather, no `qv_sh` smem.
+//   - NEOX RoPE pairs position i with i+64. With contiguous-per-thread
+//     layout, the partner of every element in thread t lives in thread t^16
+//     at the SAME vec4 component, so the partner load is one shmem read of a
+//     vec4 (no per-element pair lookup, no half-boundary thread split).
+//
+// Dispatch (n_kv_head, m_tokens, 1).
 
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
@@ -34,22 +46,20 @@ layout(set = 0, binding = 4, std430) buffer VBuf { uint kv_v[]; };
 const uint HEAD_DIM = 128u;
 const uint HALF_DIM = 64u;
 const uint NB_PER_HEAD = HEAD_DIM / 32u;
-const uint WG = 128u;
+const uint WG = 32u;
+const uint ELEMS_PER_THREAD = 4u;
+const uint LANES_PER_BLOCK = 32u / ELEMS_PER_THREAD;   // 8 threads per Q8_0 block
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 // rope_in_sh holds normed-and-weighted K so RoPE can fetch the pair partner
-// across the head-half boundary.
-shared float16_t rope_in_sh[HEAD_DIM];
-// sg_partial: scalar f32 partials for the RMS cross-subgroup merge.
-// sg_partial_kv: vec2 K/V partials for the per-32-block amax stitch
-//               (only used when SUBGROUP_SIZE < 32).
+// across the head-half boundary. Stored as f16vec4 with the same
+// thread-contiguous layout as the per-thread state (thread t -> slot t).
+shared f16vec4 rope_in_sh[WG];
 shared float sg_partial[NUM_SUBGROUPS];
-shared vec2 sg_partial_kv[NUM_SUBGROUPS];
 
-#include "lib/rope_neox.glsl"
 #include "lib/subgroup_reduce_scalar.glsl"
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     uint head = gl_WorkGroupID.x;
@@ -57,95 +67,73 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
 
     uint kv_token_off = tok * p.kv_dim + head * HEAD_DIM;
-    float k_raw = float(act[p.k_cur_off + kv_token_off + tid]);
-    float v_raw = float(act[p.v_cur_off + kv_token_off + tid]);
+    uint base_pos = tid * ELEMS_PER_THREAD;            // 0..124, head_dim element offset
+    uint k_load = p.k_cur_off + kv_token_off + base_pos;
+    uint v_load = p.v_cur_off + kv_token_off + base_pos;
+    uint w_load = p.w_k_norm_off + base_pos;
 
-    float inv_h = inversesqrt(wg_sum_f32(k_raw * k_raw) / float(HEAD_DIM) + p.eps);
+    // ---- Load K, V, w_k_norm as vec4 ----
+    vec4 k_raw = vec4(act[k_load + 0u], act[k_load + 1u], act[k_load + 2u], act[k_load + 3u]);
+    vec4 v_raw = vec4(act[v_load + 0u], act[v_load + 1u], act[v_load + 2u], act[v_load + 3u]);
+    f16vec4 wkn = f16vec4(w_norms[w_load + 0u], w_norms[w_load + 1u], w_norms[w_load + 2u], w_norms[w_load + 3u]);
 
-    // ---- norm * weight, stash to shmem so RoPE can swap pairs ----
-    rope_in_sh[tid] = float16_t(k_raw * inv_h) * w_norms[p.w_k_norm_off + tid];
+    // ---- RMS sum-of-squares over the K head (128 elements) ----
+    float inv_h = inversesqrt(wg_sum_f32(dot(k_raw, k_raw)) / float(HEAD_DIM) + p.eps);
+
+    // ---- normalize * w_k_norm, stash for the RoPE partner load ----
+    f16vec4 k_normed = f16vec4(k_raw * inv_h) * wkn;
+    rope_in_sh[tid] = k_normed;
     barrier();
 
-    uint pos_abs = p.pos_base + tok;
-    uint cs_base = p.rope_offset + pos_abs * HEAD_DIM;
-    float k_post = float(rope_neox(tid, cs_base));
+    // ---- NEOX RoPE in-register ----
+    // Pair partner of position p (p<64) is p+64, lives in thread t^16 at the
+    // same vec4 component. Both halves of the thread's vec4 are in the same
+    // RoPE half (lower or upper), since 4 | 64.
+    f16vec4 partner = rope_in_sh[tid ^ 16u];
+    bool is_lower = base_pos < HALF_DIM;
+    uint j_base = base_pos - mix(HALF_DIM, 0u, is_lower); // pair index for cos/sin
+    uint cs_base = p.rope_offset + (p.pos_base + tok) * HEAD_DIM;
 
-    // ---- Per-32-block amax for K and V via subgroup butterfly ----
-    // Masks 1/2/4 are always safe (SUBGROUP_SIZE >= 8 enforced at load time);
-    // 8/16 are gated by SUBGROUP_SIZE (folded after specialization). The
-    // stitch path runs only when SUBGROUP_SIZE < 32 (no cluster covers a
-    // full 32-block).
-    float ak = abs(k_post);
-    float av = abs(v_raw);
+    vec4 k_post;
+    [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+        uint j = j_base + e;
+        float c = float(rope_cs[cs_base + j * 2u]);
+        float s = float(rope_cs[cs_base + j * 2u + 1u]);
+        float a = float(k_normed[e]);
+        float b = float(partner[e]);
+        // is_lower:  a*c - b*s   (a is lower, b is upper partner)
+        // upper:     b*s + a*c   (a is upper, b is lower partner)
+        k_post[e] = mix(b * s + a * c, a * c - b * s, is_lower);
+    }
 
+    // ---- Per-32-block max-abs for K and V (8-lane subgroup butterfly) ----
+    // 8 threads contribute 4 elements each per block; masks {1,2,4} stay
+    // in-subgroup (subgroup_min_size >= 8 enforced at load time).
+    vec4 akv4 = abs(k_post);
+    vec4 avv4 = abs(v_raw);
+    float ak = max(max(akv4.x, akv4.y), max(akv4.z, akv4.w));
+    float av = max(max(avv4.x, avv4.y), max(avv4.z, avv4.w));
     ak = max(ak, subgroupShuffleXor(ak, 1u));
     av = max(av, subgroupShuffleXor(av, 1u));
     ak = max(ak, subgroupShuffleXor(ak, 2u));
     av = max(av, subgroupShuffleXor(av, 2u));
     ak = max(ak, subgroupShuffleXor(ak, 4u));
     av = max(av, subgroupShuffleXor(av, 4u));
-    if (SUBGROUP_SIZE >= 16u) {
-        ak = max(ak, subgroupShuffleXor(ak, 8u));
-        av = max(av, subgroupShuffleXor(av, 8u));
-    }
-    if (SUBGROUP_SIZE >= 32u) {
-        ak = max(ak, subgroupShuffleXor(ak, 16u));
-        av = max(av, subgroupShuffleXor(av, 16u));
-    }
-    if (SUBGROUP_SIZE < 32u) {
-        // Stitch the in-subgroup partials into per-32 blocks. Each cluster of
-        // SUBGROUP_SIZE lanes contributes one entry; a 32-block spans
-        // 32/SUBGROUP_SIZE entries (2 for SUBGROUP_SIZE=16, 4 for =8).
-        uint sg_lane = tid % SUBGROUP_SIZE;
-        uint cluster_id = tid / SUBGROUP_SIZE;
-        if (sg_lane == 0u) {
-            sg_partial_kv[cluster_id] = vec2(ak, av);
-        }
-        barrier();
-        uint group_id = tid >> 5;
-        uint per_group = 32u / SUBGROUP_SIZE;
-        uint g_base = group_id * per_group;
-        float mk = 0.0;
-        float mv = 0.0;
-        [[unroll]]
-        for (uint i = 0u; i < per_group; ++i) {
-            vec2 m = sg_partial_kv[g_base + i];
-            mk = max(mk, m.x);
-            mv = max(mv, m.y);
-        }
-        ak = mk;
-        av = mv;
-    }
 
-    uint block_in_head = tid >> 5; // 0..3
-    float inv_dk = mix(0.0, 127.0 / ak, ak != 0);
-    float inv_dv = mix(0.0, 127.0 / av, av != 0);
+    uint pk = packSnorm4x8(k_post / ak);
+    uint pv = packSnorm4x8(v_raw / av);
 
-    uint qk = uint(int(clamp(round(k_post * inv_dk), -127.0, 127.0))) & 0xFFu;
-    uint qv = uint(int(clamp(round(v_raw * inv_dv), -127.0, 127.0))) & 0xFFu;
+    uint pos_abs = p.pos_base + tok;
+    uint block_in_head = tid / LANES_PER_BLOCK;             // 0..3
+    uint lane_in_block = tid - block_in_head * LANES_PER_BLOCK; // 0..7
 
-    // ---- Pack 4 bytes into one u32 via subgroup shuffle, write to cache ----
-    // 4-lane clusters live entirely within one subgroup (SUBGROUP_SIZE >= 8).
-    uint cluster_base = gl_SubgroupInvocationID & ~3u;
-    uint qk0 = subgroupShuffle(qk, cluster_base);
-    uint qk1 = subgroupShuffle(qk, cluster_base + 1u);
-    uint qk2 = subgroupShuffle(qk, cluster_base + 2u);
-    uint qk3 = subgroupShuffle(qk, cluster_base + 3u);
-    uint qv0 = subgroupShuffle(qv, cluster_base);
-    uint qv1 = subgroupShuffle(qv, cluster_base + 1u);
-    uint qv2 = subgroupShuffle(qv, cluster_base + 2u);
-    uint qv3 = subgroupShuffle(qv, cluster_base + 3u);
-
-    if ((tid & 3u) == 0u) {
-        uint pk = qk0 | (qk1 << 8) | (qk2 << 16) | (qk3 << 24);
-        uint pv = qv0 | (qv1 << 8) | (qv2 << 16) | (qv3 << 24);
-        uint qs_byte_in_layer = p.dst_qs_byte_offset + pos_abs * p.kv_dim + head * HEAD_DIM + tid;
-        kv_k[qs_byte_in_layer >> 2] = pk;
-        kv_v[qs_byte_in_layer >> 2] = pv;
-    }
+    // qs write: one u32 per thread, no cross-lane gather.
+    uint qs_byte_in_layer = p.dst_qs_byte_offset + pos_abs * p.kv_dim + head * HEAD_DIM + tid * 4u;
+    kv_k[qs_byte_in_layer >> 2] = pk;
+    kv_v[qs_byte_in_layer >> 2] = pv;
 
     // d (FP32 scale) — one writer per block.
-    if ((tid & 31u) == 0u) {
+    if (lane_in_block == 0u) {
         uint block_global = pos_abs * p.nb_per_row + head * NB_PER_HEAD + block_in_head;
         kv_k[p.dst_d_word_offset + block_global] = floatBitsToUint(ak / 127.0);
         kv_v[p.dst_d_word_offset + block_global] = floatBitsToUint(av / 127.0);
