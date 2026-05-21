@@ -7,6 +7,8 @@
 
 #[path = "src/minify.rs"]
 mod minify;
+#[path = "src/msl_strip.rs"]
+mod msl_strip;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,6 +129,10 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         let raw_path = out_dir.join(format!("{name}.raw.spv"));
         run_glslang(&src_path, &raw_path, &define_metal, &lib_dir, debug_shaders);
         run_spirv_cross_msl(&raw_path, &msl_path);
+        // Rewrite the spec-constant scaffolding to a form that load-time can
+        // patch by simply prepending a `#define`. See `msl_strip` for details.
+        // Runs before minify so the minify pass validates the result.
+        strip_spec_constants_msl(&msl_path);
         minify_msl(&msl_path);
     }
 }
@@ -203,6 +209,14 @@ fn run_spirv_opt(raw_path: &Path, opt_path: &Path) {
         "spirv-opt failed for {}",
         raw_path.display(),
     );
+}
+
+fn strip_spec_constants_msl(msl_path: &Path) {
+    let src = fs::read_to_string(msl_path).expect("read MSL for spec-constant strip");
+    let out = msl_strip::strip(&src).expect("strip spec constants");
+    let tmp_path = msl_path.with_extension("msl.tmp");
+    fs::write(&tmp_path, out).expect("write stripped MSL to tmp");
+    fs::rename(&tmp_path, msl_path).expect("rename stripped MSL into place");
 }
 
 fn minify_msl(msl_path: &Path) {

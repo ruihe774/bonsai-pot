@@ -434,116 +434,30 @@ pub const fn pick_subgroup_config(
 }
 
 /// Override the default of a spirv-cross-emitted `SpecConstant` in an MSL
-/// source string. spirv-cross emits Vulkan `SpecConstants` in one of two forms,
-/// and this function handles both:
+/// source string by prepending a `#define` for the slot's `SPIRV_CROSS_CONSTANT_ID_<N>`
+/// macro.
 ///
-/// **Form A** (the simple substitution case):
+/// The build pipeline has already normalised the spirv-cross spec-constant
+/// scaffolding to a uniform shape (see `msl_strip` in build.rs): the
+/// `#ifndef SPIRV_CROSS_CONSTANT_ID_<N> / #define … / #endif` guard blocks
+/// and any `[[function_constant(N)]]` declarations have been stripped /
+/// rewritten so that every kernel reaches the macro through a single
+/// `constant uint NAME = SPIRV_CROSS_CONSTANT_ID_<N>;` declaration. All we
+/// have to do at load time is prepend the value as a `#define` — the
+/// preprocessor handles the rest.
 ///
-/// ```text
-/// #ifndef SPIRV_CROSS_CONSTANT_ID_<slot>
-/// #define SPIRV_CROSS_CONSTANT_ID_<slot> <default>u
-/// #endif
-/// constant uint NAME = SPIRV_CROSS_CONSTANT_ID_<slot>;
-/// ```
-///
-/// Patched by prepending `#define SPIRV_CROSS_CONSTANT_ID_<slot> <value>u\n`
-/// ahead of the source — the prepended define wins via the `#ifndef` guard.
-///
-/// **Form B** (emitted when the spec constant participates in expressions
-/// spirv-cross can't fold to a `#define`, e.g. as a control predicate that
-/// also feeds a constexpr):
-///
-/// ```text
-/// constant uint NAME_tmp [[function_constant(<slot>)]];
-/// constant uint NAME = is_function_constant_defined(NAME_tmp) ? NAME_tmp : <default>u;
-/// ```
-///
-/// Patched by replacing both lines with `constant uint NAME = <value>u;`.
-/// Without this rewrite, the `[[function_constant]]` attribute leaves the
-/// pipeline waiting for an `MTLFunctionConstantValues`, which wgpu's MSL
-/// passthrough path doesn't expose — pipeline creation fails at load time.
-///
-/// Asserts the slot actually appears in the source so a typo or missing
+/// Asserts the macro actually appears in the source so a typo or missing
 /// `layout(constant_id = N)` is caught at load time rather than silently
-/// shipping the default.
+/// shipping a stale value.
 #[cfg(target_vendor = "apple")]
-#[allow(
-    clippy::panic,
-    clippy::expect_used,
-    reason = "shaders are written by us"
-)]
+#[allow(clippy::panic, reason = "shaders are written by us")]
 fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
-    let id = format!("SPIRV_CROSS_CONSTANT_ID_{slot}");
-    if src.contains(&id) {
-        return format!("#define {id} {value}u\n{src}");
-    }
-
-    let attr = format!("[[function_constant({slot})]]");
-    if let Some(attr_pos) = src.find(&attr) {
-        // The minifier collapses the two-statement Form B declaration to
-        // `constant uint NAME_tmp[[function_constant(N)]];constant uint NAME=
-        //  is_function_constant_defined(NAME_tmp)?NAME_tmp:<default>u;`
-        // — no whitespace around the attribute or between the two
-        // statements. Parse it character-positionally rather than by lines.
-
-        // Walk back from `attr_pos` over the `NAME_tmp` identifier (any run
-        // of identifier chars), then over the required whitespace, then over
-        // the `constant uint` keywords. The position right before
-        // `constant` is the start of the declaration we'll replace.
-        let bytes = src.as_bytes();
-        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-
-        let mut name_end = attr_pos;
-        while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
-            name_end -= 1;
-        }
-        let mut name_start = name_end;
-        while name_start > 0 && is_ident(bytes[name_start - 1]) {
-            name_start -= 1;
-        }
-        let name_tmp = &src[name_start..name_end];
-        let name = name_tmp
-            .strip_suffix("_tmp")
-            .expect("expected '_tmp' suffix on function_constant name");
-
-        let mut cursor = name_start;
-        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
-            cursor -= 1;
-        }
-        let uint_kw = "uint";
-        cursor = cursor
-            .checked_sub(uint_kw.len())
-            .filter(|&p| &src[p..p + uint_kw.len()] == uint_kw)
-            .expect("expected 'uint' keyword before function_constant name");
-        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
-            cursor -= 1;
-        }
-        let const_kw = "constant";
-        let decl_start = cursor
-            .checked_sub(const_kw.len())
-            .filter(|&p| &src[p..p + const_kw.len()] == const_kw)
-            .expect("expected 'constant' keyword before function_constant decl");
-
-        // Skip the first `;` (end of the `_tmp` decl), then the second `;`
-        // (end of the ternary that defines `NAME`).
-        let after_attr = attr_pos + attr.len();
-        let first_semi = src[after_attr..]
-            .find(';')
-            .expect("expected ';' after function_constant attribute");
-        let after_first = after_attr + first_semi + 1;
-        let second_semi = src[after_first..]
-            .find(';')
-            .expect("expected ';' after function_constant ternary");
-        let replace_end = after_first + second_semi + 1;
-
-        return format!(
-            "{}constant uint {name} = {value}u;{}",
-            &src[..decl_start],
-            &src[replace_end..]
-        );
-    }
-
-    panic!("spec constant slot {slot} ({id}) not found in MSL source");
+    let macro_name = format!("SPIRV_CROSS_CONSTANT_ID_{slot}");
+    assert!(
+        src.contains(&macro_name),
+        "spec constant slot {slot} ({macro_name}) not referenced in MSL source"
+    );
+    format!("#define {macro_name} {value}u\n{src}")
 }
 
 /// Shift every SSBO `[[buffer(N)]]` on the `cs_main` signature to
@@ -1640,11 +1554,11 @@ impl Model {
         // (`SUBGROUP_SIZE`, `MAX_CHUNKS`, `K_V4`/`N_EMBD_V4`) are Vulkan
         // specialization constants at SpecId 0, 1, 2 in the GLSL. On the
         // Vulkan side we patch their `OpSpecConstant` defaults in the
-        // SPIR-V at load time. On the Apple side spirv-cross emits each
-        // SpecId as a `#ifndef SPIRV_CROSS_CONSTANT_ID_<n> / #define ... <default>u`
-        // preamble that the constant `constant uint NAME = ...;` reads;
-        // we override defaults by prepending our own `#define` lines —
-        // see `msl_set_function_const_u32`. Either way the result is fed
+        // SPIR-V at load time. On the Apple side, build.rs's `msl_strip`
+        // pass has already normalised each SpecId to a single
+        // `constant uint NAME = SPIRV_CROSS_CONSTANT_ID_<n>;` reference —
+        // see `msl_set_function_const_u32`, which prepends a `#define`
+        // for the macro at load time. Either way the result is fed
         // through `create_shader_module_passthrough`, bypassing naga.
         #[cfg(not(target_vendor = "apple"))]
         macro_rules! load_shader {
@@ -1674,12 +1588,7 @@ impl Model {
                 let mut s: String = SRC.to_owned();
                 for &(id, value) in $spec_consts as &[(u32, u32)] {
                     // Slot 0 (`SUBGROUP_SIZE`) is always 32 on Apple Silicon
-                    // (`pick_subgroup_config` enforces this), but the patch
-                    // is not always a no-op: when SUBGROUP_SIZE participates
-                    // in a constexpr context spirv-cross can't fold, it emits
-                    // `[[function_constant(0)]]` — which wgpu's passthrough
-                    // path can't bind — and `msl_set_function_const_u32` is
-                    // what rewrites the declaration to a literal.
+                    // (`pick_subgroup_config` enforces this).
                     if id == SPEC_SUBGROUP_SIZE {
                         debug_assert_eq!(value, 32, "Apple SUBGROUP_SIZE must be 32");
                     }
@@ -2271,66 +2180,25 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn msl_patcher_prepends_spirv_cross_constant_id_define() {
-        let src = "#ifndef SPIRV_CROSS_CONSTANT_ID_1\n\
-                   #define SPIRV_CROSS_CONSTANT_ID_1 128u\n\
-                   #endif\n\
-                   constant uint MAX_CHUNKS = SPIRV_CROSS_CONSTANT_ID_1;\n\
-                   #ifndef SPIRV_CROSS_CONSTANT_ID_2\n\
-                   #define SPIRV_CROSS_CONSTANT_ID_2 640u\n\
-                   #endif\n\
+        // build.rs's msl_strip pass leaves the source in this normalised
+        // shape; the load-time patcher just prepends a `#define` for each
+        // slot.
+        let src = "constant uint MAX_CHUNKS = SPIRV_CROSS_CONSTANT_ID_1;\n\
                    constant uint K_V4 = SPIRV_CROSS_CONSTANT_ID_2;\n\
                    kernel void cs_main() {}\n";
         let s = super::msl_set_function_const_u32(src, 1, 1234);
         let s = super::msl_set_function_const_u32(&s, 2, 7);
-        // The patches land *before* the #ifndef guards, so the guarded
-        // defaults stay textually present but are inert (the prepended
-        // defines win). Assert the prepended forms exist and that they
-        // come before the spirv-cross block for that slot.
+        assert!(s.starts_with("#define SPIRV_CROSS_CONSTANT_ID_2 7u\n"));
         assert!(s.contains("#define SPIRV_CROSS_CONSTANT_ID_1 1234u\n"));
-        assert!(s.contains("#define SPIRV_CROSS_CONSTANT_ID_2 7u\n"));
-        let p1 = s.find("#define SPIRV_CROSS_CONSTANT_ID_1 1234u").unwrap();
-        let g1 = s.find("#ifndef SPIRV_CROSS_CONSTANT_ID_1").unwrap();
-        assert!(p1 < g1, "patch must precede the guarded default");
+        // The original references stay in place — preprocessor substitution
+        // resolves them through the prepended `#define`s.
+        assert!(s.contains("constant uint MAX_CHUNKS = SPIRV_CROSS_CONSTANT_ID_1;"));
+        assert!(s.contains("constant uint K_V4 = SPIRV_CROSS_CONSTANT_ID_2;"));
     }
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn msl_patcher_rewrites_function_constant_form() {
-        let src = "// preamble\n\
-                   constant uint SUBGROUP_SIZE_tmp [[function_constant(0)]];\n\
-                   constant uint SUBGROUP_SIZE = is_function_constant_defined(SUBGROUP_SIZE_tmp) ? SUBGROUP_SIZE_tmp : 32u;\n\
-                   constant bool _193 = (SUBGROUP_SIZE >= 32u);\n\
-                   kernel void cs_main() {}\n";
-        let s = super::msl_set_function_const_u32(src, 0, 32);
-        // The two-line declaration is collapsed into a single literal binding.
-        assert!(s.contains("constant uint SUBGROUP_SIZE = 32u;\n"));
-        // The function_constant attribute and ternary are gone — Metal would
-        // otherwise refuse to build a pipeline without MTLFunctionConstantValues.
-        assert!(!s.contains("[[function_constant("));
-        assert!(!s.contains("is_function_constant_defined"));
-        // Surrounding context is preserved.
-        assert!(s.contains("// preamble\n"));
-        assert!(s.contains("constant bool _193 = (SUBGROUP_SIZE >= 32u);\n"));
-    }
-
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    fn msl_patcher_rewrites_minified_function_constant_form() {
-        // build.rs minifies translated MSL — whitespace around the attribute
-        // and between the `_tmp` decl and the ternary disappears entirely.
-        let src = "// preamble\n\
-                   constant uint SUBGROUP_SIZE_tmp[[function_constant(0)]];constant uint SUBGROUP_SIZE=is_function_constant_defined(SUBGROUP_SIZE_tmp)?SUBGROUP_SIZE_tmp:32u;constant bool _193=(SUBGROUP_SIZE>=32u);kernel void cs_main(){}\n";
-        let s = super::msl_set_function_const_u32(src, 0, 32);
-        assert!(s.contains("constant uint SUBGROUP_SIZE = 32u;"));
-        assert!(!s.contains("[[function_constant("));
-        assert!(!s.contains("is_function_constant_defined"));
-        assert!(s.contains("// preamble\n"));
-        assert!(s.contains("constant bool _193=(SUBGROUP_SIZE>=32u);"));
-    }
-
-    #[cfg(target_vendor = "apple")]
-    #[test]
-    #[should_panic(expected = "not found in MSL source")]
+    #[should_panic(expected = "not referenced in MSL source")]
     fn msl_patcher_panics_on_missing_slot() {
         let _ = super::msl_set_function_const_u32("kernel void cs_main() {}\n", 0, 32);
     }
