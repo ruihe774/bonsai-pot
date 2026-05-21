@@ -147,11 +147,15 @@ kernel void cs_main(
             uint half_bits = (word >> ((b_offset & 2u) * 8u));
             half dw = as_type<half2>(half_bits).x;
             half neg_dw = -dw;
+            ushort neg_dw_bits = as_type<ushort>(neg_dw);
+            ushort2 neg_dw_bits2 = ushort2(neg_dw_bits, neg_dw_bits);
             threadgroup half* w_dst = w_sh + half_idx * W_HALF;
             uint k0 = kc * 32u;
             #pragma unroll
-            for (uint i = 0u; i < 32u; ++i) {
-                w_dst[(k0 + i) * TILE_N + n_local] = select(neg_dw, dw, ((sign_word >> i) & 1u) != 0u);
+            for (uint i = 0u; i < 16u; ++i) {
+                half2 r = as_type<half2>((ushort2(ushort(sign_word >> (i * 2)), ushort(sign_word >> (i * 2 + 1))) << 15u) ^ neg_dw_bits2);
+                w_dst[(k0 + i * 2) * TILE_N + n_local] = r.x;
+                w_dst[(k0 + i * 2 + 1) * TILE_N + n_local] = r.y;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
