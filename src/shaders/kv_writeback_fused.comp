@@ -48,7 +48,7 @@ const uint HALF_DIM = 64u;
 const uint NB_PER_HEAD = HEAD_DIM / 32u;
 const uint WG = 32u;
 const uint ELEMS_PER_THREAD = 4u;
-const uint LANES_PER_BLOCK = 32u / ELEMS_PER_THREAD;   // 8 threads per Q8_0 block
+const uint LANES_PER_BLOCK = 32u / ELEMS_PER_THREAD; // 8 threads per Q8_0 block
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 // rope_in_sh holds normed-and-weighted K so RoPE can fetch the pair partner
@@ -67,7 +67,7 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
 
     uint kv_token_off = tok * p.kv_dim + head * HEAD_DIM;
-    uint base_pos = tid * ELEMS_PER_THREAD;            // 0..124, head_dim element offset
+    uint base_pos = tid * ELEMS_PER_THREAD; // 0..124, head_dim element offset
     uint k_load = p.k_cur_off + kv_token_off + base_pos;
     uint v_load = p.v_cur_off + kv_token_off + base_pos;
     uint w_load = p.w_k_norm_off + base_pos;
@@ -124,7 +124,7 @@ void main() {
     uint pv = packSnorm4x8(v_raw / av);
 
     uint pos_abs = p.pos_base + tok;
-    uint block_in_head = tid / LANES_PER_BLOCK;             // 0..3
+    uint block_in_head = tid / LANES_PER_BLOCK;                 // 0..3
     uint lane_in_block = tid - block_in_head * LANES_PER_BLOCK; // 0..7
 
     // qs write: one u32 per thread, no cross-lane gather.

@@ -36,9 +36,9 @@ layout(set = 0, binding = 2, std430) buffer OutBuf { uint outbuf[]; };
 
 const uint WG = 64u;
 const uint BLOCK_SIZE = 32u;
-const uint LANES_PER_BLOCK = BLOCK_SIZE / 4u;        // 8
-const uint BLOCKS_PER_ITER = WG / LANES_PER_BLOCK;   // 8
-const uint ELEMS_PER_ITER = WG * 4u;                 // 256
+const uint LANES_PER_BLOCK = BLOCK_SIZE / 4u;      // 8
+const uint BLOCKS_PER_ITER = WG / LANES_PER_BLOCK; // 8
+const uint ELEMS_PER_ITER = WG * 4u;               // 256
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 shared float sg_partial[NUM_SUBGROUPS];
@@ -81,10 +81,14 @@ void main() {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
         uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
 
-        vec4 x = vec4(act[in_base + elem_base + 0u], act[in_base + elem_base + 1u],
-                      act[in_base + elem_base + 2u], act[in_base + elem_base + 3u]);
-        vec4 wv = vec4(w[w_base + elem_base + 0u], w[w_base + elem_base + 1u],
-                       w[w_base + elem_base + 2u], w[w_base + elem_base + 3u]);
+        vec4 x = vec4(act[in_base + elem_base + 0u],
+                      act[in_base + elem_base + 1u],
+                      act[in_base + elem_base + 2u],
+                      act[in_base + elem_base + 3u]);
+        vec4 wv = vec4(w[w_base + elem_base + 0u],
+                       w[w_base + elem_base + 1u],
+                       w[w_base + elem_base + 2u],
+                       w[w_base + elem_base + 3u]);
         vec4 v = x * inv_h * wv;
 
         vec4 av = abs(v);

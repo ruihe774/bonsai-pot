@@ -34,9 +34,9 @@ layout(set = 0, binding = 1, std430) buffer OutBuf { uint outbuf[]; };
 
 const uint WG = 64u;
 const uint BLOCK_SIZE = 32u;
-const uint LANES_PER_BLOCK = BLOCK_SIZE / 4u;       // 8
-const uint BLOCKS_PER_ITER = WG / LANES_PER_BLOCK;  // 8
-const uint ELEMS_PER_ITER = WG * 4u;                // 256
+const uint LANES_PER_BLOCK = BLOCK_SIZE / 4u;      // 8
+const uint BLOCKS_PER_ITER = WG / LANES_PER_BLOCK; // 8
+const uint ELEMS_PER_ITER = WG * 4u;               // 256
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -57,10 +57,14 @@ void main() {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
         uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
 
-        f16vec4 gh = f16vec4(act[g_base + elem_base + 0u], act[g_base + elem_base + 1u],
-                             act[g_base + elem_base + 2u], act[g_base + elem_base + 3u]);
-        f16vec4 uh = f16vec4(act[u_base + elem_base + 0u], act[u_base + elem_base + 1u],
-                             act[u_base + elem_base + 2u], act[u_base + elem_base + 3u]);
+        f16vec4 gh = f16vec4(act[g_base + elem_base + 0u],
+                             act[g_base + elem_base + 1u],
+                             act[g_base + elem_base + 2u],
+                             act[g_base + elem_base + 3u]);
+        f16vec4 uh = f16vec4(act[u_base + elem_base + 0u],
+                             act[u_base + elem_base + 1u],
+                             act[u_base + elem_base + 2u],
+                             act[u_base + elem_base + 3u]);
         vec4 g = vec4(gh);
         vec4 s = g / (vec4(1.0) + exp(-g));
         vec4 v = s * vec4(uh);
