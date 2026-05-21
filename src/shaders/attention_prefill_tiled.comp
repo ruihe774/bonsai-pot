@@ -1,10 +1,6 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "lib/preamble.glsl"
 
 // Q-tiled + GQA-batched FlashAttention-2 prefill kernel.
 //
@@ -78,31 +74,13 @@ const uint Q_TILE = 2u;
 const float NEG_INF = -1.0e30;
 
 shared vec4 sg_partial4[NUM_SUBGROUPS];
-// Cluster-stitch buffer for the per-32-block max-abs reduction in
-// `block_max_abs` on subgroups smaller than WG=32. Kept separate from
-// `sg_partial4` so the t-loop's last `wg_sum_v4` cannot race with the first
-// `write_block` call.
+// Cluster-stitch buffer for block_max_abs on subgroups smaller than WG=32.
+// Kept separate from sg_partial4 so the t-loop's last wg_sum_v4 cannot race
+// with the first write_block call.
 shared float sg_partial_amax[NUM_SUBGROUPS];
 
-vec4 wg_sum_v4(vec4 local_v) {
-    vec4 sg_sum = subgroupAdd(local_v);
-    if (NUM_SUBGROUPS == 1u) {
-        return sg_sum;
-    }
-    if (gl_SubgroupInvocationID == 0u)
-        sg_partial4[gl_SubgroupID] = sg_sum;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        vec4 combined = vec4(0.0);
-        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
-            combined = sg_partial4[gl_SubgroupInvocationID];
-        vec4 final_sum = subgroupAdd(combined);
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial4[0] = final_sum;
-    }
-    barrier();
-    return sg_partial4[0];
-}
+#include "lib/q8_0_quantize.glsl"
+#include "lib/subgroup_reduce_v4.glsl"
 
 float load_k(uint t, uint e_local) {
     uint elem_idx = t * p.kv_stride + e_local;
@@ -128,58 +106,8 @@ float load_v(uint t, uint e_local) {
     return scale * float(qs_signed);
 }
 
-// ---- Q8_0 quantize helpers (per-32-lane block) ----
-// WG=32 so the entire workgroup is exactly one Q8_0 block. Masks 1/2/4 stay
-// in-subgroup (SUBGROUP_SIZE >= 8 enforced at load time); masks 8/16 are
-// taken when the subgroup is wide enough; if the subgroup is smaller than
-// the 32-block we stitch through `sg_partial_amax` across the WG's
-// SG-clusters (NUM_SUBGROUPS == WG/SUBGROUP_SIZE entries).
-float block_max_abs(float v) {
-    float m = abs(v);
-    m = max(m, subgroupShuffleXor(m, 1u));
-    m = max(m, subgroupShuffleXor(m, 2u));
-    m = max(m, subgroupShuffleXor(m, 4u));
-    if (SUBGROUP_SIZE >= 16u) {
-        m = max(m, subgroupShuffleXor(m, 8u));
-    }
-    if (SUBGROUP_SIZE >= 32u) {
-        m = max(m, subgroupShuffleXor(m, 16u));
-    }
-    if (SUBGROUP_SIZE < 32u) {
-        // Stitch in-subgroup partials across all clusters in the WG; with
-        // WG=32 the whole workgroup is the 32-block. Mirrors the scheme in
-        // kv_writeback_fused.
-        uint tid = gl_LocalInvocationID.x;
-        uint sg_lane = tid % SUBGROUP_SIZE;
-        uint cluster_id = tid / SUBGROUP_SIZE;
-        if (sg_lane == 0u) {
-            sg_partial_amax[cluster_id] = m;
-        }
-        barrier();
-        // Number of SG-clusters covering this 32-block = WG / SUBGROUP_SIZE
-        // (since WG == 32 == block size). NUM_SUBGROUPS holds the same value.
-        float mm = 0.0;
-        [[unroll]]
-        for (uint i = 0u; i < NUM_SUBGROUPS; ++i) {
-            mm = max(mm, sg_partial_amax[i]);
-        }
-        barrier();
-        m = mm;
-    }
-    return m;
-}
-
-uint pack4(uint qv) {
-    // 4-lane cluster fits inside one subgroup since NUM_SUBGROUPS >= 8.
-    uint base = gl_SubgroupInvocationID & ~3u;
-    return subgroupShuffle(qv, base + 0u) | (subgroupShuffle(qv, base + 1u) << 8) |
-           (subgroupShuffle(qv, base + 2u) << 16) | (subgroupShuffle(qv, base + 3u) << 24);
-}
-
 void write_block(float v, uint block_global) {
     // WG=32, so lane-in-block is exactly the local invocation id (0..31).
-    // Using gl_SubgroupInvocationID would alias to 0..7 on SG=8 and four
-    // subgroups would fight to write the same bytes.
     uint lane_in_block = gl_LocalInvocationID.x;
     float max_abs = block_max_abs(v);
     float id_inv = mix(0.0, 127.0 / max_abs, max_abs != 0.0);

@@ -1,17 +1,14 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "lib/preamble.glsl"
 
 // Combines per-chunk (m, l, o) partials produced by attention_split.comp into
 // the final attention output via a flash-attention-style log-sum-exp merge.
 //
 // dispatch: (n_head, 1, 1). One workgroup per Q head. Three phases:
-//   A) Parallel chunk-max reduction across threads → m_global (subgroupMax).
+//   A) Parallel chunk-max reduction across threads → m_global (wg_max).
 //   B) Parallel weight precompute into shmem + parallel sum of l_c*weight
-//      across threads → l_global (subgroupAdd).
+//      across threads → l_global (wg_sum_f32).
 //   C) Per-thread o accumulation using the precomputed weights, then write.
 
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
@@ -32,7 +29,7 @@ layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
 layout(set = 0, binding = 1, std430) readonly buffer Partials { float partials[]; };
 
 // Apple sweep: WG=32 (1 simdgroup) + ELEMS_PER_THREAD=4 covers head_dim=128
-// in one pass and collapses `wg_max`/`wg_sum` to a single simd_max/simd_sum.
+// in one pass and collapses wg_max/wg_sum_f32 to a single simd_max/simd_sum.
 // Vulkan keeps WG=128 / EPT=1 since the inner phase-C loop's `tid + i*WG`
 // indexing reads sequential lanes per chunk and amortizes the partials load.
 #ifndef METAL_BACKEND
@@ -48,47 +45,7 @@ const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 shared float sg_partial[NUM_SUBGROUPS];
 shared float weights_sh[MAX_CHUNKS];
 
-float wg_max(float local_v) {
-    float sg_m = subgroupMax(local_v);
-    if (NUM_SUBGROUPS == 1u)
-        return sg_m;
-    if (gl_SubgroupInvocationID == 0u)
-        sg_partial[gl_SubgroupID] = sg_m;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (WG=128 with SG=8 →
-        // NUM_SUBGROUPS=16). Fold every k*SUBGROUP_SIZE-th partial into
-        // the merging lane before the final subgroupMax.
-        float combined = -1e30;
-        for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE)
-            combined = max(combined, sg_partial[i]);
-        float final_m = subgroupMax(combined);
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial[0] = final_m;
-    }
-    barrier();
-    return sg_partial[0];
-}
-
-float wg_sum(float local_v) {
-    float sg_s = subgroupAdd(local_v);
-    if (NUM_SUBGROUPS == 1u)
-        return sg_s;
-    if (gl_SubgroupInvocationID == 0u)
-        sg_partial[gl_SubgroupID] = sg_s;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        // Same NUM_SUBGROUPS > SUBGROUP_SIZE fan-in as wg_max above.
-        float combined = 0.0;
-        for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE)
-            combined += sg_partial[i];
-        float final_s = subgroupAdd(combined);
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial[0] = final_s;
-    }
-    barrier();
-    return sg_partial[0];
-}
+#include "lib/subgroup_reduce_scalar.glsl"
 
 #ifndef METAL_BACKEND
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -122,7 +79,7 @@ void main() {
         weights_sh[c] = w;
         l_local += l_c * w;
     }
-    float l_global = wg_sum(l_local);
+    float l_global = wg_sum_f32(l_local);
 
     // Phase C: per-thread o accumulation using precomputed weights.
     float o[ELEMS_PER_THREAD];

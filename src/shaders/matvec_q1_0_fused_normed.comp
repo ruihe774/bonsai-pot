@@ -1,14 +1,9 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
 #ifndef METAL_BACKEND
 #extension GL_EXT_integer_dot_product : require
 #endif
+#include "lib/preamble.glsl"
 
 // Multi-range Q1_0 matvec **fused with the preceding RMS-norm + scale**:
 // one dispatch produces output rows for 2 or 3 separate weight tensors that
@@ -25,7 +20,7 @@
 // once at row-write on both backends.
 //
 // Apple sweep: WG_Y=32 (256 threads, 8 simdgroups per WG) over WG_Y=16 wins
-// ~5% on e2e_tg via better amortization of the K_V4-sized `x_sh` load and
+// ~5% on e2e_tg via better amortization of the K_V4-sized `q1_x_sh` load and
 // the halved dispatch count. The cross-SG ssq merge cost (8 SGs vs 4) is
 // real but dominated by the bandwidth win. Smaller WG (WG_Y∈{4,8}) regresses
 // sharply.
@@ -33,7 +28,7 @@
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 // `K_V4` = n_embd / 4, baked at load time per model so the LDS arrays fit
 // the actual row exactly. SpecConstant array sizes are evaluated post-
-// specialization so x_sh / a_qs_sh land at the per-model size.
+// specialization so q1_x_sh / q1_a_qs_sh land at the per-model size.
 layout(constant_id = 2) const uint K_V4 = 640;
 
 layout(push_constant) uniform Params {
@@ -62,22 +57,7 @@ layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t act[]; };
 layout(set = 0, binding = 2, std430) readonly buffer NormBuf { float16_t w_norms[]; };
 
-float load_f16_at(uint b_offset) {
-    uint word = weights[b_offset >> 2];
-    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
-    return unpackFloat2x16(half_bits).x;
-}
-
-#ifndef METAL_BACKEND
-uint expand_4_bits(uint bits) {
-    // Spread the 4 input bits to the 4 byte LSBs in one mul: bit i lands at bit (8i)
-    // because 0x00204081 has bits set at positions {0, 7, 14, 21}.
-    uint spread = (bits * 0x00204081u) & 0x01010101u;
-    return ~(spread * 0xFEu);
-}
-#else
-float reduce_add(vec4 v) { return v.x + v.y + v.z + v.w; }
-#endif
+#include "lib/q1_0_load.glsl"
 
 const uint WG_X = 8u;
 #ifndef METAL_BACKEND
@@ -90,12 +70,19 @@ const uint ROWS_PER_WG = WG_Y;
 
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
-shared f16vec4 x_sh[K_V4];
+shared f16vec4 q1_x_sh[K_V4];
 #ifndef METAL_BACKEND
-shared uint a_qs_sh[K_V4]; // K bytes packed as u32 (= K_V4)
-shared float a_d_sh[(K_V4 << 2) / 32];
+// Q1_NB_Q8 = K / 32 = (K_V4 * 4) / 32 = K_V4 / 8.
+// Declared as a variable so q1_0_matvec.glsl can reference it (the value
+// is spec-constant-derived and thus not a compile-time constant here).
+uint Q1_NB_Q8;
+shared uint q1_a_qs_sh[K_V4]; // K bytes packed as u32 (= K_V4 u32 slots)
+shared float q1_a_d_sh[(K_V4 << 2) / 32];
 #endif
 shared float sg_partial[NUM_SUBGROUPS];
+
+#include "lib/q1_0_matvec.glsl"
+#include "lib/subgroup_reduce_scalar.glsl"
 
 #ifndef METAL_BACKEND
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -107,6 +94,7 @@ void main() {
     uint K = K_V4 << 2;
 #ifndef METAL_BACKEND
     uint NB_Q8 = K >> 5;
+    Q1_NB_Q8 = NB_Q8;
 #endif
     uint wg_idx = gl_WorkGroupID.y * p.dispatch_x_dim + gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationIndex;
@@ -116,7 +104,7 @@ void main() {
     bool valid = global_row < p.n_total;
     uint nb_q1 = K / 128u;
 
-    // ---- Stage 1: load x and w_norm; stage `x * w_norm` into x_sh; accumulate ssq.
+    // ---- Stage 1: load x and w_norm; stage `x * w_norm` into q1_x_sh; accumulate ssq.
     uint in_v4_off = p.input_offset >> 2;
     uint w_v4_off = p.w_norm_off >> 2;
     float ssq = 0.0;
@@ -127,35 +115,10 @@ void main() {
         ssq += xv4f.x * xv4f.x + xv4f.y * xv4f.y + xv4f.z * xv4f.z + xv4f.w * xv4f.w;
         uint w_base = (w_v4_off + v) << 2;
         f16vec4 wv4 = f16vec4(w_norms[w_base + 0u], w_norms[w_base + 1u], w_norms[w_base + 2u], w_norms[w_base + 3u]);
-        x_sh[v] = xv4 * wv4;
+        q1_x_sh[v] = xv4 * wv4;
     }
 
-    // ---- Stage 1.5: workgroup-wide ssq sum ----
-    float sg_sum = subgroupAdd(ssq);
-    float total;
-    if (NUM_SUBGROUPS == 1u) {
-        total = sg_sum;
-        barrier();
-    } else {
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial[gl_SubgroupID] = sg_sum;
-        barrier();
-        if (gl_SubgroupID == 0u) {
-            // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (e.g. WG=256 with SG=8 →
-            // NUM_SUBGROUPS=32 but only 8 merging lanes). Each lane folds
-            // every k*SUBGROUP_SIZE-th partial before the final subgroupAdd.
-            float c = 0.0;
-            for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE) {
-                c += sg_partial[i];
-            }
-            float f = subgroupAdd(c);
-            if (gl_SubgroupInvocationID == 0u)
-                sg_partial[0] = f;
-        }
-        barrier();
-        total = sg_partial[0];
-    }
-    float inv_rms = inversesqrt(total / float(K) + p.eps);
+    float inv_rms = inversesqrt(wg_sum_f32(ssq) / float(K) + p.eps);
 
 #ifndef METAL_BACKEND
     // ---- Stage 2: quantize each Q8_0 block (8 f16vec4) to Q8_0 ----
@@ -163,20 +126,18 @@ void main() {
         uint block_v4_base = tid * 8u;
         float16_t max_abs_h = float16_t(0.0);
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-            f16vec4 af = abs(x_sh[block_v4_base + i]);
+            f16vec4 af = abs(q1_x_sh[block_v4_base + i]);
             max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
         }
         float max_abs = float(max_abs_h);
         // Don't fold inv_rms here — apply it once at row-write below.
-        // Saves one fmul per Q8_0 a-block per token in this stage; the
-        // matmul inner loop is unaffected.
         float d = max_abs * (1.0 / 127.0);
-        a_d_sh[tid] = d;
+        q1_a_d_sh[tid] = d;
         float inv_max = 127.0 / max(max_abs, 1.0e-30);
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-            vec4 v = vec4(x_sh[block_v4_base + i]);
+            vec4 v = vec4(q1_x_sh[block_v4_base + i]);
             vec4 q = clamp(round(v * inv_max), vec4(-128.0), vec4(127.0));
-            a_qs_sh[i * NB_Q8 + tid] = pack32(u8vec4(i8vec4(q)));
+            q1_a_qs_sh[i * NB_Q8 + tid] = pack32(u8vec4(i8vec4(q)));
         }
     }
     barrier();
@@ -214,42 +175,7 @@ void main() {
         for (uint b = tx; b < nb_q1; b += WG_X) {
             float d_w = load_f16_at(row_d_byte + b * 2u);
             uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
-#ifndef METAL_BACKEND
-            uint a_block_base = b * 4u;
-            float sub_acc = 0.0;
-            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
-                uint qword = weights[qs_word_base + s];
-                float a_d = a_d_sh[a_block_base + s];
-                uint block_l = a_block_base + s;
-                int sumi = 0;
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                    uint bits = (qword >> (i * 4u)) & 0xFu;
-                    uint w_packed = expand_4_bits(bits);
-                    uint a_packed = a_qs_sh[i * NB_Q8 + block_l];
-                    sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;
-                }
-                sub_acc += a_d * float(sumi);
-            }
-#else
-            uint x_block_base = b * 32u; // f16vec4 stride per Q1_0 block (128 elems / 4)
-            // Inner reduction on packed-half2 f16 ALU pipe (2 MAC/cyc/lane).
-            f16vec4 acc4 = f16vec4(0.0);
-            [[unroll]] for (uint s = 0u; s < 4u; ++s) {
-                uint qword = weights[qs_word_base + s];
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                    uint bits = (qword >> (i * 4u)) & 0xFu;
-                    f16vec4 a4 = x_sh[x_block_base + s * 8u + i];
-                    // Q1_0 sign convention: bit=1 → +a, bit=0 → -a.
-                    // SWAR-spread the 4 sign bits into 4 byte lanes (bit i →
-                    // byte i, value 0 or 1), then map {0,1}→{−1,+1}
-                    // arithmetically. Avoids 4 per-lane selects.
-                    bvec4 sb = bvec4((bits & 1u) != 0u, (bits & 2u) != 0u, (bits & 4u) != 0u, (bits & 8u) != 0u);
-                    acc4 += mix(-a4, a4, sb);
-                }
-            }
-            float sub_acc = reduce_add(vec4(acc4));
-#endif
-            acc += d_w * sub_acc;
+            acc += d_w * q1_0_block_dot(qs_word_base, b);
         }
     }
 

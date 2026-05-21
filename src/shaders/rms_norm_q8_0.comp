@@ -1,10 +1,6 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "lib/preamble.glsl"
 
 // Fused: y = rms_norm(x) * w  →  Q8_0 quantize  →  write to act_q8.
 //
@@ -40,33 +36,12 @@ const uint BLOCKS_PER_ITER = WG / BLOCK_SIZE; // 8
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 shared float sg_partial[NUM_SUBGROUPS];
+shared float sg_partial_amax[NUM_SUBGROUPS];
 shared float inv_h_sh;
 shared uint qv_sh[256];
 
-float wg_sum_f32(float local_v) {
-    float sg_sum = subgroupAdd(local_v);
-    if (NUM_SUBGROUPS == 1u)
-        return sg_sum;
-    if (gl_SubgroupInvocationID == 0u)
-        sg_partial[gl_SubgroupID] = sg_sum;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (e.g. WG=256 with SG=8 →
-        // NUM_SUBGROUPS=32). Each merging lane folds every k*SUBGROUP_SIZE-th
-        // partial before the final subgroupAdd. The loop bound is constant
-        // after specialization, so spirv-opt folds it for the common
-        // NUM_SUBGROUPS <= SUBGROUP_SIZE case.
-        float c = 0.0;
-        for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE) {
-            c += sg_partial[i];
-        }
-        float f = subgroupAdd(c);
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial[0] = f;
-    }
-    barrier();
-    return sg_partial[0];
-}
+#include "lib/q8_0_quantize.glsl"
+#include "lib/subgroup_reduce_scalar.glsl"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -94,7 +69,6 @@ void main() {
     // ---- Phase 2: per-block normalize + Q8_0 quantize ----
     uint lane_in_block = tid & 31u;
     uint block_within_iter = tid >> 5;
-    uint sg_block_base = gl_SubgroupInvocationID & ~31u;
 
     uint n_iters = nb_q8 / BLOCKS_PER_ITER;
     for (uint it = 0u; it < n_iters; ++it) {
@@ -102,50 +76,13 @@ void main() {
         uint elem_idx = it * WG + tid;
         float v = float(act[in_base + elem_idx]) * inv_h * float(w[p.weight_offset + elem_idx]);
 
-        // Per-32-lane max-abs reduction. Masks 1/2/4 are always safe
-        // (SUBGROUP_SIZE >= 8 enforced at load time); masks 8/16 only when
-        // the subgroup is wide enough to keep the XOR partner in-subgroup.
-        // When the subgroup is smaller than 32, no single cluster covers a
-        // full 32-block, so we stitch the in-subgroup partials through
-        // `sg_partial` (same scheme as kv_writeback_fused).
-        float m = abs(v);
-        m = max(m, subgroupShuffleXor(m, 1u));
-        m = max(m, subgroupShuffleXor(m, 2u));
-        m = max(m, subgroupShuffleXor(m, 4u));
-        if (SUBGROUP_SIZE >= 16u) {
-            m = max(m, subgroupShuffleXor(m, 8u));
-        }
-        if (SUBGROUP_SIZE >= 32u) {
-            m = max(m, subgroupShuffleXor(m, 16u));
-        }
-        if (SUBGROUP_SIZE < 32u) {
-            uint sg_lane = tid % SUBGROUP_SIZE;
-            uint cluster_id = tid / SUBGROUP_SIZE;
-            if (sg_lane == 0u) {
-                sg_partial[cluster_id] = m;
-            }
-            barrier();
-            uint group_id = tid >> 5;             // which 32-block within the WG
-            uint per_group = 32u / SUBGROUP_SIZE; // 4 (sg=8) or 2 (sg=16)
-            uint g_base = group_id * per_group;
-            float mm = 0.0;
-            [[unroll]]
-            for (uint i = 0u; i < per_group; ++i) {
-                mm = max(mm, sg_partial[g_base + i]);
-            }
-            barrier();
-            m = mm;
-        }
+        float m = block_max_abs(v);
         float id_inv = mix(0.0, 127.0 / m, m != 0.0);
         uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
 
-        // Pack 4 bytes per u32 (subgroup-shuffle path or LDS-staging fallback).
         uint packed;
         if (SUBGROUP_SIZE >= 32u) {
-            uint group4_in_block = lane_in_block & ~3u;
-            uint tgt = sg_block_base | group4_in_block;
-            packed = subgroupShuffle(qv, tgt + 0u) | (subgroupShuffle(qv, tgt + 1u) << 8) |
-                     (subgroupShuffle(qv, tgt + 2u) << 16) | (subgroupShuffle(qv, tgt + 3u) << 24);
+            packed = pack4(qv);
         } else {
             qv_sh[tid] = qv;
             barrier();

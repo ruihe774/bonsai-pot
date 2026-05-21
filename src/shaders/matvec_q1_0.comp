@@ -1,13 +1,9 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
 #ifndef METAL_BACKEND
 #extension GL_EXT_integer_dot_product : require
 #endif
+#include "lib/preamble.glsl"
 
 // Q1_0 matvec.
 //
@@ -34,22 +30,7 @@ p;
 layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t act[]; };
 
-float load_f16_at(uint b_offset) {
-    uint word = weights[b_offset >> 2];
-    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
-    return unpackFloat2x16(half_bits).x;
-}
-
-#ifndef METAL_BACKEND
-uint expand_4_bits(uint bits) {
-    // Spread the 4 input bits to the 4 byte LSBs in one mul: bit i lands at bit (8i)
-    // because 0x00204081 has bits set at positions {0, 7, 14, 21}.
-    uint spread = (bits * 0x00204081u) & 0x01010101u;
-    return ~(spread * 0xFEu);
-}
-#else
-float reduce_add(vec4 v) { return v.x + v.y + v.z + v.w; }
-#endif
+#include "lib/q1_0_load.glsl"
 
 const uint WG_X = 8u;
 const uint WG_Y = 16u;
@@ -57,20 +38,20 @@ const uint WG = WG_X * WG_Y;
 const uint ROWS_PER_WG = WG_Y;
 const uint TILE_K = 4096u;
 #ifndef METAL_BACKEND
-const uint TILE_NB_Q8 = TILE_K / 32u; // = 128, matches WG
+const uint Q1_NB_Q8 = TILE_K / 32u;   // = 128, matches WG
 const uint TILE_QS_LEN = TILE_K >> 2; // u32 slots packing the i8 activation
-#else
-const uint TILE_K_V4 = TILE_K >> 2; // half4 slots
-#endif
 
-#ifndef METAL_BACKEND
 // Layout is **transposed** vs. block-major to dodge LDS bank conflicts:
 // see WGSL doc for full reasoning.
-shared uint a_qs_sh[TILE_QS_LEN];
-shared float a_d_sh[TILE_NB_Q8];
+shared uint q1_a_qs_sh[TILE_QS_LEN];
+shared float q1_a_d_sh[Q1_NB_Q8];
 #else
-shared f16vec4 a_sh[TILE_K_V4];
+const uint TILE_K_V4 = TILE_K >> 2; // f16vec4 slots
+
+shared f16vec4 q1_x_sh[TILE_K_V4];
 #endif
+
+#include "lib/q1_0_matvec.glsl"
 
 layout(local_size_x = 8, local_size_y = 16, local_size_z = 1) in;
 
@@ -110,21 +91,21 @@ void main() {
 
             float max_abs = float(max_abs_h);
             float d = max_abs * (1.0 / 127.0);
-            a_d_sh[tid] = d;
+            q1_a_d_sh[tid] = d;
             float inv_max = 127.0 / max(max_abs, 1.0e-30);
 
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 vec4 q = clamp(round(vec4(v[i]) * inv_max), vec4(-128.0), vec4(127.0));
-                a_qs_sh[i * TILE_NB_Q8 + tid] = pack32(u8vec4(i8vec4(q)));
+                q1_a_qs_sh[i * Q1_NB_Q8 + tid] = pack32(u8vec4(i8vec4(q)));
             }
         }
 #else
-        // ---- Stage 1: cooperative half4 staging (no Q8_0 round-trip) ----
+        // ---- Stage 1: cooperative f16vec4 staging (no Q8_0 round-trip) ----
         uint tile_v4 = tile_size >> 2;
         uint in_v4_off = (p.input_offset + tile_start) >> 2;
         for (uint v = tid; v < tile_v4; v += WG) {
             uint base = (in_v4_off + v) << 2;
-            a_sh[v] = f16vec4(act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u]);
+            q1_x_sh[v] = f16vec4(act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u]);
         }
 #endif
         barrier();
@@ -136,44 +117,7 @@ void main() {
                 uint b = b_q1_base_global + b_local;
                 float d_w = load_f16_at(row_d_byte + b * 2u);
                 uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
-#ifndef METAL_BACKEND
-                uint a_block_local_base = b_local * 4u;
-                float sub_acc = 0.0;
-                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
-                    uint qword = weights[qs_word_base + s];
-                    float a_d = a_d_sh[a_block_local_base + s];
-                    uint block_l = a_block_local_base + s;
-                    int sumi = 0;
-                    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                        uint bits = (qword >> (i * 4u)) & 0xFu;
-                        uint w_packed = expand_4_bits(bits);
-                        uint a_packed = a_qs_sh[i * TILE_NB_Q8 + block_l];
-                        sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;
-                    }
-                    sub_acc += a_d * float(sumi);
-                }
-#else
-                uint x_block_base = b_local * 32u; // half4 stride per Q1_0 block in tile-local a_sh
-                // Inner reduction on packed-half2 f16 ALU pipe (2 MAC/cyc/lane
-                // vs f32's 1). 128 ±-terms per Q1_0 block × O(1) activations
-                // fits in fp16; the d_w * sub_acc accumulate stays f32.
-                f16vec4 acc4 = f16vec4(0.0);
-                [[unroll]] for (uint s = 0u; s < 4u; ++s) {
-                    uint qword = weights[qs_word_base + s];
-                    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                        uint bits = (qword >> (i * 4u)) & 0xFu;
-                        f16vec4 a4 = a_sh[x_block_base + s * 8u + i];
-                        // Q1_0 sign convention: bit=1 → +a, bit=0 → -a.
-                        // SWAR-spread the 4 sign bits into 4 byte lanes (bit i
-                        // → byte i, value 0 or 1), then map {0,1}→{−1,+1}
-                        // arithmetically. Avoids 4 per-lane selects.
-                        bvec4 sb = bvec4((bits & 1u) != 0u, (bits & 2u) != 0u, (bits & 4u) != 0u, (bits & 8u) != 0u);
-                        acc4 += mix(-a4, a4, sb);
-                    }
-                }
-                float sub_acc = reduce_add(vec4(acc4));
-#endif
-                acc += d_w * sub_acc;
+                acc += d_w * q1_0_block_dot(qs_word_base, b_local);
             }
         }
         barrier();

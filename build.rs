@@ -71,13 +71,15 @@ fn main() {
 // `GL_EXT_integer_dot_product`). Optimisation runs as a follow-up
 // `spirv-opt -O` pass since glslangValidator has no `-O` switch.
 fn build_vulkan(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
+    let lib_dir = manifest_dir.join("src/shaders");
+    rerun_if_lib_changed(&lib_dir);
     for name in SHADERS {
         let src_path = manifest_dir.join("src/shaders").join(name);
         let raw_path = out_dir.join(format!("{name}.raw.spv"));
         let opt_path = out_dir.join(format!("{name}.spv"));
         println!("cargo:rerun-if-changed={}", src_path.display());
 
-        run_glslang(&src_path, &raw_path, &[], debug_shaders);
+        run_glslang(&src_path, &raw_path, &[], &lib_dir, debug_shaders);
         run_spirv_opt(&raw_path, &opt_path);
     }
 }
@@ -98,6 +100,8 @@ fn build_vulkan(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
 // default; we rename to `cs_main` so the pipeline `entry_point` stays
 // the same as for the hand-ported MSL files.
 fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
+    let lib_dir = manifest_dir.join("src/shaders");
+    rerun_if_lib_changed(&lib_dir);
     let define_metal = [("METAL_BACKEND", "1")];
     for name in SHADERS {
         let src_path = manifest_dir.join("src/shaders").join(name);
@@ -121,20 +125,39 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         }
 
         let raw_path = out_dir.join(format!("{name}.raw.spv"));
-        run_glslang(&src_path, &raw_path, &define_metal, debug_shaders);
+        run_glslang(&src_path, &raw_path, &define_metal, &lib_dir, debug_shaders);
         run_spirv_cross_msl(&raw_path, &msl_path);
         minify_msl(&msl_path);
     }
 }
 
-fn run_glslang(src_path: &Path, raw_path: &Path, defines: &[(&str, &str)], debug: bool) {
+fn rerun_if_lib_changed(shaders_dir: &Path) {
+    let lib_dir = shaders_dir.join("lib");
+    let entries = fs::read_dir(&lib_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", lib_dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("glsl") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn run_glslang(
+    src_path: &Path,
+    raw_path: &Path,
+    defines: &[(&str, &str)],
+    include_dir: &Path,
+    debug: bool,
+) {
     let mut glslang = Command::new("glslangValidator");
     glslang
         .arg("--target-env")
         .arg("vulkan1.3")
         .arg("-S")
         .arg("comp")
-        .arg("-V");
+        .arg("-V")
+        .arg(format!("-I{}", include_dir.display()));
     if debug {
         // `-g` embeds OpSource (with the full GLSL source string),
         // OpString filenames, and OpLine debug info, so RGP / Nsight /

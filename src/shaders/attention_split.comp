@@ -1,10 +1,7 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_control_flow_attributes2 : require
+#include "lib/preamble.glsl"
 
 // Split-K + GQA-batched attention chunk pass for the matvec (m_tokens=1) path.
 //
@@ -59,25 +56,7 @@ const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
 shared vec4 sg_partial4[NUM_SUBGROUPS];
 
-vec4 wg_sum_v4(vec4 local_v) {
-    vec4 sg_sum = subgroupAdd(local_v);
-    if (NUM_SUBGROUPS == 1u) {
-        return sg_sum;
-    }
-    if (gl_SubgroupInvocationID == 0u)
-        sg_partial4[gl_SubgroupID] = sg_sum;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        vec4 combined = vec4(0.0);
-        if (gl_SubgroupInvocationID < NUM_SUBGROUPS)
-            combined = sg_partial4[gl_SubgroupInvocationID];
-        vec4 final_sum = subgroupAdd(combined);
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial4[0] = final_sum;
-    }
-    barrier();
-    return sg_partial4[0];
-}
+#include "lib/subgroup_reduce_v4.glsl"
 
 float load_k(uint t, uint e_local) {
     uint elem_idx = t * p.kv_stride + e_local;

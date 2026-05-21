@@ -1,4 +1,5 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_integer_dot_product : require
@@ -26,6 +27,8 @@ layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) readonly buffer ABuf { uint acts[]; };
 layout(set = 0, binding = 2, std430) buffer YBuf { float16_t y[]; };
 
+#include "lib/q1_0_load.glsl"
+
 const uint WG_N = 16u;
 const uint WG_M = 16u;
 const uint WG = 256u;
@@ -38,19 +41,6 @@ shared float w_d_lds[64];
 shared uint w_bits_lds[256];
 shared float a_d_lds[256];
 shared uint a_qs_lds[2048];
-
-float load_w_f16(uint b_offset) {
-    uint word = weights[b_offset >> 2];
-    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
-    return unpackFloat2x16(half_bits).x;
-}
-
-uint expand_4_bits(uint bits) {
-    // Spread the 4 input bits to the 4 byte LSBs in one mul: bit i lands at bit (8i)
-    // because 0x00204081 has bits set at positions {0, 7, 14, 21}.
-    uint spread = (bits * 0x00204081u) & 0x01010101u;
-    return ~(spread * 0xFEu);
-}
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -81,7 +71,7 @@ void main() {
         // ---- Cooperative loads ----
         if (tid < 64u) {
             uint n_idx = n_base + tid;
-            w_d_lds[tid] = load_w_f16(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
+            w_d_lds[tid] = load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
         }
         {
             uint n_local = tid / 4u;

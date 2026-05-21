@@ -1,8 +1,6 @@
 #version 460
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+#include "lib/preamble.glsl"
 
 // Fused per-layer Q-side pre-attention pipeline:
 //   rms_norm(Q head) -> *w_q_norm -> NEOX-RoPE -> write back to act.q (f16,
@@ -33,12 +31,15 @@ const uint HALF_DIM = 64u;
 const uint WG = 128u;
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
-// q_sh holds normed-and-weighted Q so RoPE can fetch each thread's pair partner
-// across the head-half boundary (partners always cross a subgroup boundary at
-// WG=128). After RoPE the rotated value lives in a register; q_sh is dead.
-shared float16_t q_sh[128];
-// Cross-subgroup merge slot for the RMS reduction (used only when NUM_SUBGROUPS > 1).
+// rope_in_sh holds normed-and-weighted Q so RoPE can fetch each thread's pair
+// partner across the head-half boundary. After RoPE the rotated value lives in
+// a register; rope_in_sh is dead.
+shared float16_t rope_in_sh[HEAD_DIM];
+// Cross-subgroup merge slot for the RMS reduction.
 shared float sg_partial[NUM_SUBGROUPS];
+
+#include "lib/rope_neox.glsl"
+#include "lib/subgroup_reduce_scalar.glsl"
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -51,50 +52,13 @@ void main() {
     uint q_idx = p.q_off + q_token_off + tid;
     float q_raw = float(act[q_idx]);
 
-    // ---- RMS-norm reduction over the Q head (sum of squares) ----
-    float sg_sum = subgroupAdd(q_raw * q_raw);
-    float total;
-    if (NUM_SUBGROUPS == 1u) {
-        total = sg_sum;
-    } else {
-        if (gl_SubgroupInvocationID == 0u)
-            sg_partial[gl_SubgroupID] = sg_sum;
-        barrier();
-        if (gl_SubgroupID == 0u) {
-            // NUM_SUBGROUPS can exceed SUBGROUP_SIZE (WG=128 with SG=8 →
-            // NUM_SUBGROUPS=16). Fold every k*SUBGROUP_SIZE-th partial into
-            // the merging lane before the final subgroupAdd.
-            float c = 0.0;
-            for (uint i = gl_SubgroupInvocationID; i < NUM_SUBGROUPS; i += SUBGROUP_SIZE) {
-                c += sg_partial[i];
-            }
-            float f = subgroupAdd(c);
-            if (gl_SubgroupInvocationID == 0u)
-                sg_partial[0] = f;
-        }
-        barrier();
-        total = sg_partial[0];
-    }
-    float inv_h = inversesqrt(total / float(HEAD_DIM) + p.eps);
+    float inv_h = inversesqrt(wg_sum_f32(q_raw * q_raw) / float(HEAD_DIM) + p.eps);
 
     // ---- norm * weight, stash to shmem so RoPE can swap pairs ----
-    q_sh[tid] = float16_t(q_raw * inv_h) * w_norms[p.w_q_norm_off + tid];
+    rope_in_sh[tid] = float16_t(q_raw * inv_h) * w_norms[p.w_q_norm_off + tid];
     barrier();
 
-    // ---- NEOX RoPE: each lane computes its own output ----
     uint pos_abs = p.pos_base + tok;
     uint cs_base = p.rope_offset + pos_abs * HEAD_DIM;
-    float16_t q_post;
-    if (tid < HALF_DIM) {
-        float16_t c = rope_cs[cs_base + tid * 2u];
-        float16_t s = rope_cs[cs_base + tid * 2u + 1u];
-        q_post = q_sh[tid] * c - q_sh[tid + HALF_DIM] * s;
-    } else {
-        uint j = tid - HALF_DIM;
-        float16_t c = rope_cs[cs_base + j * 2u];
-        float16_t s = rope_cs[cs_base + j * 2u + 1u];
-        q_post = q_sh[j] * s + q_sh[tid] * c;
-    }
-
-    act[q_idx] = q_post;
+    act[q_idx] = rope_neox(tid, cs_base);
 }
