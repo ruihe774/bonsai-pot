@@ -14,11 +14,11 @@ use std::time::Instant;
 use wgpu::PollType;
 
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
-use super::MicroMarker;
+use super::{MicroMarker, Session};
 #[cfg(any(feature = "ci", not(target_vendor = "apple")))]
 use super::NoMarker;
 #[cfg(not(feature = "ci"))]
-use super::{BenchMarker, Session};
+use super::BenchMarker;
 use super::{
     Result, StepEncoder, encode_step_matvec, prefill_matmul_topk, step_matvec_no_sample,
     upload_sample, wait_topk_readback,
