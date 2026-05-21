@@ -398,9 +398,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.15.0"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "env_filter"
@@ -576,9 +576,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hexf-parse"
@@ -599,7 +599,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.0",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -755,7 +755,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -1153,9 +1153,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "indexmap",
  "itoa",
@@ -1438,7 +1438,7 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1466,7 +1466,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -1497,7 +1497,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "wgpu-hal",
 ]
@@ -1505,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "wgpu-hal",
 ]
@@ -1513,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -1553,7 +1553,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -1562,7 +1562,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#7015d16f2447df64ddc04b2cd1d0fd107d46f152"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#b616af177a5f275ed3b9ff41a64dc2f03cb39d64"
 dependencies = [
  "bitflags",
  "bytemuck",
