@@ -54,13 +54,6 @@ constant uint TILE_M = 64u;          // SG_GRID_M * TM_SG * 8
 constant uint TILE_N = 64u;          // SG_GRID_N * TN_SG * 8
 constant uint W_HALF = 64u * TILE_N;
 
-// Load a single fp16 (as float) from a 16-bit-aligned offset within `weights`.
-static inline float load_w_f16(device const uint* weights, uint b_offset) {
-    uint word = weights[b_offset >> 2];
-    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
-    return float(as_type<half2>(half_bits).x);
-}
-
 kernel void cs_main(
     constant Params& p [[buffer(0)]],
     device const uint* weights [[buffer(1)]],
@@ -128,7 +121,7 @@ kernel void cs_main(
             uint q_packed = acts[qs_off >> 2];
             char4 q_chars = as_type<char4>(q_packed);
 
-            float4 q_f = float4(float(q_chars[0]), float(q_chars[1]), float(q_chars[2]), float(q_chars[3])) * a_d;
+            float4 q_f = float4(q_chars) * a_d;
             a_sh[idx] = half4(q_f);
         }
 
@@ -149,14 +142,16 @@ kernel void cs_main(
             uint n_idx = n_base + n_local;
             uint sign_off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
             uint sign_word = weights[sign_off >> 2];
-            half dw = half(load_w_f16(weights, p.w_d_offset + (n_idx * nb_q1 + b) * 2u));
+            uint b_offset = p.w_d_offset + (n_idx * nb_q1 + b) * 2u;
+            uint word = weights[b_offset >> 2];
+            uint half_bits = (word >> ((b_offset & 2u) * 8u));
+            half dw = as_type<half2>(half_bits).x;
             half neg_dw = -dw;
             threadgroup half* w_dst = w_sh + half_idx * W_HALF;
             uint k0 = kc * 32u;
             #pragma unroll
             for (uint i = 0u; i < 32u; ++i) {
-                bool bit = ((sign_word >> i) & 1u) != 0u;
-                w_dst[(k0 + i) * TILE_N + n_local] = bit ? dw : neg_dw;
+                w_dst[(k0 + i) * TILE_N + n_local] = select(neg_dw, dw, ((sign_word >> i) & 1u) != 0u);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -230,10 +225,6 @@ kernel void cs_main(
             continue;
         uint yi = p.out_offset + m_idx * p.n + n_idx;
         float val = c_sh[m_local * TILE_N + n_local];
-        if (p.accumulate != 0u) {
-            y[yi] = half(float(y[yi]) + val);
-        } else {
-            y[yi] = half(val);
-        }
+        y[yi] = half(select(0.0f, float(y[yi]), p.accumulate != 0u) + val);
     }
 }
