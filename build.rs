@@ -193,6 +193,7 @@ fn run_spirv_opt(raw_path: &Path, opt_path: &Path) {
         .arg(raw_path)
         .arg("-o")
         .arg(opt_path)
+        .arg("--trim-capabilities")
         .status()
         .unwrap_or_else(|e| panic!("failed to run spirv-opt: {e}"));
     assert!(

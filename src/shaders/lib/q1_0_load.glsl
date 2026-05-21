@@ -3,7 +3,7 @@
 
 float load_f16_at(uint b_offset) {
     uint word = weights[b_offset >> 2];
-    uint half_bits = (word >> ((b_offset & 2u) * 8u)) & 0xFFFFu;
+    uint half_bits = (word >> ((b_offset & 2u) * 8u));
     return unpackFloat2x16(half_bits).x;
 }
 
