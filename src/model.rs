@@ -32,13 +32,13 @@ use crate::error::{PotError, Result};
 #[derive(Debug, Clone)]
 pub struct TensorEntry {
     pub dtype: String,
-    pub shape: Vec<u64>,
+    pub shape: Vec<u32>,
     pub buffer: String,
-    pub offset: u64,
-    pub length: u64,
-    pub d_offset: u64,
-    pub qs_offset: u64,
-    pub nb: u64,
+    pub offset: u32,
+    pub length: u32,
+    pub d_offset: u32,
+    pub qs_offset: u32,
+    pub nb: u32,
 }
 
 /// Parsed `config.ini`: model dimensions, hyper-parameters, and the tensor manifest.
@@ -947,10 +947,10 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
         let shape = get(g, "shape")?
             .split(',')
             .map(|s| {
-                s.parse::<u64>()
+                s.parse::<u32>()
                     .map_err(|_| PotError::Config("config.ini shape has invalid value"))
             })
-            .collect::<Result<Vec<u64>>>()?;
+            .collect::<Result<Vec<u32>>>()?;
         Ok(TensorEntry {
             dtype: get(g, "dtype")?.to_string(),
             shape,
@@ -1014,7 +1014,7 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
 }
 
 fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
-    const fn pad4(n: u64) -> u64 {
+    const fn pad4(n: u32) -> u32 {
         (n + 3) & !3
     }
 
@@ -1048,15 +1048,15 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
     // Each spec: (name, dtype, shape as [u64;2-or-1], buffer filename)
     // For 1-D F16 tensors encode shape as &[dim] (single element).
 
-    let n_embd = u64::from(cfg.n_embd);
-    let n_ff = u64::from(cfg.n_ff);
-    let q_dim = u64::from(cfg.q_dim);
-    let kv_dim = u64::from(cfg.kv_dim);
-    let n_vocab = u64::from(cfg.n_vocab);
-    let head_dim = u64::from(cfg.head_dim);
+    let n_embd = cfg.n_embd;
+    let n_ff = cfg.n_ff;
+    let q_dim = cfg.q_dim;
+    let kv_dim = cfg.kv_dim;
+    let n_vocab = cfg.n_vocab;
+    let head_dim = cfg.head_dim;
 
     // Per-layer tensors (iterated over all layers).
-    let layer_specs: &[(&str, &str, &[u64], &str)] = &[
+    let layer_specs: &[(&str, &str, &[u32], &str)] = &[
         (
             "attn_q.weight",
             "Q1_0",
@@ -1115,7 +1115,7 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
         ("ffn_norm.weight", "F16", &[n_embd], "weights_norms.bin"),
     ];
     // Non-layer tensors.
-    let global_specs: &[(&str, &str, &[u64], &str)] = &[
+    let global_specs: &[(&str, &str, &[u32], &str)] = &[
         ("output_norm.weight", "F16", &[n_embd], "weights_norms.bin"),
         (
             "token_embd.weight",
@@ -1125,7 +1125,7 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
         ),
     ];
 
-    let check = |name: &str, dtype: &str, shape: &[u64], buffer: &str| -> Result<()> {
+    let check = |name: &str, dtype: &str, shape: &[u32], buffer: &str| -> Result<()> {
         let e = cfg.manifest.get(name).ok_or(PotError::Config(
             "manifest: expected tensor missing (re-extract the model dir)",
         ))?;
@@ -1163,7 +1163,7 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
                 }
             }
             "F16" => {
-                let expected_length = pad4(shape.iter().product::<u64>() * 2);
+                let expected_length = pad4(shape.iter().product::<u32>() * 2);
                 if e.length != expected_length {
                     return Err(PotError::Config("manifest: F16 tensor length mismatch"));
                 }
@@ -1956,7 +1956,7 @@ impl Model {
                 let qn = tensor(&cfg, &format!("blk.{il}.attn_q_norm.weight"));
                 let kn = tensor(&cfg, &format!("blk.{il}.attn_k_norm.weight"));
                 let fn_ = tensor(&cfg, &format!("blk.{il}.ffn_norm.weight"));
-                let act_elem_bytes = size_of::<half::f16>() as u64;
+                let act_elem_bytes = size_of::<half::f16>() as u32;
                 LayerTensors {
                     wq: (q.d_offset as u32, q.qs_offset as u32),
                     wk: (k.d_offset as u32, k.qs_offset as u32),
@@ -1981,12 +1981,12 @@ impl Model {
             } else {
                 tensor(&cfg, "output.weight")
             };
-            let act_elem_bytes = size_of::<half::f16>() as u64;
+            let act_elem_bytes = size_of::<half::f16>() as u32;
             OutputTensors {
-                token_embd_d: te.d_offset as u32,
-                token_embd_qs: te.qs_offset as u32,
-                lm_head_d: lm.d_offset as u32,
-                lm_head_qs: lm.qs_offset as u32,
+                token_embd_d: te.d_offset,
+                token_embd_qs: te.qs_offset,
+                lm_head_d: lm.d_offset,
+                lm_head_qs: lm.qs_offset,
                 output_norm_off: (on.offset / act_elem_bytes) as u32,
             }
         };
