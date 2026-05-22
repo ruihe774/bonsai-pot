@@ -5,16 +5,21 @@
 //! `Q8_0` activations (used by the `dot4I8Packed` matmul path). Norm weights and the
 //! `RoPE` cos/sin table are also f16; `Q8_0` scales remain f32.
 
-use std::collections::HashMap;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString as _};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::mem::size_of;
+use core::pin::pin;
+use core::str::{FromStr, from_utf8};
+use core::task::{Context, Poll, Waker};
+#[cfg(feature = "std")]
 use std::fs::{read, read_to_string};
-use std::mem::size_of;
+#[cfg(feature = "std")]
 use std::path::Path;
-use std::pin::pin;
-use std::str::{FromStr, from_utf8};
-use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll, Waker};
 
 use bytemuck::{Pod, Zeroable, cast_slice};
+use once_cell::sync::OnceCell;
 use wgpu::util::DeviceExt as _;
 use wgpu::{Backends, InstanceDescriptor};
 
@@ -23,38 +28,119 @@ use crate::error::{PotError, Result};
 
 // ----- config & manifest ----------------------------------------------------
 
+/// Metadata for a single tensor in the model manifest.
 #[derive(Debug, Clone)]
 pub struct TensorEntry {
-    pub(crate) dtype: String,
-    pub(crate) shape: Vec<u64>,
-    pub(crate) buffer: String,
-    pub(crate) offset: u64,
-    pub(crate) length: u64,
-    pub(crate) d_offset: u64,
-    pub(crate) qs_offset: u64,
-    pub(crate) nb: u64,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    pub buffer: String,
+    pub offset: u64,
+    pub length: u64,
+    pub d_offset: u64,
+    pub qs_offset: u64,
+    pub nb: u64,
 }
 
-/// Internal config: the full struct deserialized from `config.ini`.
+/// Parsed `config.ini`: model dimensions, hyper-parameters, and the tensor manifest.
 #[derive(Debug, Clone)]
-pub struct Config {
-    pub(crate) n_layer: u32,
-    pub(crate) n_embd: u32,
-    pub(crate) n_ff: u32,
-    pub(crate) n_head: u32,
-    pub(crate) n_kv_head: u32,
-    pub(crate) head_dim: u32,
-    pub(crate) rope_freq_base: f32,
-    pub(crate) rms_eps: f32,
-    pub(crate) n_vocab: u32,
-    pub(crate) eos_token_id: u32,
-    pub(crate) add_bos: bool,
-    pub(crate) rope_orig_context: u32,
-    pub(crate) n_kv_groups: u32,
-    pub(crate) q_dim: u32,
-    pub(crate) kv_dim: u32,
-    pub(crate) tied_embeddings: bool,
-    pub(crate) manifest: HashMap<String, TensorEntry>,
+pub struct ModelConfig {
+    pub n_layer: u32,
+    pub n_embd: u32,
+    pub n_ff: u32,
+    pub n_head: u32,
+    pub n_kv_head: u32,
+    pub head_dim: u32,
+    pub rope_freq_base: f32,
+    pub rms_eps: f32,
+    pub n_vocab: u32,
+    pub eos_token_id: u32,
+    pub add_bos: bool,
+    pub rope_orig_context: u32,
+    pub n_kv_groups: u32,
+    pub q_dim: u32,
+    pub kv_dim: u32,
+    pub tied_embeddings: bool,
+    pub manifest: BTreeMap<String, TensorEntry>,
+}
+
+impl ModelConfig {
+    /// Parse a `config.ini` text blob (as produced by `scripts/extract.py`).
+    ///
+    /// Useful in `no_std` environments where you need to construct a
+    /// [`ModelSnapshot`] without a filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Return `PotError::Config` for malformed ini
+    pub fn from_ini(text: &str) -> Result<Self> {
+        parse_config_ini(text)
+    }
+}
+
+/// Pre-loaded model weights and metadata.
+///
+/// Pass to [`Model::load_with_weights`] to initialise the engine without any
+/// filesystem access. Callers can obtain a `ModelSnapshot` by:
+///
+/// - Calling [`ModelSnapshot::from_dir`] (requires the `std` feature) to read
+///   the files from disk, or
+/// - Constructing the struct directly from bytes obtained by any other means
+///   (e.g. `include_bytes!`, fetched from the network, embedded in flash).
+#[derive(Debug, Clone)]
+pub struct ModelSnapshot {
+    /// Parsed `config.ini` contents.
+    pub config: ModelConfig,
+    /// Contents of `weights_attn.bin`.
+    pub w_attn: Vec<u8>,
+    /// Contents of `weights_ffn_gate_up.bin`.
+    pub w_ffn_gate_up: Vec<u8>,
+    /// Contents of `weights_ffn_down.bin`.
+    pub w_ffn_down: Vec<u8>,
+    /// Contents of `weights_norms.bin`.
+    pub w_norms: Vec<u8>,
+    /// Contents of `weights_embed_lmhead.bin`.
+    pub w_embed_lmhead: Vec<u8>,
+    /// Contents of `vocab.bin`.
+    pub vocab_bytes: Vec<u8>,
+    /// Contents of `vocab_offsets.bin` (little-endian `u32` stream).
+    pub vocab_offsets: Vec<u8>,
+}
+
+impl ModelSnapshot {
+    /// Read the seven model files from `model_dir` and parse `config.ini`.
+    ///
+    /// This is the std-backed equivalent of constructing `ModelSnapshot` by hand;
+    /// it reads the same files that `Model::load` would read.
+    ///
+    /// # Errors
+    ///
+    /// Return `PotError::Io` for IO error, and `PotError::Config` for invalid config
+    #[cfg(feature = "std")]
+    pub fn from_dir(model_dir: impl AsRef<Path>) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let cfg_path = model_dir.join("config.ini");
+        let cfg_text = read_to_string(&cfg_path).map_err(|e| PotError::Io {
+            path: cfg_path,
+            source: e,
+        })?;
+        let config = parse_config_ini(&cfg_text)?;
+
+        let load = |fname: &str| -> Result<Vec<u8>> {
+            let p = model_dir.join(fname);
+            read(&p).map_err(|e| PotError::Io { path: p, source: e })
+        };
+
+        Ok(Self {
+            config,
+            w_attn: load("weights_attn.bin")?,
+            w_ffn_gate_up: load("weights_ffn_gate_up.bin")?,
+            w_ffn_down: load("weights_ffn_down.bin")?,
+            w_norms: load("weights_norms.bin")?,
+            w_embed_lmhead: load("weights_embed_lmhead.bin")?,
+            vocab_bytes: load("vocab.bin")?,
+            vocab_offsets: load("vocab_offsets.bin")?,
+        })
+    }
 }
 
 // ----- uniform-param structs (WGSL-side struct layouts) ---------------------
@@ -289,7 +375,7 @@ pub struct ActLayout {
 }
 
 impl ActLayout {
-    pub fn build(cfg: &Config, m_max: u32) -> Self {
+    pub fn build(cfg: &ModelConfig, m_max: u32) -> Self {
         let mut o = 0u32;
         let alloc = |n: u32, o: &mut u32| -> u32 {
             let r = *o;
@@ -483,7 +569,7 @@ fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
     reason = "shaders are written by us"
 )]
 fn msl_shift_ssbo_buffer_indices(src: &str) -> String {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
 
     let head = "kernel void cs_main(";
     let head_pos = src
@@ -730,7 +816,7 @@ pub struct OutputTensors {
 }
 
 /// Latched state set by the wgpu device-lost or uncaptured-error callbacks.
-/// Stored in an `OnceLock` so reads are lock-free and the first writer wins.
+/// Stored in an `OnceCell` so reads are lock-free and the first writer wins.
 #[derive(Debug, Clone)]
 pub struct DeviceLostInfo {
     pub reason: wgpu::DeviceLostReason,
@@ -749,7 +835,7 @@ pub struct DeviceLostInfo {
 pub struct Model {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
-    pub(crate) cfg: Config,
+    pub(crate) cfg: ModelConfig,
     pub(crate) act_layout: ActLayout,
     pub(crate) m_max: u32,
     pub(crate) max_seq: u32,
@@ -759,7 +845,7 @@ pub struct Model {
     pub(crate) layer_tensors: Vec<LayerTensors>,
     pub(crate) output_tensors: OutputTensors,
     pub(crate) vocab: Vec<String>,
-    pub(crate) lost: Arc<OnceLock<DeviceLostInfo>>,
+    pub(crate) lost: Arc<OnceCell<DeviceLostInfo>>,
     #[cfg(all(feature = "bench-internals", not(feature = "ci")))]
     pub(crate) bench_ts_period_ns: f32,
 }
@@ -796,7 +882,7 @@ fn global_priority_fallback_to_queue_prio(priority: GlobalPriority) -> f32 {
 /// Power Preference when choosing a physical adapter.
 pub use wgpu::PowerPreference;
 
-/// Allocate-time tunables for [`Model::load_with_options`].
+/// Allocate-time tunables for [`Model::load_from_dir`].
 ///
 /// These affect GPU buffer sizing (KV cache, `RoPE` table) and so cannot be
 /// changed per call — pick them once at load.
@@ -837,18 +923,18 @@ impl Default for LoadOptions {
     }
 }
 
-fn parse_config_ini(text: &str) -> Result<Config> {
-    fn get<'a>(map: &'a HashMap<&str, &str>, key: &'static str) -> Result<&'a str> {
+fn parse_config_ini(text: &str) -> Result<ModelConfig> {
+    fn get<'a>(map: &'a BTreeMap<&str, &str>, key: &'static str) -> Result<&'a str> {
         map.get(key)
             .copied()
             .ok_or(PotError::Config("config.ini missing required field"))
     }
-    fn parse_field<T: FromStr>(map: &HashMap<&str, &str>, key: &'static str) -> Result<T> {
+    fn parse_field<T: FromStr>(map: &BTreeMap<&str, &str>, key: &'static str) -> Result<T> {
         get(map, key)?
             .parse()
             .map_err(|_| PotError::Config("config.ini field has invalid value"))
     }
-    fn parse_opt<T: FromStr + Default>(map: &HashMap<&str, &str>, key: &'static str) -> Result<T> {
+    fn parse_opt<T: FromStr + Default>(map: &BTreeMap<&str, &str>, key: &'static str) -> Result<T> {
         map.get(key).map_or_else(
             || Ok(T::default()),
             |v| {
@@ -857,7 +943,7 @@ fn parse_config_ini(text: &str) -> Result<Config> {
             },
         )
     }
-    fn build_entry(g: &HashMap<&str, &str>) -> Result<TensorEntry> {
+    fn build_entry(g: &BTreeMap<&str, &str>) -> Result<TensorEntry> {
         let shape = get(g, "shape")?
             .split(',')
             .map(|s| {
@@ -877,10 +963,10 @@ fn parse_config_ini(text: &str) -> Result<Config> {
         })
     }
 
-    let mut globals: HashMap<&str, &str> = HashMap::new();
-    let mut manifest: HashMap<String, TensorEntry> = HashMap::new();
+    let mut globals: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut manifest: BTreeMap<String, TensorEntry> = BTreeMap::new();
     let mut cur_section: Option<&str> = None;
-    let mut cur_fields: HashMap<&str, &str> = HashMap::new();
+    let mut cur_fields: BTreeMap<&str, &str> = BTreeMap::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -906,7 +992,7 @@ fn parse_config_ini(text: &str) -> Result<Config> {
     }
 
     let g = &globals;
-    Ok(Config {
+    Ok(ModelConfig {
         n_layer: parse_field(g, "n_layer")?,
         n_embd: parse_field(g, "n_embd")?,
         n_ff: parse_field(g, "n_ff")?,
@@ -927,7 +1013,7 @@ fn parse_config_ini(text: &str) -> Result<Config> {
     })
 }
 
-fn validate_cfg(cfg: &Config) -> Result<()> {
+fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
     const fn pad4(n: u64) -> u64 {
         (n + 3) & !3
     }
@@ -1110,18 +1196,20 @@ fn validate_cfg(cfg: &Config) -> Result<()> {
 
 impl Model {
     /// Load weights with default options. Equivalent to
+    /// Convenience wrapper: reads weights from `model_dir` and calls
     /// [`Model::load_with_options`] with `LoadOptions::default()`.
     ///
     /// # Errors
     ///
     /// See [`Model::load_with_options`].
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with_options(model_dir, LoadOptions::default())
+        Self::load_from_dir(model_dir, LoadOptions::default())
     }
 
-    /// Load weights, build pipelines, allocate the KV cache. Reads
-    /// `config.json`, `weights_*.bin`, `vocab.bin`, and `vocab_offsets.bin` from
-    /// `model_dir`.
+    /// Load weights from `model_dir`, build pipelines, allocate the KV cache.
+    /// Reads `config.ini`, `weights_*.bin`, `vocab.bin`, and `vocab_offsets.bin`.
     ///
     /// # Errors
     ///
@@ -1129,7 +1217,27 @@ impl Model {
     /// or parsed, no suitable wgpu adapter is available, the adapter does not
     /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
     /// subgroup size is unsupported, or the vocab files are malformed.
-    pub fn load_with_options(model_dir: impl AsRef<Path>, opts: LoadOptions) -> Result<Self> {
+    #[cfg(feature = "std")]
+    pub fn load_from_dir(model_dir: impl AsRef<Path>, opts: LoadOptions) -> Result<Self> {
+        Self::load_with_weights(ModelSnapshot::from_dir(model_dir)?, opts)
+    }
+
+    /// Build pipelines and allocate the KV cache from pre-loaded `weights`.
+    ///
+    /// This is the primary entry point in `no_std` environments. Callers
+    /// supply the model bytes directly (e.g. via `include_bytes!`, mmap, or
+    /// a network fetch) rather than letting the engine read from the filesystem.
+    ///
+    /// [`ModelSnapshot::from_dir`] is a convenience constructor that reads the
+    /// files from disk (requires the `std` feature).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `opts.max_seq == 0`, the weights or config are
+    /// malformed, no suitable wgpu adapter is available, the adapter does not
+    /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
+    /// subgroup size is unsupported, or the vocab files are malformed.
+    pub fn load_with_weights(weights: ModelSnapshot, opts: LoadOptions) -> Result<Self> {
         // Per-session buffer sizing constants (sample / staging / readback /
         // bench query-set) live in `SessionState::new`. Only the BGL helper
         // is hoisted here so we don't trip items-after-statements lints.
@@ -1149,13 +1257,7 @@ impl Model {
         if opts.max_seq == 0 {
             return Err(PotError::Config("max_seq must be > 0"));
         }
-        let model_dir = model_dir.as_ref();
-        let cfg_path = model_dir.join("config.ini");
-        let cfg_text = read_to_string(&cfg_path).map_err(|e| PotError::Io {
-            path: cfg_path.clone(),
-            source: e,
-        })?;
-        let cfg = parse_config_ini(&cfg_text)?;
+        let cfg = weights.config;
         validate_cfg(&cfg)?;
 
         // ---- wgpu init ------------------------------------------------------
@@ -1382,9 +1484,9 @@ impl Model {
         };
 
         // ---- wire up device-lost and uncaptured-error callbacks ------------
-        // Both callbacks write into `lost` via OnceLock; the first writer wins
+        // Both callbacks write into `lost` via OnceCell; the first writer wins
         // (the device-lost reason is more specific, so that path fires first).
-        let lost: Arc<OnceLock<DeviceLostInfo>> = Arc::new(OnceLock::new());
+        let lost: Arc<OnceCell<DeviceLostInfo>> = Arc::new(OnceCell::new());
         {
             let lost = Arc::clone(&lost);
             device.set_device_lost_callback(move |reason, message| {
@@ -1427,11 +1529,7 @@ impl Model {
             sg_max,
         );
 
-        // ---- load weight buffers from disk ---------------------------------
-        let load = |fname: &str| -> Result<Vec<u8>> {
-            let p = model_dir.join(fname);
-            read(&p).map_err(|e| PotError::Io { path: p, source: e })
-        };
+        // ---- upload weight buffers to GPU -----------------------------------
         // create_buffer_init uses mapped_at_creation, so COPY_DST is not needed
         // for the initial upload. The weight + rope buffers are read-only after load.
         let w_storage = wgpu::BufferUsages::STORAGE;
@@ -1442,11 +1540,11 @@ impl Model {
                 usage: w_storage,
             })
         };
-        let w_attn = make_storage("w_attn", &load("weights_attn.bin")?);
-        let w_ffn_gu = make_storage("w_ffn_gu", &load("weights_ffn_gate_up.bin")?);
-        let w_ffn_d = make_storage("w_ffn_d", &load("weights_ffn_down.bin")?);
-        let w_norms = make_storage("w_norms", &load("weights_norms.bin")?);
-        let w_embed = make_storage("w_embed", &load("weights_embed_lmhead.bin")?);
+        let w_attn = make_storage("w_attn", &weights.w_attn);
+        let w_ffn_gu = make_storage("w_ffn_gu", &weights.w_ffn_gate_up);
+        let w_ffn_d = make_storage("w_ffn_d", &weights.w_ffn_down);
+        let w_norms = make_storage("w_norms", &weights.w_norms);
+        let w_embed = make_storage("w_embed", &weights.w_embed_lmhead);
 
         // ---- build RoPE table (f32 host-side, then downcast to f16) --------
         let rope_table_f32 = build_rope_table(&cfg, opts.max_seq);
@@ -1574,7 +1672,7 @@ impl Model {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some($name),
-                            spirv: Some(std::borrow::Cow::Owned(words)),
+                            spirv: Some(alloc::borrow::Cow::Owned(words)),
                             ..Default::default()
                         },
                     )
@@ -1599,7 +1697,7 @@ impl Model {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some($name),
-                            msl: Some(std::borrow::Cow::Owned(s)),
+                            msl: Some(alloc::borrow::Cow::Owned(s)),
                             num_workgroups: $wg,
                             ..Default::default()
                         },
@@ -1832,23 +1930,13 @@ impl Model {
         };
 
         // ---- vocab ----------------------------------------------------------
-        let vocab_path = model_dir.join("vocab.bin");
-        let offs_path = model_dir.join("vocab_offsets.bin");
-        let vocab_bytes = read(&vocab_path).map_err(|e| PotError::Io {
-            path: vocab_path,
-            source: e,
-        })?;
-        let offs_bytes = read(&offs_path).map_err(|e| PotError::Io {
-            path: offs_path,
-            source: e,
-        })?;
-        let offs: &[u32] = cast_slice(&offs_bytes);
+        let offs: &[u32] = cast_slice(&weights.vocab_offsets);
         if offs.len() as u32 != cfg.n_vocab + 1 {
             return Err(PotError::Vocab("offsets length doesn't match n_vocab + 1"));
         }
         let mut vocab = Vec::with_capacity(cfg.n_vocab as usize);
         for i in 0..cfg.n_vocab as usize {
-            let s = from_utf8(&vocab_bytes[offs[i] as usize..offs[i + 1] as usize])
+            let s = from_utf8(&weights.vocab_bytes[offs[i] as usize..offs[i + 1] as usize])
                 .unwrap_or("?")
                 .to_string();
             vocab.push(s);
@@ -2020,7 +2108,7 @@ impl Model {
     #[doc(hidden)]
     pub fn __destroy_device_for_test(&self) {
         self.device.destroy();
-        // Poll to flush the device-lost callback into the OnceLock. The callback
+        // Poll to flush the device-lost callback into the OnceCell. The callback
         // is queued by destroy() but only fires during poll().
         let _ = self.device.poll(wgpu::PollType::Poll);
     }
@@ -2028,7 +2116,7 @@ impl Model {
 
 /// Precompute cos/sin table for NEOX rope: per position p (`0..max_seq`),
 /// per j (`0..head_dim/2`), interleaved (cos, sin) pairs => `head_dim` floats per pos.
-fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
+fn build_rope_table(cfg: &ModelConfig, max_seq: u32) -> Vec<f32> {
     let half = (cfg.head_dim / 2) as usize;
     let mut out = vec![0f32; max_seq as usize * cfg.head_dim as usize];
     for p in 0..max_seq as usize {
@@ -2049,7 +2137,7 @@ fn build_rope_table(cfg: &Config, max_seq: u32) -> Vec<f32> {
     clippy::unwrap_used,
     reason = "manifest is fully validated at load; missing tensor is a programmer error"
 )]
-pub fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
+pub fn tensor<'a>(cfg: &'a ModelConfig, name: &str) -> &'a TensorEntry {
     cfg.manifest.get(name).unwrap()
 }
 
@@ -2057,8 +2145,8 @@ pub fn tensor<'a>(cfg: &'a Config, name: &str) -> &'a TensorEntry {
 mod tests {
     use super::*;
 
-    fn bonsai4b_cfg() -> Config {
-        Config {
+    fn bonsai4b_cfg() -> ModelConfig {
+        ModelConfig {
             n_layer: 36,
             n_embd: 2560,
             n_ff: 9728,
@@ -2075,12 +2163,12 @@ mod tests {
             q_dim: 4_096,
             kv_dim: 1_024,
             tied_embeddings: true,
-            manifest: HashMap::new(),
+            manifest: BTreeMap::new(),
         }
     }
 
-    fn rope_test_cfg() -> Config {
-        Config {
+    fn rope_test_cfg() -> ModelConfig {
+        ModelConfig {
             n_layer: 1,
             n_embd: 8,
             n_ff: 8,
@@ -2097,7 +2185,7 @@ mod tests {
             q_dim: 8,
             kv_dim: 8,
             tied_embeddings: false,
-            manifest: HashMap::new(),
+            manifest: BTreeMap::new(),
         }
     }
 

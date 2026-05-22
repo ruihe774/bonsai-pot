@@ -323,7 +323,7 @@ fn main() {
     eprintln!("seed: {}", args.seed);
 
     eprintln!("loading model from {}…", args.model_dir.display());
-    let model = Model::load_with_options(
+    let model = Model::load_from_dir(
         &args.model_dir,
         LoadOptions {
             max_seq: args.max_seq,

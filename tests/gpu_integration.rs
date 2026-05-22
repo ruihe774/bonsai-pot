@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use std::env;
 use std::path::{Path, PathBuf};
 

@@ -1,11 +1,15 @@
+use alloc::string::String;
+use core::result::Result as StdResult;
+#[cfg(feature = "std")]
 use std::io;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
-use std::result::Result as StdResult;
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PotError {
+    #[cfg(feature = "std")]
     #[error("io error reading {path}: {source}")]
     Io {
         path: PathBuf,
@@ -39,13 +43,15 @@ pub type Result<T> = StdResult<T, PotError>;
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
-    use std::io;
-    use std::path::PathBuf;
+    use alloc::string::{String, ToString as _};
+    use core::error::Error as _;
 
     use super::PotError;
 
+    #[cfg(feature = "std")]
     fn make_io_error() -> PotError {
+        use std::io;
+        use std::path::PathBuf;
         PotError::Io {
             path: PathBuf::from("/tmp/fake"),
             source: io::Error::new(io::ErrorKind::NotFound, "not found"),
@@ -54,6 +60,7 @@ mod tests {
 
     #[test]
     fn display_each_variant() {
+        #[cfg(feature = "std")]
         assert!(make_io_error().to_string().contains("/tmp/fake"));
         assert!(
             PotError::Config("bad ini key")
@@ -119,6 +126,7 @@ mod tests {
 
     #[test]
     fn source_present_for_wrapped() {
+        #[cfg(feature = "std")]
         assert!(make_io_error().source().is_some());
 
         assert!(PotError::Vocab("x").source().is_none());

@@ -29,6 +29,10 @@
 //! [`Session::prefill`]. Decode token ids back to bytes/text via
 //! [`Model::decode_token`] and [`Model::decode_tokens`].
 
+#![cfg_attr(not(feature = "std"), no_std)]
+#[macro_use]
+extern crate alloc;
+
 #[cfg(all(target_vendor = "apple", not(target_arch = "aarch64")))]
 compile_error!("the Metal backend requires Apple Silicon (aarch64); Intel Macs are not supported");
 
@@ -43,7 +47,7 @@ pub use error::{PotError, Result};
 pub use kv_snapshot::KvSnapshot;
 #[cfg(not(target_vendor = "apple"))]
 pub use model::GlobalPriority;
-pub use model::{LoadOptions, Model};
+pub use model::{LoadOptions, Model, ModelConfig, ModelSnapshot, TensorEntry};
 pub use session::{GenerateOptions, Sampler, Session, StopReason};
 
 /// Bench / microbench helpers, exposed only with the `bench-internals` feature.

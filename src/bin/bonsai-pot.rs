@@ -212,7 +212,7 @@ fn main() {
         .init();
     let args = parse_args();
 
-    let model = Model::load_with_options(
+    let model = Model::load_from_dir(
         &args.model_dir,
         LoadOptions {
             max_seq: args.max_seq,

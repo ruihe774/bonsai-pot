@@ -1,4 +1,5 @@
-use std::mem::size_of;
+use alloc::vec::Vec;
+use core::mem::size_of;
 
 use crate::error::{PotError, Result};
 use crate::forward::{self, build_step_matvec_topk_cb, commit_sample_upload, wait_topk_readback};

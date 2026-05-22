@@ -27,20 +27,30 @@ path = "src/bin/bonsai-pot.rs"
 required-features = ["bench-internals"]
 
 [features]
-default = []
+default = ["std"]
+# Enable std-dependent functionality: filesystem-backed model loading
+# (`Model::load`, `Model::load_with_options`, `ModelWeights::from_dir`) and the
+# `PotError::Io` variant. Without this feature the crate is `no_std + alloc`;
+# callers must supply pre-loaded bytes via `Model::load_with_weights`.
+std = [
+    "half/std",
+    "log/std",
+    "thiserror/std",
+]
 # Exposes bench/microbench utilities under `bonsai_pot::__bench` and pulls in
 # the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
 # stable public library API.
-bench-internals = ["dep:env_logger"]
+bench-internals = ["dep:env_logger", "std"]
 # Disable timestamp query in CI
 ci = ["bench-internals"]
 
 [dependencies]
 # Library deps.
 bytemuck = { version = "1", features = ["derive"] }
-half = { version = "2", features = ["bytemuck"] }
-log = "0.4"
-thiserror = "2"
+half = { version = "2", default-features = false, features = ["bytemuck"] }
+log = { version = "0.4", default-features = false }
+once_cell = { version = "1", default-features = false, features = ["parking_lot"] }
+thiserror = { version = "2", default-features = false }
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
 env_logger = { version = "0.11", optional = true }

@@ -22,15 +22,17 @@
 //! dispatch of a given (kind, weight buffer) pair, since the dynamic uniform
 //! offset is the only per-dispatch variation.
 
+use alloc::vec::Vec;
+
 use wgpu::PollType;
 
 use crate::error::{PotError, Result};
 use crate::model::{
-    ATTN_CHUNK_SIZE, AttnMergeParams, AttnPrefillTiledParams, AttnSplitParams, Config, EmbedParams,
+    ATTN_CHUNK_SIZE, AttnMergeParams, AttnPrefillTiledParams, AttnSplitParams, EmbedParams,
     KvWritebackFusedParams, MATVEC_FUSED_NORMED_ROWS_PER_WG, MATVEC_SILU_ROWS_PER_WG, MatmulParams,
-    MatvecFusedNormedParams, MatvecParams, MatvecSiluParams, QNormRopeFusedParams, RmsNormParams,
-    RmsNormQ8Params, SiluMulQ8Params, TOPK_MAX, TOPK_NUM_PARTIAL_WG, TopKMergeParams,
-    TopKPartialParams, WeightSet,
+    MatvecFusedNormedParams, MatvecParams, MatvecSiluParams, ModelConfig, QNormRopeFusedParams,
+    RmsNormParams, RmsNormQ8Params, SiluMulQ8Params, TOPK_MAX, TOPK_NUM_PARTIAL_WG,
+    TopKMergeParams, TopKPartialParams, WeightSet,
 };
 use crate::session::Session;
 
@@ -42,13 +44,13 @@ use crate::session::Session;
 // `(il * max_seq + pos) * (kv_dim/32) + b` (single-row stride = kv_dim/32 in
 // d-elements, kv_dim in qs-bytes).
 
-const fn kv_qs_byte_base(cfg: &Config, max_seq: u32) -> u32 {
+const fn kv_qs_byte_base(cfg: &ModelConfig, max_seq: u32) -> u32 {
     cfg.n_layer * max_seq * (cfg.kv_dim / 32) * 4
 }
 
 /// `(d_word_offset, qs_byte_offset)` for the start of layer `il` inside each
 /// kv buffer. Same layout for `kv_k` and `kv_v`, so callers reuse the pair.
-const fn kv_layer_offsets(cfg: &Config, max_seq: u32, il: u32) -> (u32, u32) {
+const fn kv_layer_offsets(cfg: &ModelConfig, max_seq: u32, il: u32) -> (u32, u32) {
     let d_word = il * max_seq * (cfg.kv_dim / 32);
     let qs_byte = kv_qs_byte_base(cfg, max_seq) + il * max_seq * cfg.kv_dim;
     (d_word, qs_byte)
@@ -224,7 +226,7 @@ const fn matmul_bg<'a>(session: &'a Session<'_>, ws: WeightSet) -> &'a wgpu::Bin
 
 fn dispatch_rms_norm(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     n_groups: u32,
     group_size: u32,
@@ -323,7 +325,7 @@ fn dispatch_matvec_q1_0_silu(
 /// single-token path. See `shaders/matvec_q1_0_fused_normed.comp`.
 fn dispatch_matvec_q1_0_fused_normed(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     k: u32,
     input_offset: u32,
@@ -419,7 +421,7 @@ fn dispatch_topk_reduce(
 /// `rms_norm(K) + rope(K) + kv_writeback` with one dispatch.
 fn dispatch_kv_writeback_fused(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     k_cur_off: u32,
     v_cur_off: u32,
@@ -453,7 +455,7 @@ fn dispatch_kv_writeback_fused(
 /// `act.q` in place. Replaces `rms_norm(Q) + rope(Q)` with one dispatch.
 fn dispatch_q_norm_rope_fused(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     q_off: u32,
     w_q_norm_off: u32,
@@ -480,7 +482,7 @@ fn dispatch_q_norm_rope_fused(
 /// `(d_offset, qs_offset)` of the freshly-written `Q8_0` region in `act_q8`.
 fn dispatch_rms_norm_q8_0(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     k: u32,
     m: u32,
@@ -575,7 +577,7 @@ fn dispatch_matmul_q1_0(
 /// See `shaders/attention_prefill_tiled.wgsl`.
 fn dispatch_attention_prefill_tiled(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     layer_il: u32,
     max_seq: u32,
@@ -643,7 +645,7 @@ pub fn wait_topk_readback(session: &Session<'_>, k: u32) -> Result<(Vec<f32>, Ve
 /// the sampled token isn't read.
 pub fn encode_step_matvec<M: StepMarker>(
     se: &mut StepEncoder,
-    cfg: &Config,
+    cfg: &ModelConfig,
     sample_in: u32,
     topk_out: Option<(u32, u32)>,
     pos: u32,
@@ -807,7 +809,7 @@ pub fn step_matvec_no_sample(session: &Session<'_>, token_id: u32, pos: u32) {
 /// Pre-KV-copy block of one layer: `rms_norm` → QKV fused → q/k norms → rope.
 fn layer_pre_kv_in_pass<M: StepMarker>(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     pos: u32,
@@ -854,7 +856,7 @@ fn layer_pre_kv_in_pass<M: StepMarker>(
 /// → gate-up fused → `silu_mul` → Wd (resid).
 fn layer_post_kv_in_pass<M: StepMarker>(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     pos: u32,
@@ -1119,7 +1121,7 @@ pub fn prefill_matmul_topk<M: StepMarker>(
 
 fn layer_step_matmul_in_pass<M: StepMarker>(
     session: &Session<'_>,
-    cfg: &Config,
+    cfg: &ModelConfig,
     pass: &mut wgpu::ComputePass<'_>,
     il: u32,
     m: u32,

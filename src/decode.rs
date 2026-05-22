@@ -1,10 +1,12 @@
-use std::sync::OnceLock;
+use alloc::vec::Vec;
+
+use once_cell::sync::OnceCell;
 
 /// Inverse of GPT-2's `bytes_to_unicode` map: each codepoint in a vocab token
 /// maps back to its raw byte. Special tokens (e.g. `<|im_start|>`) fall through
 /// as their UTF-8 encoding.
 pub fn decode_token_bytes(s: &str) -> Vec<u8> {
-    static INV: OnceLock<[Option<u8>; 0x180]> = OnceLock::new();
+    static INV: OnceCell<[Option<u8>; 0x180]> = OnceCell::new();
     let inv = INV.get_or_init(|| {
         let mut bs: Vec<u32> = (u32::from(b'!')..=u32::from(b'~'))
             .chain(0xa1..=0xac)
@@ -42,6 +44,8 @@ pub fn decode_token_bytes(s: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString as _;
+
     use super::*;
 
     #[test]

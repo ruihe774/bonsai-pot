@@ -19,6 +19,8 @@
 //! A snapshot captured with `max_seq=512` can be restored into a model loaded
 //! with `max_seq=2048` as long as `pos ≤ model.max_seq_len()`.
 
+use alloc::vec::Vec;
+
 use crate::error::{PotError, Result};
 use crate::model::Model;
 use crate::session::Session;
