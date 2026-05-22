@@ -10,7 +10,7 @@
 // constant-folds the loop body away for the common NUM_SUBGROUPS <= SUBGROUP_SIZE
 // case (the loop runs 0 or 1 iterations and the conditional is dead).
 
-float wg_sum_f32(float local_v) {
+float wg_sum(float local_v) {
     float sg_sum = subgroupAdd(local_v);
     if (NUM_SUBGROUPS == 1u)
         return sg_sum;

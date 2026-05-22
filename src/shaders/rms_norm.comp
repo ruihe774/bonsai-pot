@@ -47,7 +47,7 @@ void main() {
         s += v * v;
     }
 
-    float total = wg_sum_f32(s);
+    float total = wg_sum(s);
     float16_t inv_h = float16_t(inversesqrt(total / float(n) + p.eps));
     for (uint i = tid; i < n; i += WG) {
         act[out_base + i] = act[in_base + i] * inv_h * w[p.weight_offset + i];

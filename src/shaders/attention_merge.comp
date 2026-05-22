@@ -6,7 +6,7 @@
 // dispatch: (n_head, 1, 1). One workgroup per Q head. Three phases:
 //   A) Parallel chunk-max reduction across threads → m_global (wg_max).
 //   B) Parallel weight precompute into shmem + parallel sum of l_c*weight
-//      across threads → l_global (wg_sum_f32).
+//      across threads → l_global (wg_sum).
 //   C) Per-thread o accumulation using the precomputed weights, then write.
 
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
@@ -27,7 +27,7 @@ layout(set = 0, binding = 0, std430) buffer ActBuf { float16_t act[]; };
 layout(set = 0, binding = 1, std430) readonly buffer Partials { float partials[]; };
 
 // Apple sweep: WG=32 (1 simdgroup) + ELEMS_PER_THREAD=4 covers head_dim=128
-// in one pass and collapses wg_max/wg_sum_f32 to a single simd_max/simd_sum.
+// in one pass and collapses wg_max/wg_sum to a single simd_max/simd_sum.
 // Vulkan keeps WG=128 / EPT=1 since the inner phase-C loop's `tid + i*WG`
 // indexing reads sequential lanes per chunk and amortizes the partials load.
 #ifndef METAL_BACKEND
@@ -77,7 +77,7 @@ void main() {
         weights_sh[c] = w;
         l_local += l_c * w;
     }
-    float l_global = wg_sum_f32(l_local);
+    float l_global = wg_sum(l_local);
 
     // Phase C: per-thread o accumulation using precomputed weights.
     float o[ELEMS_PER_THREAD];

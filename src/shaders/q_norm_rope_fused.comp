@@ -50,7 +50,7 @@ void main() {
     uint q_idx = p.q_off + q_token_off + tid;
     float q_raw = float(act[q_idx]);
 
-    float inv_h = inversesqrt(wg_sum_f32(q_raw * q_raw) / float(HEAD_DIM) + p.eps);
+    float inv_h = inversesqrt(wg_sum(q_raw * q_raw) / float(HEAD_DIM) + p.eps);
 
     // ---- norm * weight, stash to shmem so RoPE can swap pairs ----
     rope_in_sh[tid] = float16_t(q_raw * inv_h) * w_norms[p.w_q_norm_off + tid];

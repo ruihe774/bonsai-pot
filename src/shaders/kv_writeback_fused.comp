@@ -78,7 +78,7 @@ void main() {
     f16vec4 wkn = f16vec4(w_norms[w_load + 0u], w_norms[w_load + 1u], w_norms[w_load + 2u], w_norms[w_load + 3u]);
 
     // ---- RMS sum-of-squares over the K head (128 elements) ----
-    float inv_h = inversesqrt(wg_sum_f32(dot(k_raw, k_raw)) / float(HEAD_DIM) + p.eps);
+    float inv_h = inversesqrt(wg_sum(dot(k_raw, k_raw)) / float(HEAD_DIM) + p.eps);
 
     // ---- normalize * w_k_norm, stash for the RoPE partner load ----
     f16vec4 k_normed = f16vec4(k_raw * inv_h) * wkn;

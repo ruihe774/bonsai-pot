@@ -65,7 +65,7 @@ void main() {
         vec4 x = vec4(act[b], act[b + 1u], act[b + 2u], act[b + 3u]);
         s += dot(x, x);
     }
-    float total_sq = wg_sum_f32(s);
+    float total_sq = wg_sum(s);
     if (tid == 0u) {
         inv_h_sh = inversesqrt(total_sq / float(p.k) + p.eps);
     }

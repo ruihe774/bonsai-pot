@@ -113,7 +113,7 @@ void main() {
         q1_x_sh[v] = xv4 * wv4;
     }
 
-    float inv_rms = inversesqrt(wg_sum_f32(ssq) / float(K) + p.eps);
+    float inv_rms = inversesqrt(wg_sum(ssq) / float(K) + p.eps);
 
 #ifndef METAL_BACKEND
     // ---- Stage 2: quantize each Q8_0 block (8 f16vec4) to Q8_0 ----
