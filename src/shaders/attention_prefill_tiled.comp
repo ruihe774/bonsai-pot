@@ -79,30 +79,7 @@ shared float sg_partial_amax[NUM_SUBGROUPS];
 
 #include "lib/q8_0_quantize.glsl"
 #include "lib/subgroup_reduce_v4.glsl"
-
-float load_k(uint t, uint e_local) {
-    uint elem_idx = t * p.kv_stride + e_local;
-    uint block_idx = elem_idx >> 5;
-    float scale = uintBitsToFloat(k_cache[p.k_d_word_offset + block_idx]);
-    uint qs_byte_idx = p.k_qs_byte_offset + elem_idx;
-    uint qs_word = k_cache[qs_byte_idx >> 2];
-    uint shift = (qs_byte_idx & 3u) << 3;
-    uint qs_byte = (qs_word >> shift) & 0xFFu;
-    int qs_signed = int(qs_byte << 24) >> 24;
-    return scale * float(qs_signed);
-}
-
-float load_v(uint t, uint e_local) {
-    uint elem_idx = t * p.kv_stride + e_local;
-    uint block_idx = elem_idx >> 5;
-    float scale = uintBitsToFloat(v_cache[p.v_d_word_offset + block_idx]);
-    uint qs_byte_idx = p.v_qs_byte_offset + elem_idx;
-    uint qs_word = v_cache[qs_byte_idx >> 2];
-    uint shift = (qs_byte_idx & 3u) << 3;
-    uint qs_byte = (qs_word >> shift) & 0xFFu;
-    int qs_signed = int(qs_byte << 24) >> 24;
-    return scale * float(qs_signed);
-}
+#include "lib/kv_cache_load.glsl"
 
 void write_block(float v, uint block_global) {
     // WG=32, so lane-in-block is exactly the local invocation id (0..31).
