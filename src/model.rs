@@ -543,13 +543,13 @@ pub const fn pick_subgroup_config(
 ///
 /// Asserts the macro actually appears in the source so a typo or missing
 /// `layout(constant_id = N)` is caught at load time rather than silently
-/// shipping a stale value.
+/// shipping a stale value. (Except slot 3, which is QUANT_FORMAT that is unused)
 #[cfg(target_vendor = "apple")]
 #[allow(clippy::panic, reason = "shaders are written by us")]
 fn msl_set_function_const_u32(src: &str, slot: u32, value: u32) -> String {
     let macro_name = format!("SPIRV_CROSS_CONSTANT_ID_{slot}");
     assert!(
-        src.contains(&macro_name),
+        src.contains(&macro_name) || slot == 3,
         "spec constant slot {slot} ({macro_name}) not referenced in MSL source"
     );
     format!("#define {macro_name} {value}u\n{src}")
@@ -1729,7 +1729,14 @@ impl Model {
             }};
         }
         let no_spec: &[(u32, u32)] = &[];
-        let quant_fmt_id: u32 = if cfg.quant_format == "Q2_0" { 1 } else { 0 };
+        let quant_fmt_id: u32 = if cfg.quant_format == "Q2_0" {
+            if cfg!(target_vendor = "apple") {
+                return Err(PotError::Config("Q2_0 is not supported in Metal backend"));
+            }
+            1
+        } else {
+            0
+        };
         let qf_spec: &[(u32, u32)] = &[(SPEC_QUANT_FORMAT, quant_fmt_id)];
 
         let sh_embed = load_shader!("embed", qf_spec, WG_EMBED);
