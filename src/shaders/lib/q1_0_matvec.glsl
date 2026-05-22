@@ -39,7 +39,7 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx) {
     [[unroll]] for (uint s = 0u; s < 4u; ++s) {
         uint qword = weights[qs_word_base + s];
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-            uint bits = (qword >> (i * 4u)) & 0xFu;
+            uint bits = (qword >> (i * 4u)); // & 0xFu;
             f16vec4 a4 = q1_x_sh[x_base + s * 8u + i];
             // Q1_0 sign convention: bit=1 → +a, bit=0 → -a.
             bvec4 sb = bvec4((bits & 1u) != 0u, (bits & 2u) != 0u, (bits & 4u) != 0u, (bits & 8u) != 0u);
