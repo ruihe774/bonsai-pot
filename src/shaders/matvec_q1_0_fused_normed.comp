@@ -159,13 +159,13 @@ void main() {
     }
 
     uint row_d_byte = d_off + local_row * nb_q1 * 2u;
-    uint row_qs_byte = qs_off + local_row * nb_q1 * 16u;
+    uint row_qs_byte = qs_off + local_row * nb_q1 * QS_BYTES_PER_BLOCK;
 
     float acc = 0.0;
     if (valid) {
         for (uint b = tx; b < nb_q1; b += WG_X) {
             float d_w = load_f16_at(row_d_byte + b * 2u);
-            uint qs_word_base = (row_qs_byte + b * 16u) >> 2;
+            uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2;
             acc += d_w * q1_0_block_dot(qs_word_base, b);
         }
     }

@@ -53,8 +53,8 @@ const uint PARTIAL_STRIDE = 130u; // head_dim + 2
 
 shared vec4 sg_partial4[NUM_SUBGROUPS];
 
-#include "lib/subgroup_reduce_v4.glsl"
 #include "lib/kv_cache_load.glsl"
+#include "lib/subgroup_reduce_v4.glsl"
 
 #ifndef METAL_BACKEND
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;

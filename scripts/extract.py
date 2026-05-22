@@ -2,12 +2,13 @@
 # /// script
 # requires-python = "~=3.10"
 # dependencies = [
-#   "gguf~=0.19",
+#   "gguf @ git+https://github.com/PrismML-Eng/llama.cpp.git#subdirectory=gguf-py",
 #   "numpy~=2.4",
 # ]
 # ///
 """
-Extract a Bonsai (Qwen3-family) Q1_0 GGUF into a flat directory the Rust runtime can load.
+Extract a Bonsai (Qwen3-family) Q1_0 or Q2_0 GGUF into a flat directory the
+Rust runtime can load.
 
 Output layout (under --out, default ./model):
   config.ini        hyperparams + tensor manifest (offsets & shapes within
@@ -23,9 +24,12 @@ Output layout (under --out, default ./model):
                     `scripts/bpe.py` to encode prompts; not consumed by
                     the Rust runtime.
 
-Q1_0 tensors are stored as their raw 18-byte blocks (LSB-first sign bits +
-FP16 d at the front). Per-row stride is (n_in / 128) * 18 bytes; rows are
-contiguous, total = n_out rows. Each tensor's region is 4-byte padded.
+Q1_0 tensors store 128-element blocks as 16 bytes of sign bits + 2-byte FP16
+scale (= 18 B/block); Q2_0 tensors store the same 128-element blocks as
+32 bytes of 2-bit codes + 2-byte FP16 scale (= 34 B/block). The model-wide
+format is autodetected from the GGUF; `quant_format` in `config.ini` records
+which one. Per row, we split into a d-array (FP16 scales) followed by a
+qs-array; both halves are u32-aligned. Each tensor's region is 4-byte padded.
 
 Norms (originally F32 in the GGUF) are downcast to F16 on disk so the
 runtime can bind them as `array<f16>` without a load-time conversion.
@@ -35,6 +39,7 @@ Prompts are NOT encoded here. Run `scripts/bpe.py` for that.
 Usage:
   uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
   uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
+  uv run scripts/extract.py path/to/Ternary-Bonsai-4B-Q2_0.gguf --out ./model-ternary-4b
 """
 import argparse, os, struct
 import gguf
@@ -48,9 +53,9 @@ def field_str(f):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Extract a Bonsai/Qwen3 Q1_0 GGUF into a flat model dir.",
+        description="Extract a Bonsai/Qwen3 Q1_0 or Q2_0 GGUF into a flat model dir.",
     )
-    ap.add_argument("gguf", help="path to a Bonsai-*.gguf (Qwen3 Q1_0 family)")
+    ap.add_argument("gguf", help="path to a Bonsai-*.gguf (Qwen3 Q1_0/Q2_0 family)")
     ap.add_argument("--out", default="./model",
                     help="output directory (default: ./model)")
     args = ap.parse_args()
@@ -87,20 +92,40 @@ def main():
     by_name = {t.name: t for t in r.tensors}
     n_layer = cfg["n_layer"]
 
-    QK1_0 = 128
-    BLK_BYTES = 18
+    QK = 128  # weights per block (same for Q1_0 and Q2_0)
+    # (gguf type, blk_bytes) per supported quant format.
+    QFORMATS = {
+        "Q1_0": (gguf.GGMLQuantizationType.Q1_0, 18),  # 2 d + 16 qs
+        "Q2_0": (gguf.GGMLQuantizationType.Q2_0, 34),  # 2 d + 32 qs
+    }
     def pad4(n):
         return (n + 3) & ~3
+
+    # Autodetect the model-wide quant format from the first Q tensor encountered.
+    # All Q tensors in a Bonsai model share a single format.
+    detected = None
+    for t in r.tensors:
+        for fmt, (gtype, _) in QFORMATS.items():
+            if t.tensor_type == gtype:
+                detected = fmt
+                break
+        if detected is not None:
+            break
+    if detected is None:
+        raise RuntimeError("no Q1_0 or Q2_0 tensors found in GGUF")
+    cfg["quant_format"] = detected
+    QUANT_GTYPE, QUANT_BLK_BYTES = QFORMATS[detected]
+    print(f"quant format: {detected} ({QUANT_BLK_BYTES} B/block)")
 
     manifest = {"tensors": {}}
 
     def write_tensor(out_f, t, name, expected_dtype):
         """Write tensor bytes to current output file with a layout suitable for
-        u32-aligned reads in WGSL. For Q1_0 we split into a d-array (FP16
-        scales) followed by a qs-array (raw 16-byte sign blocks). Both halves
-        are u32-aligned because n_rows*(K/128) is even for all our tensors.
-        For F32 we emit f32 contiguous; for F16 we emit f16 contiguous (the
-        GGUF source may be F32 or F16 — F32 sources are downcast on the fly)."""
+        u32-aligned reads in WGSL. For Q1_0/Q2_0 we split into a d-array (FP16
+        scales) followed by a qs-array (raw 16- or 32-byte code blocks). Both
+        halves are u32-aligned because n_rows*(K/128) is even for all our
+        tensors. For F32 we emit f32 contiguous; for F16 we emit f16 contiguous
+        (the GGUF source may be F32 or F16 — F32 sources are downcast on the fly)."""
         shape = [int(s) for s in t.shape]
         entry = {
             "dtype": expected_dtype,
@@ -109,11 +134,12 @@ def main():
             "offset": out_f.tell(),
         }
         data = t.data
-        if t.tensor_type == gguf.GGMLQuantizationType.Q1_0:
-            assert expected_dtype == "Q1_0", f"{name}: dtype mismatch"
+        if t.tensor_type == QUANT_GTYPE:
+            assert expected_dtype == detected, f"{name}: dtype mismatch"
             n_in, n_out = shape[0], shape[1] if len(shape) > 1 else 1
-            nb = n_in // QK1_0
-            raw = data.reshape(n_out, nb, BLK_BYTES)  # (n_out, nb, 18)
+            nb = n_in // QK
+            qs_bytes = QUANT_BLK_BYTES - 2
+            raw = data.reshape(n_out, nb, QUANT_BLK_BYTES)
             d_arr  = np.ascontiguousarray(raw[:, :, :2])
             qs_arr = np.ascontiguousarray(raw[:, :, 2:])
             d_offset = out_f.tell()
@@ -148,25 +174,27 @@ def main():
         entry["length"] = out_f.tell() - entry["offset"]
         manifest["tensors"][name] = entry
 
+    Q = detected  # "Q1_0" or "Q2_0"
+
     # ---- group A: weights_attn (per-layer Wq, Wk, Wv, Wo) -------------------
     with open(os.path.join(args.out, "weights_attn.bin"), "wb") as f:
         for il in range(n_layer):
             for tag in ("attn_q", "attn_k", "attn_v", "attn_output"):
                 name = f"blk.{il}.{tag}.weight"
-                write_tensor(f, by_name[name], name, "Q1_0")
+                write_tensor(f, by_name[name], name, Q)
 
     # ---- group B: weights_ffn_gate_up (Wgate, Wup) --------------------------
     with open(os.path.join(args.out, "weights_ffn_gate_up.bin"), "wb") as f:
         for il in range(n_layer):
             for tag in ("ffn_gate", "ffn_up"):
                 name = f"blk.{il}.{tag}.weight"
-                write_tensor(f, by_name[name], name, "Q1_0")
+                write_tensor(f, by_name[name], name, Q)
 
     # ---- group C: weights_ffn_down -----------------------------------------
     with open(os.path.join(args.out, "weights_ffn_down.bin"), "wb") as f:
         for il in range(n_layer):
             name = f"blk.{il}.ffn_down.weight"
-            write_tensor(f, by_name[name], name, "Q1_0")
+            write_tensor(f, by_name[name], name, Q)
 
     # ---- group D: weights_norms (norms downcast to F16 for the f16 runtime) ---
     with open(os.path.join(args.out, "weights_norms.bin"), "wb") as f:
@@ -183,9 +211,9 @@ def main():
     # n_vocab rows of n_embd elements — the right shape for both ops).
     cfg["tied_embeddings"] = "output.weight" not in by_name
     with open(os.path.join(args.out, "weights_embed_lmhead.bin"), "wb") as f:
-        write_tensor(f, by_name["token_embd.weight"], "token_embd.weight", "Q1_0")
+        write_tensor(f, by_name["token_embd.weight"], "token_embd.weight", Q)
         if not cfg["tied_embeddings"]:
-            write_tensor(f, by_name["output.weight"], "output.weight", "Q1_0")
+            write_tensor(f, by_name["output.weight"], "output.weight", Q)
 
     # ---- vocab dump --------------------------------------------------------
     n_vocab = cfg["n_vocab"]

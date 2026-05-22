@@ -77,9 +77,9 @@ shared vec4 sg_partial4[NUM_SUBGROUPS];
 // with the first write_block call.
 shared float sg_partial_amax[NUM_SUBGROUPS];
 
+#include "lib/kv_cache_load.glsl"
 #include "lib/q8_0_quantize.glsl"
 #include "lib/subgroup_reduce_v4.glsl"
-#include "lib/kv_cache_load.glsl"
 
 void write_block(float v, uint block_global) {
     // WG=32, so lane-in-block is exactly the local invocation id (0..31).

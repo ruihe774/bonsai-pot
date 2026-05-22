@@ -1,6 +1,6 @@
 #version 460
 
-// Q1_0 row gather: dequant ONE row of the embedding matrix into f16.
+// Q1_0 / Q2_0 row gather: dequant ONE row of the embedding matrix into f16.
 // Reads the row index (token_id) from `sample[sample_offset + wg.x]`; this
 // lets us chain steps on the GPU without a CPU round-trip — argmax of step
 // N writes the input token for step N+1.
@@ -22,6 +22,8 @@ layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t x[]; };
 layout(set = 0, binding = 2, std430) readonly buffer SampleBuf { uint sample_in[]; };
 
+#include "lib/q1_0_load.glsl"
+
 uint load_half_bits(uint b_offset) {
     uint word = weights[b_offset >> 2];
     return (word >> ((b_offset & 2) * 8)) & 0xFFFFu;
@@ -42,14 +44,31 @@ void main() {
         return;
     uint b = tid;
     uint d_bits = load_half_bits(p.d_offset + (row * nb + b) * 2u);
-    uint qs_b = p.qs_offset + (row * nb + b) * 16u;
+    uint qs_b = p.qs_offset + (row * nb + b) * QS_BYTES_PER_BLOCK;
     uint out_base = p.output_offset + gl_WorkGroupID.x * p.k + b * 128u;
-    for (uint k = 0u; k < 16u; ++k) {
-        uint qb = load_byte_at(qs_b + k);
-        for (uint bit = 0u; bit < 8u; ++bit) {
-            // bit==1 → +d; bit==0 → -d (XOR sign).
-            uint signed_bits = d_bits ^ (0x8000u & (((qb >> bit) & 1u) - 1));
-            x[out_base + k * 8u + bit] = uint16BitsToHalf(uint16_t(signed_bits));
+    if (QUANT_FORMAT == 0u) {
+        // Q1_0: 16 qs bytes/block, each byte = 8 sign bits.
+        [[unroll]]
+        for (uint k = 0u; k < 16u; ++k) {
+            uint qb = load_byte_at(qs_b + k);
+            [[unroll]]
+            for (uint bit = 0u; bit < 8u; ++bit) {
+                // bit==1 → +d; bit==0 → -d (XOR the FP16 sign bit).
+                uint signed_bits = d_bits ^ (0x8000u & (((qb >> bit) & 1u) - 1));
+                x[out_base + k * 8u + bit] = uint16BitsToHalf(uint16_t(signed_bits));
+            }
+        }
+    } else {
+        // Q2_0: 32 qs bytes/block, each byte = 4 codes of 2 bits;
+        // weight = (q - 1) * d for q ∈ {0,1,2,3}.
+        [[unroll]]
+        for (uint k = 0u; k < 32u; ++k) {
+            uint qb = load_byte_at(qs_b + k);
+            [[unroll]]
+            for (uint c = 0u; c < 4u; ++c) {
+                int q = int((qb >> (c * 2u)) & 0x3u);
+                x[out_base + k * 4u + c] = float16_t(q - 1) * uint16BitsToHalf(uint16_t(d_bits));
+            }
         }
     }
 }

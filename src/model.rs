@@ -60,6 +60,10 @@ pub struct ModelConfig {
     pub q_dim: u32,
     pub kv_dim: u32,
     pub tied_embeddings: bool,
+    /// Weight quantization format: "Q1_0" (binary signs, 16 B qs/block) or
+    /// "Q2_0" (ternary 2-bit codes, 32 B qs/block). Selected at extract time;
+    /// every Q tensor in `manifest` shares this format.
+    pub quant_format: &'static str,
     pub manifest: BTreeMap<String, TensorEntry>,
 }
 
@@ -415,6 +419,11 @@ impl ActLayout {
 pub const SPEC_SUBGROUP_SIZE: u32 = 0;
 pub const SPEC_MAX_CHUNKS: u32 = 1;
 pub const SPEC_N_EMBD_V4: u32 = 2;
+/// Weight quantization format selector for Q-tensor shaders: `0` = Q1_0
+/// (16 qs bytes/block, binary signs), `1` = Q2_0 (32 qs bytes/block, ternary
+/// 2-bit codes). Driver compilers fold the spec constant so the inactive arm
+/// of each `if (QUANT_FORMAT == ...)` branch is dead code.
+pub const SPEC_QUANT_FORMAT: u32 = 3;
 
 // ----- Per-kernel workgroup shapes ------------------------------------------
 //
@@ -946,8 +955,16 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
     fn intern_dtype(s: &str) -> Result<&'static str> {
         match s {
             "Q1_0" => Ok("Q1_0"),
+            "Q2_0" => Ok("Q2_0"),
             "F16" => Ok("F16"),
             _ => Err(PotError::Config("manifest: unknown dtype")),
+        }
+    }
+    fn intern_quant_format(s: &str) -> Result<&'static str> {
+        match s {
+            "Q1_0" => Ok("Q1_0"),
+            "Q2_0" => Ok("Q2_0"),
+            _ => Err(PotError::Config("config: unknown quant_format")),
         }
     }
     fn intern_buffer(s: &str) -> Result<&'static str> {
@@ -1026,6 +1043,7 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
         q_dim: parse_field(g, "q_dim")?,
         kv_dim: parse_field(g, "kv_dim")?,
         tied_embeddings: get(g, "tied_embeddings")? == "true",
+        quant_format: intern_quant_format(get(g, "quant_format")?)?,
         manifest,
     })
 }
@@ -1071,48 +1089,34 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
     let kv_dim = cfg.kv_dim;
     let n_vocab = cfg.n_vocab;
     let head_dim = cfg.head_dim;
+    let qf = cfg.quant_format; // "Q1_0" or "Q2_0"
 
     // Per-layer tensors (iterated over all layers).
     let layer_specs: &[(&str, &str, &[u32], &str)] = &[
-        (
-            "attn_q.weight",
-            "Q1_0",
-            &[n_embd, q_dim],
-            "weights_attn.bin",
-        ),
-        (
-            "attn_k.weight",
-            "Q1_0",
-            &[n_embd, kv_dim],
-            "weights_attn.bin",
-        ),
-        (
-            "attn_v.weight",
-            "Q1_0",
-            &[n_embd, kv_dim],
-            "weights_attn.bin",
-        ),
+        ("attn_q.weight", qf, &[n_embd, q_dim], "weights_attn.bin"),
+        ("attn_k.weight", qf, &[n_embd, kv_dim], "weights_attn.bin"),
+        ("attn_v.weight", qf, &[n_embd, kv_dim], "weights_attn.bin"),
         (
             "attn_output.weight",
-            "Q1_0",
+            qf,
             &[q_dim, n_embd],
             "weights_attn.bin",
         ),
         (
             "ffn_gate.weight",
-            "Q1_0",
+            qf,
             &[n_embd, n_ff],
             "weights_ffn_gate_up.bin",
         ),
         (
             "ffn_up.weight",
-            "Q1_0",
+            qf,
             &[n_embd, n_ff],
             "weights_ffn_gate_up.bin",
         ),
         (
             "ffn_down.weight",
-            "Q1_0",
+            qf,
             &[n_ff, n_embd],
             "weights_ffn_down.bin",
         ),
@@ -1136,7 +1140,7 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
         ("output_norm.weight", "F16", &[n_embd], "weights_norms.bin"),
         (
             "token_embd.weight",
-            "Q1_0",
+            qf,
             &[n_embd, n_vocab],
             "weights_embed_lmhead.bin",
         ),
@@ -1156,27 +1160,29 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
             return Err(PotError::Config("manifest: tensor is in wrong buffer file"));
         }
         match dtype {
-            "Q1_0" => {
+            "Q1_0" | "Q2_0" => {
+                let qs_bytes_per_block: u32 = if dtype == "Q1_0" { 16 } else { 32 };
                 let n_in = shape[0];
                 let n_out = if shape.len() > 1 { shape[1] } else { 1 };
                 if !n_in.is_multiple_of(128) {
                     return Err(PotError::Config(
-                        "manifest: Q1_0 tensor n_in not divisible by 128",
+                        "manifest: Q-tensor n_in not divisible by 128",
                     ));
                 }
                 let nb = n_in / 128;
                 if e.nb != nb {
-                    return Err(PotError::Config("manifest: Q1_0 tensor nb != n_in/128"));
+                    return Err(PotError::Config("manifest: Q-tensor nb != n_in/128"));
                 }
                 let expected_qs_offset = pad4(e.d_offset + n_out * nb * 2);
                 if e.qs_offset != expected_qs_offset {
                     return Err(PotError::Config(
-                        "manifest: Q1_0 tensor qs_offset != pad4(d_offset + n_out*nb*2)",
+                        "manifest: Q-tensor qs_offset != pad4(d_offset + n_out*nb*2)",
                     ));
                 }
-                let expected_length = (e.qs_offset - e.d_offset) + pad4(n_out * nb * 16);
+                let expected_length =
+                    (e.qs_offset - e.d_offset) + pad4(n_out * nb * qs_bytes_per_block);
                 if e.length != expected_length {
-                    return Err(PotError::Config("manifest: Q1_0 tensor length mismatch"));
+                    return Err(PotError::Config("manifest: Q-tensor length mismatch"));
                 }
             }
             "F16" => {
@@ -1202,7 +1208,7 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
     if !cfg.tied_embeddings {
         check(
             "output.weight",
-            "Q1_0",
+            qf,
             &[n_embd, n_vocab],
             "weights_embed_lmhead.bin",
         )?;
@@ -1723,24 +1729,27 @@ impl Model {
             }};
         }
         let no_spec: &[(u32, u32)] = &[];
+        let quant_fmt_id: u32 = if cfg.quant_format == "Q2_0" { 1 } else { 0 };
+        let qf_spec: &[(u32, u32)] = &[(SPEC_QUANT_FORMAT, quant_fmt_id)];
 
-        let sh_embed = load_shader!("embed", no_spec, WG_EMBED);
+        let sh_embed = load_shader!("embed", qf_spec, WG_EMBED);
         let sh_rms = load_shader!(
             "rms_norm",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_rms)],
             WG_RMS_NORM
         );
-        let sh_matvec = load_shader!("matvec_q1_0", no_spec, WG_MATVEC);
-        let sh_matvec_silu = load_shader!("matvec_q1_0_silu", no_spec, WG_MATVEC_SILU);
+        let sh_matvec = load_shader!("matvec_q1_0", qf_spec, WG_MATVEC);
+        let sh_matvec_silu = load_shader!("matvec_q1_0_silu", qf_spec, WG_MATVEC_SILU);
         let sh_matvec_fused_normed = load_shader!(
             "matvec_q1_0_fused_normed",
             &[
                 (SPEC_SUBGROUP_SIZE, sg_spec_matvec_fused_normed),
                 (SPEC_N_EMBD_V4, cfg.n_embd / 4),
+                (SPEC_QUANT_FORMAT, quant_fmt_id),
             ],
             WG_MATVEC_FUSED_NORMED
         );
-        let sh_matmul = load_shader!("matmul_q1_0_q8_0", no_spec, WG_MATMUL);
+        let sh_matmul = load_shader!("matmul_q1_0_q8_0", qf_spec, WG_MATMUL);
         let sh_attn_prefill_tiled = load_shader!(
             "attention_prefill_tiled",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_prefill_tiled)],
@@ -2180,6 +2189,7 @@ mod tests {
             q_dim: 4_096,
             kv_dim: 1_024,
             tied_embeddings: true,
+            quant_format: "Q1_0",
             manifest: BTreeMap::new(),
         }
     }
@@ -2202,6 +2212,7 @@ mod tests {
             q_dim: 8,
             kv_dim: 8,
             tied_embeddings: false,
+            quant_format: "Q1_0",
             manifest: BTreeMap::new(),
         }
     }

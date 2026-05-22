@@ -1,8 +1,12 @@
 #version 460
 
-// dotPacked4x8EXT matmul: Q1_0 weights × Q8_0 activations -> f16 output.
+// dotPacked4x8EXT matmul: Q1_0/Q2_0 weights × Q8_0 activations -> f16 output.
 //
-// 64×64 tile, 256 threads, each thread = 4×4 = 16 cells.
+// 64×64 tile, 256 threads, each thread = 4×4 = 16 cells. The decode step
+// (filling `w[TN][8]` packed-i8 weight quads per Q8_0 sub-block) branches on
+// QUANT_FORMAT — Q1_0 unpacks 8 nibbles per qword via expand_4_bits, Q2_0
+// unpacks 4 bytes from each of 2 qwords via expand_8_bits — but the TM × dp4a
+// accumulation that consumes those quads is shared between formats.
 
 layout(push_constant) uniform Params {
     uint k;
@@ -32,7 +36,7 @@ const uint TILE_N = 64u;
 const uint TILE_M = 64u;
 
 shared float w_d_lds[64];
-shared uint w_bits_lds[256];
+shared uint w_bits_lds[256 << QUANT_FORMAT];
 shared float a_d_lds[256];
 shared uint a_qs_lds[2048];
 
@@ -67,11 +71,13 @@ void main() {
             uint n_idx = n_base + tid;
             w_d_lds[tid] = load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
         }
-        {
+        // Each thread loads one qword per pass; Q1_0 = 1 pass, Q2_0 = 2 passes
+        // (4 qwords/block × 64 rows = 256 loads per pass = 1 per thread).
+        [[unroll]] for (uint pass = 0u; pass < (W_QWORDS_PER_BLOCK / 4u); ++pass) {
             uint n_local = tid / 4u;
-            uint s = tid % 4u;
+            uint s = (tid % 4u) + pass * 4u;
             uint n_idx = n_base + n_local;
-            uint off = p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u;
+            uint off = p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + s * 4u;
             w_bits_lds[s * 64u + n_local] = weights[off >> 2];
         }
         {
@@ -95,19 +101,26 @@ void main() {
         float wd[TN];
         [[unroll]] for (uint tn = 0u; tn < TN; ++tn) { wd[tn] = w_d_lds[lx * TN + tn]; }
 
-        // Hoist the 4 × TN sign-words out of the s-loop so all LDS reads are
-        // issued up front and the compiler can overlap them with the dot/FMA
-        // work below. Only 16 uints / thread → no register pressure issue.
-        uint bw_all[4u * TN];
-        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
-            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) { bw_all[s * TN + tn] = w_bits_lds[s * 64u + lx * TN + tn]; }
-        }
-
+        // 4 Q8_0 sub-blocks per Q1_0 block. The decode step differs by format
+        // (Q1_0: 1 qword/sub-block, 8 nibbles via expand_4_bits; Q2_0: 2
+        // qwords/sub-block, 4 bytes each via expand_8_bits) but the resulting
+        // 8 packed-i8 weight quads feed an identical TM × dp4a accumulation.
         [[unroll]] for (uint s = 0u; s < 4u; ++s) {
             uint w[TN][8];
-            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-                uint bw = bw_all[s * TN + tn];
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
+            if (QUANT_FORMAT == 0u) {
+                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                    uint bw = w_bits_lds[s * 64u + lx * TN + tn];
+                    [[unroll]] for (uint i = 0u; i < 8u; ++i) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
+                }
+            } else {
+                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                    [[unroll]] for (uint wq = 0u; wq < 2u; ++wq) {
+                        uint qword = w_bits_lds[(s * 2u + wq) * 64u + lx * TN + tn];
+                        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                            w[tn][wq * 4u + i] = expand_8_bits((qword >> (i * 8u)) & 0xFFu);
+                        }
+                    }
+                }
             }
 
             [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
