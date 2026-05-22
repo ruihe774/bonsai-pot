@@ -484,6 +484,19 @@ mod tests {
         assert!(KvSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_json_roundtrip() {
+        let snap = make_snap(4, 64, 128, 8);
+        let json = serde_json::to_string(&snap).unwrap();
+        let snap2: KvSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap2.pos, snap.pos);
+        assert_eq!(snap2.n_layer, snap.n_layer);
+        assert_eq!(snap2.kv_dim, snap.kv_dim);
+        assert_eq!(snap2.max_seq, snap.max_seq);
+        assert_eq!(snap2.payload, snap.payload);
+    }
+
     #[test]
     fn getters_match_header() {
         let snap = make_snap(36, 1024, 512, 64);

@@ -2197,6 +2197,62 @@ mod tests {
         assert_eq!(TOPK_MAX, 32);
     }
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_json_roundtrip_model_config() {
+        let mut cfg = bonsai4b_cfg();
+        cfg.manifest.insert(
+            "token_embd.weight".to_string(),
+            TensorEntry {
+                dtype: "Q1_0".to_string(),
+                shape: alloc::vec![151_936, 2560],
+                buffer: "weights_embed_lmhead".to_string(),
+                offset: 0,
+                length: 1234,
+                d_offset: 0,
+                qs_offset: 4096,
+                nb: 80,
+            },
+        );
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: ModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg2.n_layer, cfg.n_layer);
+        assert_eq!(cfg2.n_embd, cfg.n_embd);
+        assert_eq!(cfg2.rope_freq_base, cfg.rope_freq_base);
+        assert_eq!(cfg2.tied_embeddings, cfg.tied_embeddings);
+        assert_eq!(cfg2.manifest.len(), 1);
+        let te = &cfg2.manifest["token_embd.weight"];
+        assert_eq!(te.dtype, "Q1_0");
+        assert_eq!(te.shape, alloc::vec![151_936u64, 2560]);
+        assert_eq!(te.qs_offset, 4096);
+        assert_eq!(te.nb, 80);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_json_roundtrip_model_snapshot() {
+        let snap = ModelSnapshot {
+            config: bonsai4b_cfg(),
+            w_attn: alloc::vec![1, 2, 3, 4],
+            w_ffn_gate_up: alloc::vec![5, 6],
+            w_ffn_down: alloc::vec![7, 8, 9],
+            w_norms: alloc::vec![10],
+            w_embed_lmhead: alloc::vec![11, 12, 13, 14, 15],
+            vocab_bytes: alloc::vec![b'a', b'b', b'c'],
+            vocab_offsets: alloc::vec![0, 1, 2, 3],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let snap2: ModelSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap2.w_attn, snap.w_attn);
+        assert_eq!(snap2.w_ffn_gate_up, snap.w_ffn_gate_up);
+        assert_eq!(snap2.w_ffn_down, snap.w_ffn_down);
+        assert_eq!(snap2.w_norms, snap.w_norms);
+        assert_eq!(snap2.w_embed_lmhead, snap.w_embed_lmhead);
+        assert_eq!(snap2.vocab_bytes, snap.vocab_bytes);
+        assert_eq!(snap2.vocab_offsets, snap.vocab_offsets);
+        assert_eq!(snap2.config.n_layer, snap.config.n_layer);
+    }
+
     #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn pick_subgroup_config_branches() {
