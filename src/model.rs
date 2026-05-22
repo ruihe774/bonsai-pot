@@ -2199,7 +2199,7 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn serde_json_roundtrip_model_config() {
+    fn serde_postcard_roundtrip_model_config() {
         let mut cfg = bonsai4b_cfg();
         cfg.manifest.insert(
             "token_embd.weight".to_string(),
@@ -2214,8 +2214,8 @@ mod tests {
                 nb: 80,
             },
         );
-        let json = serde_json::to_string(&cfg).unwrap();
-        let cfg2: ModelConfig = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&cfg).unwrap();
+        let cfg2: ModelConfig = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(cfg2.n_layer, cfg.n_layer);
         assert_eq!(cfg2.n_embd, cfg.n_embd);
         assert_eq!(cfg2.rope_freq_base, cfg.rope_freq_base);
@@ -2230,7 +2230,7 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn serde_json_roundtrip_model_snapshot() {
+    fn serde_postcard_roundtrip_model_snapshot() {
         let snap = ModelSnapshot {
             config: bonsai4b_cfg(),
             w_attn: alloc::vec![1, 2, 3, 4],
@@ -2241,8 +2241,8 @@ mod tests {
             vocab_bytes: alloc::vec![b'a', b'b', b'c'],
             vocab_offsets: alloc::vec![0, 1, 2, 3],
         };
-        let json = serde_json::to_string(&snap).unwrap();
-        let snap2: ModelSnapshot = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        let snap2: ModelSnapshot = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(snap2.w_attn, snap.w_attn);
         assert_eq!(snap2.w_ffn_gate_up, snap.w_ffn_gate_up);
         assert_eq!(snap2.w_ffn_down, snap.w_ffn_down);

@@ -486,10 +486,15 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn serde_json_roundtrip() {
+    fn serde_postcard_roundtrip() {
         let snap = make_snap(4, 64, 128, 8);
-        let json = serde_json::to_string(&snap).unwrap();
-        let snap2: KvSnapshot = serde_json::from_str(&json).unwrap();
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        // Postcard encodes Vec<u8> as a length-prefixed byte block (varint len
+        // + raw bytes), so the encoded size should be just slightly larger
+        // than the payload itself — not the ~3× blowup JSON's number-array
+        // encoding would produce.
+        assert!(bytes.len() < snap.payload.len() + 64);
+        let snap2: KvSnapshot = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(snap2.pos, snap.pos);
         assert_eq!(snap2.n_layer, snap.n_layer);
         assert_eq!(snap2.kv_dim, snap.kv_dim);
