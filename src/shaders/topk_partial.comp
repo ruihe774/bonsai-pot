@@ -81,19 +81,17 @@ void main() {
         sh_idx[base + i] = 0u;
     }
     for (uint w = w_lo + tid; w < w_hi; w += WG) {
-        // unpackFloat2x16 widens the f16 pair to vec2 (f32); cast back to f16 for
-        // the shmem heap (lossless — f16→f32 is exact).
-        vec2 pair_f32 = unpackFloat2x16(logits[in_word_off + w]);
+        f16vec2 pair_f32 = uint16BitsToFloat16(unpack16(logits[in_word_off + w]));
         uint i0 = w << 1;
         uint i1 = i0 + 1u;
-        float16_t v0 = float16_t(pair_f32.x);
+        float16_t v0 = pair_f32.x;
         if (i0 < i_hi && v0 > sh_val[base]) {
             sh_val[base] = v0;
             sh_idx[base] = i0;
             sift_down(base);
         }
         if (i1 < i_hi) {
-            float16_t v1 = float16_t(pair_f32.y);
+            float16_t v1 = pair_f32.y;
             if (v1 > sh_val[base]) {
                 sh_val[base] = v1;
                 sh_idx[base] = i1;
