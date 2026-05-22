@@ -120,8 +120,8 @@ void main() {
     ak = max(ak, subgroupShuffleXor(ak, 4u));
     av = max(av, subgroupShuffleXor(av, 4u));
 
-    uint pk = packSnorm4x8(k_post / ak);
-    uint pv = packSnorm4x8(v_raw / av);
+    uint pk = packSnorm4x8(k_post / max(ak, 1e-30));
+    uint pv = packSnorm4x8(v_raw / max(av, 1e-30));
 
     uint pos_abs = p.pos_base + tok;
     uint block_in_head = tid / LANES_PER_BLOCK;                 // 0..3

@@ -128,7 +128,7 @@ void main() {
         // Don't fold inv_rms here — apply it once at row-write below.
         q1_a_d_sh[tid] = max_abs / 127.0;
         [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-            q1_a_qs_sh[i * NB_Q8 + tid] = packSnorm4x8(vec4(q1_x_sh[block_v4_base + i]) / max_abs);
+            q1_a_qs_sh[i * NB_Q8 + tid] = packSnorm4x8(vec4(q1_x_sh[block_v4_base + i]) / max(max_abs, 1e-30));
         }
     }
     barrier();

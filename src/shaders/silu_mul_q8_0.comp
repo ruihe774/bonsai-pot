@@ -77,7 +77,7 @@ void main() {
         m = max(m, subgroupShuffleXor(m, 2u));
         m = max(m, subgroupShuffleXor(m, 4u));
 
-        outbuf[qs_token_word + block_global * 8u + lane_in_block] = packSnorm4x8(v / m);
+        outbuf[qs_token_word + block_global * 8u + lane_in_block] = packSnorm4x8(v / max(m, 1e-30));
         if (lane_in_block == 0u) {
             outbuf[d_token_word + block_global] = floatBitsToUint(m / 127.0);
         }

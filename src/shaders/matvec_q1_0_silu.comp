@@ -103,7 +103,7 @@ void main() {
             float max_abs = float(max_abs_h);
             q1_a_d_sh[tid] = max_abs / 127.0;
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                q1_a_qs_sh[i * Q1_NB_Q8 + tid] = packSnorm4x8(vec4(v[i]) / max_abs);
+                q1_a_qs_sh[i * Q1_NB_Q8 + tid] = packSnorm4x8(vec4(v[i]) / max(max_abs, 1e-30));
             }
         }
 #else
