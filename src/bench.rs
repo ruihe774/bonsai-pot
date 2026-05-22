@@ -10,20 +10,21 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Instant;
 
-#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+#[cfg(not(feature = "ci"))]
 use wgpu::PollType;
 
 #[cfg(not(feature = "ci"))]
 use super::BenchMarker;
-#[cfg(any(feature = "ci", not(target_vendor = "apple")))]
 use super::NoMarker;
 #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
-use super::{MicroMarker, Session};
+use super::MicroMarker;
+#[cfg(not(feature = "ci"))]
+use super::Session;
 use super::{
     Result, StepEncoder, encode_step_matvec, prefill_matmul_topk, step_matvec_no_sample,
     upload_sample, wait_topk_readback,
 };
-#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+#[cfg(not(feature = "ci"))]
 use crate::error::PotError;
 use crate::model::Model;
 use crate::session::{GenerateOptions, Sampler};
@@ -257,8 +258,13 @@ pub fn bench(model: &Model, pp_n: u32, tg_n: u32, repeats: u32) -> Result<()> {
 /// attention scans a single KV entry, which is unrepresentative. The KV cache
 /// is pre-filled with `pos` no-readback steps before measurement so attention
 /// sees `pos+1` cached tokens on each measured step.
-#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+#[cfg(not(feature = "ci"))]
 pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    assert!(
+        no_marker,
+        "microbench_tg on Metal requires no_marker=true (no TIMESTAMP_QUERY_INSIDE_PASSES)"
+    );
     if pos >= model.max_seq {
         return Err(PotError::ContextOverflow {
             pos,
@@ -284,9 +290,14 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
     // Each measurement is a single submit (no extra resolve submit), giving
     // deterministic submit indices for external profilers like Nsight Graphics
     // GPU Trace, which select work via --start-after-submits / --limit-to-submits.
+    // The Metal-capture guard (when MTL_CAPTURE_ENABLED=1) is scoped exactly
+    // to the measured submits, so the .gputrace excludes warmup and the
+    // pos-positions KV pre-fill.
     if no_marker {
         // warmup
         run_uninstrumented_step(&session, pos)?;
+        #[cfg(target_vendor = "apple")]
+        let _capture_guard = crate::capture::start_capture_if_enabled(model, "tg");
         eprintln!(">>> PROFILE BEGIN: tg measurement ({repeats} submit(s)) <<<");
         for _ in 0..repeats {
             run_uninstrumented_step(&session, pos)?;
@@ -295,8 +306,16 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
         return Ok(());
     }
 
+    #[cfg(target_vendor = "apple")]
+    unreachable!("microbench_tg: instrumented path is not compiled on Metal");
+    #[cfg(not(target_vendor = "apple"))]
+    microbench_tg_instrumented(&session, pos, repeats)
+}
+
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+fn microbench_tg_instrumented(session: &Session<'_>, pos: u32, repeats: u32) -> Result<()> {
     // warm up: one instrumented step at the measurement pos
-    let _ = run_instrumented_step(&session, pos)?;
+    let _ = run_instrumented_step(session, pos)?;
 
     // Per-label, per-repeat aggregate: sum of all occurrences in one step
     // (i.e. n_layer for per-layer labels, 1 for globals). Storing per-step
@@ -306,7 +325,7 @@ pub fn microbench_tg(model: &Model, pos: u32, repeats: u32, no_marker: bool) -> 
     let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
 
     for _ in 0..repeats {
-        let spans = run_instrumented_step(&session, pos)?;
+        let spans = run_instrumented_step(session, pos)?;
         let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
         for (label, ns) in &spans {
             let e = step_label_sum.entry(*label).or_insert((0, 0.0));
@@ -392,7 +411,7 @@ fn run_instrumented_step(session: &Session<'_>, pos: u32) -> Result<Vec<(&'stati
 /// Like [`run_instrumented_step`] but with no per-kernel timestamp marker —
 /// used in `--no-marker` profiling mode so the measurement is exactly one submit
 /// with no resolve submit afterward.
-#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+#[cfg(not(feature = "ci"))]
 fn run_uninstrumented_step(session: &Session<'_>, pos: u32) -> Result<()> {
     let tok: u32 = 1;
     let mut se = StepEncoder::new(session);
@@ -420,8 +439,13 @@ fn run_uninstrumented_step(session: &Session<'_>, pos: u32) -> Result<()> {
 /// measurement so the measured prefill runs at `pos_base = m` — the matmul
 /// attention then scans `[0, m + m_tok]` per query, exercising the realistic
 /// "prefill into an existing context" path rather than always starting at 0.
-#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+#[cfg(not(feature = "ci"))]
 pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    assert!(
+        no_marker,
+        "microbench_pp on Metal requires no_marker=true (no TIMESTAMP_QUERY_INSIDE_PASSES)"
+    );
     let m = m.min(model.m_max);
     if m == 0 {
         return Err(PotError::PrefillTooLarge {
@@ -465,6 +489,10 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
             model.check_device()?;
             return Err(PotError::Poll(e));
         }
+        // Scope the Metal capture (when MTL_CAPTURE_ENABLED=1) to just the
+        // measured submits so the .gputrace stays small enough to replay.
+        #[cfg(target_vendor = "apple")]
+        let _capture_guard = crate::capture::start_capture_if_enabled(model, "pp");
         eprintln!(">>> PROFILE BEGIN: pp measurement ({repeats} submit(s)) <<<");
         for _ in 0..repeats {
             let _ = prefill_matmul_topk(&session, &prompt, pos_base, 1, &mut NoMarker)?;
@@ -477,15 +505,29 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
         return Ok(());
     }
 
+    #[cfg(target_vendor = "apple")]
+    unreachable!("microbench_pp: instrumented path is not compiled on Metal");
+    #[cfg(not(target_vendor = "apple"))]
+    microbench_pp_instrumented(&session, &prompt, pos_base, m, repeats)
+}
+
+#[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+fn microbench_pp_instrumented(
+    session: &Session<'_>,
+    prompt: &[u32],
+    pos_base: u32,
+    m: u32,
+    repeats: u32,
+) -> Result<()> {
     // warm up
-    let _ = run_instrumented_prefill(&session, &prompt, pos_base)?;
+    let _ = run_instrumented_prefill(session, prompt, pos_base)?;
 
     let mut per_step_label_ns: HashMap<&'static str, Vec<f32>> = HashMap::new();
     let mut calls_per_step: HashMap<&'static str, u32> = HashMap::new();
     let mut step_totals_ns: Vec<f32> = Vec::with_capacity(repeats as usize);
 
     for _ in 0..repeats {
-        let spans = run_instrumented_prefill(&session, &prompt, pos_base)?;
+        let spans = run_instrumented_prefill(session, prompt, pos_base)?;
         let mut step_label_sum: HashMap<&'static str, (u32, f32)> = HashMap::new();
         for (label, ns) in &spans {
             let e = step_label_sum.entry(*label).or_insert((0, 0.0));

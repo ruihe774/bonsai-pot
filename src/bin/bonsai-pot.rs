@@ -233,12 +233,14 @@ fn main() {
         }
         "microbench" => {
             #[cfg(target_vendor = "apple")]
-            {
-                let _ = args.no_marker;
-                eprintln!("microbench mode is not supported on the Metal backend");
+            if !args.no_marker {
+                eprintln!(
+                    "microbench on the Metal backend requires --no-marker (Metal does not \
+                     support TIMESTAMP_QUERY_INSIDE_PASSES)"
+                );
                 exit(3);
             }
-            #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+            #[cfg(not(feature = "ci"))]
             {
                 __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker)
                     .unwrap_or_else(|e| {

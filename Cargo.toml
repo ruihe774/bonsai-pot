@@ -51,6 +51,9 @@ ash = "0.38"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "staging", default-features = false, features = ["std", "parking_lot", "metal"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLCaptureManager"] }
 
 [dev-dependencies]
 env_logger = "0.11"
