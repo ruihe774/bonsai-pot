@@ -45,7 +45,7 @@ bench-internals = ["dep:env_logger", "std"]
 ci = ["bench-internals"]
 # Derive `serde::{Serialize, Deserialize}` for `ModelConfig`, `ModelSnapshot`,
 # `TensorEntry`, and `KvSnapshot` so they can be persisted in any serde format.
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde_bytes"]
 
 [dependencies]
 # Library deps.
@@ -55,6 +55,7 @@ log = { version = "0.4", default-features = false }
 once_cell = { version = "1", default-features = false, features = ["parking_lot"] }
 thiserror = { version = "2", default-features = false }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"], optional = true }
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
 env_logger = { version = "0.11", optional = true }

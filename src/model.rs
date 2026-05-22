@@ -94,18 +94,25 @@ pub struct ModelSnapshot {
     /// Parsed `config.ini` contents.
     pub config: ModelConfig,
     /// Contents of `weights_attn.bin`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub w_attn: Vec<u8>,
     /// Contents of `weights_ffn_gate_up.bin`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub w_ffn_gate_up: Vec<u8>,
     /// Contents of `weights_ffn_down.bin`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub w_ffn_down: Vec<u8>,
     /// Contents of `weights_norms.bin`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub w_norms: Vec<u8>,
     /// Contents of `weights_embed_lmhead.bin`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub w_embed_lmhead: Vec<u8>,
     /// Contents of `vocab.bin`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub vocab_bytes: Vec<u8>,
     /// Contents of `vocab_offsets.bin` (little-endian `u32` stream).
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub vocab_offsets: Vec<u8>,
 }
 

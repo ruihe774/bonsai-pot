@@ -43,6 +43,7 @@ pub struct KvSnapshot {
     max_seq: u32,
     pos: u32,
     /// K bytes then V bytes, in canonical packed order (see module docs).
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     payload: Vec<u8>,
 }
 
