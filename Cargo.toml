@@ -31,7 +31,7 @@ default = ["std"]
 # Enable std-dependent functionality: filesystem-backed model loading
 # (`Model::load`, `Model::load_with_options`, `ModelWeights::from_dir`) and the
 # `PotError::Io` variant. Without this feature the crate is `no_std + alloc`;
-# callers must supply pre-loaded bytes via `Model::load_with_weights`.
+# callers must supply pre-loaded bytes via `Model::load_from_snapshot`.
 std = [
     "half/std",
     "log/std",

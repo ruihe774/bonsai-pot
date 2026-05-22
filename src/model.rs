@@ -79,7 +79,7 @@ impl ModelConfig {
 
 /// Pre-loaded model weights and metadata.
 ///
-/// Pass to [`Model::load_with_weights`] to initialise the engine without any
+/// Pass to [`Model::load_from_snapshot`] to initialise the engine without any
 /// filesystem access. Callers can obtain a `ModelSnapshot` by:
 ///
 /// - Calling [`ModelSnapshot::from_dir`] (requires the `std` feature) to read
@@ -1219,10 +1219,10 @@ impl Model {
     /// subgroup size is unsupported, or the vocab files are malformed.
     #[cfg(feature = "std")]
     pub fn load_from_dir(model_dir: impl AsRef<Path>, opts: LoadOptions) -> Result<Self> {
-        Self::load_with_weights(ModelSnapshot::from_dir(model_dir)?, opts)
+        Self::load_from_snapshot(ModelSnapshot::from_dir(model_dir)?, opts)
     }
 
-    /// Build pipelines and allocate the KV cache from pre-loaded `weights`.
+    /// Build pipelines and allocate the KV cache from pre-loaded `snapshot`.
     ///
     /// This is the primary entry point in `no_std` environments. Callers
     /// supply the model bytes directly (e.g. via `include_bytes!`, mmap, or
@@ -1233,11 +1233,11 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// Returns an error if `opts.max_seq == 0`, the weights or config are
+    /// Returns an error if `opts.max_seq == 0`, the snapshot or config are
     /// malformed, no suitable wgpu adapter is available, the adapter does not
     /// support the required features (`SHADER_F16`, `SUBGROUP`), the runtime
     /// subgroup size is unsupported, or the vocab files are malformed.
-    pub fn load_with_weights(weights: ModelSnapshot, opts: LoadOptions) -> Result<Self> {
+    pub fn load_from_snapshot(snapshot: ModelSnapshot, opts: LoadOptions) -> Result<Self> {
         // Per-session buffer sizing constants (sample / staging / readback /
         // bench query-set) live in `SessionState::new`. Only the BGL helper
         // is hoisted here so we don't trip items-after-statements lints.
@@ -1257,7 +1257,7 @@ impl Model {
         if opts.max_seq == 0 {
             return Err(PotError::Config("max_seq must be > 0"));
         }
-        let cfg = weights.config;
+        let cfg = snapshot.config;
         validate_cfg(&cfg)?;
 
         // ---- wgpu init ------------------------------------------------------
@@ -1540,11 +1540,11 @@ impl Model {
                 usage: w_storage,
             })
         };
-        let w_attn = make_storage("w_attn", &weights.w_attn);
-        let w_ffn_gu = make_storage("w_ffn_gu", &weights.w_ffn_gate_up);
-        let w_ffn_d = make_storage("w_ffn_d", &weights.w_ffn_down);
-        let w_norms = make_storage("w_norms", &weights.w_norms);
-        let w_embed = make_storage("w_embed", &weights.w_embed_lmhead);
+        let w_attn = make_storage("w_attn", &snapshot.w_attn);
+        let w_ffn_gu = make_storage("w_ffn_gu", &snapshot.w_ffn_gate_up);
+        let w_ffn_d = make_storage("w_ffn_d", &snapshot.w_ffn_down);
+        let w_norms = make_storage("w_norms", &snapshot.w_norms);
+        let w_embed = make_storage("w_embed", &snapshot.w_embed_lmhead);
 
         // ---- build RoPE table (f32 host-side, then downcast to f16) --------
         let rope_table_f32 = build_rope_table(&cfg, opts.max_seq);
@@ -1930,13 +1930,13 @@ impl Model {
         };
 
         // ---- vocab ----------------------------------------------------------
-        let offs: &[u32] = cast_slice(&weights.vocab_offsets);
+        let offs: &[u32] = cast_slice(&snapshot.vocab_offsets);
         if offs.len() as u32 != cfg.n_vocab + 1 {
             return Err(PotError::Vocab("offsets length doesn't match n_vocab + 1"));
         }
         let mut vocab = Vec::with_capacity(cfg.n_vocab as usize);
         for i in 0..cfg.n_vocab as usize {
-            let s = from_utf8(&weights.vocab_bytes[offs[i] as usize..offs[i + 1] as usize])
+            let s = from_utf8(&snapshot.vocab_bytes[offs[i] as usize..offs[i + 1] as usize])
                 .unwrap_or("?")
                 .to_string();
             vocab.push(s);
