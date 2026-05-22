@@ -1,6 +1,6 @@
-#include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
+#include <metal_stdlib>
 using namespace metal;
 
 // Q1_0 weights × Q8_0 activations -> f16 output. 64×64 tile, 256 threads.
@@ -50,20 +50,18 @@ constant uint SG_GRID_M = 2u;
 constant uint SG_GRID_N = 4u;
 constant uint TM_SG = 4u;
 constant uint TN_SG = 2u;
-constant uint TILE_M = 64u;          // SG_GRID_M * TM_SG * 8
-constant uint TILE_N = 64u;          // SG_GRID_N * TN_SG * 8
+constant uint TILE_M = 64u; // SG_GRID_M * TM_SG * 8
+constant uint TILE_N = 64u; // SG_GRID_N * TN_SG * 8
 constant uint W_HALF = 64u * TILE_N;
 
-kernel void cs_main(
-    constant Params& p [[buffer(0)]],
-    device const uint* weights [[buffer(1)]],
-    device const uint* acts [[buffer(2)]],
-    device half* y [[buffer(3)]],
-    uint3 wg_id [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint sg_id [[simdgroup_index_in_threadgroup]],
-    uint sg_lane [[thread_index_in_simdgroup]])
-{
+kernel void cs_main(constant Params &p [[buffer(0)]],
+                    device const uint *weights [[buffer(1)]],
+                    device const uint *acts [[buffer(2)]],
+                    device half *y [[buffer(3)]],
+                    uint3 wg_id [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]],
+                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                    uint sg_lane [[thread_index_in_simdgroup]]) {
     // Full-Q1_0-block fp16 weight tile, row-major as B[k_in_block, n_local],
     // laid out as two contiguous halves of 64 K-rows × 64 N-cols each (8 KB
     // per half, 16 KB total). The MMA inner loop walks the halves
@@ -82,34 +80,30 @@ kernel void cs_main(
     const uint nb_q8 = p.k / 32u;
 
     // Simdgroup position within the WG (4 in M, 2 in N).
-    const uint sg_m = sg_id / SG_GRID_N;     // 0..3
-    const uint sg_n = sg_id % SG_GRID_N;     // 0..1
-    const uint sg_m_base = sg_m * TM_SG * 8u;     // 0, 16, 32, 48
-    const uint sg_n_base = sg_n * TN_SG * 8u;     // 0, 32
+    const uint sg_m = sg_id / SG_GRID_N;      // 0..3
+    const uint sg_n = sg_id % SG_GRID_N;      // 0..1
+    const uint sg_m_base = sg_m * TM_SG * 8u; // 0, 16, 32, 48
+    const uint sg_n_base = sg_n * TN_SG * 8u; // 0, 32
 
     // C accumulators in registers, fp32.
     simdgroup_matrix<float, 8, 8> C[TM_SG][TN_SG];
-    #pragma unroll
     for (uint im = 0u; im < TM_SG; ++im) {
-        #pragma unroll
         for (uint in_ = 0u; in_ < TN_SG; ++in_) {
             C[im][in_] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
     }
 
-    threadgroup const half* a_base = (threadgroup const half*)a_sh
-                                     + sg_m_base * 128u;   // (sg_m_base) M-rows offset
+    threadgroup const half *a_base = (threadgroup const half *)a_sh + sg_m_base * 128u; // (sg_m_base) M-rows offset
 
     for (uint b = 0u; b < nb_q1; ++b) {
         // ---- Cooperative load: activations (dequant Q8_0 -> half4) ----
         // 2048 half4 across 256 threads -> 8 half4 per thread.
-        #pragma unroll
         for (uint li = 0u; li < 8u; ++li) {
             uint idx = li * WG + tid;       // 0..2047
-            uint m_local = idx / 32u;        // 0..63 (token within tile)
-            uint v4_local = idx % 32u;        // 0..31 (half4 index within 128 elems)
-            uint sub = v4_local / 8u;         // 0..3 (Q8_0 sub-block)
-            uint v4_in_sub = v4_local % 8u;   // 0..7 (half4 within sub-block)
+            uint m_local = idx / 32u;       // 0..63 (token within tile)
+            uint v4_local = idx % 32u;      // 0..31 (half4 index within 128 elems)
+            uint sub = v4_local / 8u;       // 0..3 (Q8_0 sub-block)
+            uint v4_in_sub = v4_local % 8u; // 0..7 (half4 within sub-block)
 
             uint m_idx = m_base + m_local;
             uint a_block = b * 4u + sub;
@@ -147,9 +141,8 @@ kernel void cs_main(
             uint half_bits = (word >> ((b_offset & 2u) * 8u));
             half dw = as_type<half2>(half_bits).x;
             half neg_dw = -dw;
-            threadgroup half* w_dst = w_sh + half_idx * W_HALF;
+            threadgroup half *w_dst = w_sh + half_idx * W_HALF;
             uint k0 = kc * 32u;
-            #pragma unroll
             for (uint i = 0u; i < 32u; ++i) {
                 w_dst[(k0 + i) * TILE_N + n_local] = select(neg_dw, dw, ((sign_word >> i) & 1u) != 0u);
             }
@@ -157,32 +150,26 @@ kernel void cs_main(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- MMA both halves; no inter-half barrier needed ----
-        #pragma unroll
         for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-            threadgroup const half* b_base_sg = w_sh + half_idx * W_HALF + sg_n_base;
+            threadgroup const half *b_base_sg = w_sh + half_idx * W_HALF + sg_n_base;
             uint k_base_in_block = half_idx * 64u;
-            #pragma unroll
             for (uint ks = 0u; ks < 8u; ++ks) {
                 uint k_off_in_block = k_base_in_block + ks * 8u;
                 uint k_off_in_half = ks * 8u;
 
                 simdgroup_matrix<half, 8, 8> Atiles[TM_SG];
-                #pragma unroll
                 for (uint im = 0u; im < TM_SG; ++im) {
-                    threadgroup const half* a_ptr = a_base + (im * 8u) * 128u + k_off_in_block;
+                    threadgroup const half *a_ptr = a_base + (im * 8u) * 128u + k_off_in_block;
                     simdgroup_load(Atiles[im], a_ptr, 128u);
                 }
 
                 simdgroup_matrix<half, 8, 8> Btiles[TN_SG];
-                #pragma unroll
                 for (uint in_ = 0u; in_ < TN_SG; ++in_) {
-                    threadgroup const half* b_ptr = b_base_sg + k_off_in_half * TILE_N + in_ * 8u;
+                    threadgroup const half *b_ptr = b_base_sg + k_off_in_half * TILE_N + in_ * 8u;
                     simdgroup_load(Btiles[in_], b_ptr, TILE_N);
                 }
 
-                #pragma unroll
                 for (uint im = 0u; im < TM_SG; ++im) {
-                    #pragma unroll
                     for (uint in_ = 0u; in_ < TN_SG; ++in_) {
                         simdgroup_multiply_accumulate(C[im][in_], Atiles[im], Btiles[in_], C[im][in_]);
                     }
@@ -199,10 +186,8 @@ kernel void cs_main(
     // tile to a small shmem fp32 buffer, then cooperatively write to y with
     // the accumulate / bounds logic. Reuses a_sh's space (sized 16 KB > 16 KB
     // needed for 64×64 fp32 = 16 KB).
-    threadgroup float* c_sh = (threadgroup float*)a_sh;
-    #pragma unroll
+    threadgroup float *c_sh = (threadgroup float *)a_sh;
     for (uint im = 0u; im < TM_SG; ++im) {
-        #pragma unroll
         for (uint in_ = 0u; in_ < TN_SG; ++in_) {
             uint m_off = sg_m_base + im * 8u;
             uint n_off = sg_n_base + in_ * 8u;
@@ -212,11 +197,10 @@ kernel void cs_main(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Cooperatively write 64*64 = 4096 outputs across 256 threads = 16 each.
-    #pragma unroll
     for (uint li = 0u; li < 16u; ++li) {
-        uint idx = li * WG + tid;             // 0..4095
-        uint m_local = idx / TILE_N;          // 0..63
-        uint n_local = idx % TILE_N;          // 0..63
+        uint idx = li * WG + tid;    // 0..4095
+        uint m_local = idx / TILE_N; // 0..63
+        uint n_local = idx % TILE_N; // 0..63
         uint m_idx = m_base + m_local;
         if (m_idx >= p.m)
             continue;
