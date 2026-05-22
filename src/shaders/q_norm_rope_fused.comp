@@ -36,7 +36,6 @@ shared float16_t rope_in_sh[HEAD_DIM];
 // Cross-subgroup merge slot for the RMS reduction.
 shared float sg_partial[NUM_SUBGROUPS];
 
-#include "lib/rope_neox.glsl"
 #include "lib/subgroup_reduce_scalar.glsl"
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -58,5 +57,15 @@ void main() {
 
     uint pos_abs = p.pos_base + tok;
     uint cs_base = p.rope_offset + pos_abs * HEAD_DIM;
-    act[q_idx] = rope_neox(tid, cs_base);
+
+    // NEOX RoPE: pair-swap across the head-half boundary. Both halves compute
+    // self*c ± partner*s; only the sign on the s-term flips (− for first half,
+    // + for second).
+    uint base = tid & (HALF_DIM - 1u);
+    float16_t c = rope_cs[cs_base + base * 2u];
+    float16_t s = rope_cs[cs_base + base * 2u + 1u];
+    float16_t self_v = rope_in_sh[tid];
+    float16_t partner = rope_in_sh[tid ^ HALF_DIM];
+    uint16_t sign = uint16_t(((tid - HALF_DIM) >> 16u) & 0x8000u);
+    act[q_idx] = self_v * c + uint16BitsToHalf(halfBitsToUint16(partner * s) ^ sign);
 }

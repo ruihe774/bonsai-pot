@@ -81,7 +81,7 @@ void main() {
         sh_idx[base + i] = 0u;
     }
     for (uint w = w_lo + tid; w < w_hi; w += WG) {
-        f16vec2 pair_f32 = uint16BitsToFloat16(unpack16(logits[in_word_off + w]));
+        f16vec2 pair_f32 = uint16BitsToHalf(unpack16(logits[in_word_off + w]));
         uint i0 = w << 1;
         uint i1 = i0 + 1u;
         float16_t v0 = pair_f32.x;
