@@ -33,23 +33,12 @@ uint expand_4_bits(uint bits) {
 
 uint expand_8_bits(uint byte) {
     // Spread 4 input 2-bit codes (in `byte`'s low 8 bits) to 4 byte lanes
-    // holding signed `(q - 1)` ∈ {-1, 0, +1, +2} (= bytes {0xFF, 0x00, 0x01,
-    // 0x02}) for dotPacked4x8EXT consumption.
-    //
-    // The mul-spread trick used by expand_4_bits doesn't work here: for any
-    // byte where two set bits collide under the shifted sum (e.g. 0x43 →
-    // bit 6 from byte<<0 plus bit 0 from byte<<6 both at u32 bit 6), the carry
-    // propagates and corrupts the next code's lane. Extract the 4 codes
-    // explicitly instead — still cheap (4 shifts + 4 ANDs + 3 ORs).
-    uint packed = (byte & 0x03u) | (((byte >> 2u) & 0x03u) << 8u) | (((byte >> 4u) & 0x03u) << 16u) |
-                  (((byte >> 6u) & 0x03u) << 24u);
-    // Apply (q - 1) per byte without inter-byte borrow:
-    //   - low 2 bits = (q + 3) & 3 (no carry: each byte's q+3 ≤ 6 < 256);
-    //   - high 6 bits = 0xFC iff q == 0 else 0x00 (sign extension of −1).
-    uint low2 = (packed + 0x03030303u) & 0x03030303u;
-    uint nz = (packed | (packed >> 1u)) & 0x01010101u;
-    uint sx = (nz ^ 0x01010101u) * 0xFCu;
-    return low2 | sx;
+    // holding signed `(q - 1)` ∈ {-1, 0, +1} (= bytes {0xFF, 0x00, 0x01})
+    // for dotPacked4x8EXT consumption. (0b11 is not valid for Q2_0)
+    uint spread = ((byte >> 2u) * 0x104100u) | byte;
+    uint mask = ~spread;
+    uint trail = mask & 0x01010101u;
+    return (((mask >> 1u) & trail) * 0xFFu) | trail;
 }
 #else
 float reduce_add(vec4 v) { return v.x + v.y + v.z + v.w; }
