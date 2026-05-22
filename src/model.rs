@@ -31,9 +31,9 @@ use crate::error::{PotError, Result};
 /// Metadata for a single tensor in the model manifest.
 #[derive(Debug, Clone)]
 pub struct TensorEntry {
-    pub dtype: String,
+    pub dtype: &'static str,
     pub shape: Vec<u32>,
-    pub buffer: String,
+    pub buffer: &'static str,
     pub offset: u32,
     pub length: u32,
     pub d_offset: u32,
@@ -943,6 +943,23 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
             },
         )
     }
+    fn intern_dtype(s: &str) -> Result<&'static str> {
+        match s {
+            "Q1_0" => Ok("Q1_0"),
+            "F16" => Ok("F16"),
+            _ => Err(PotError::Config("manifest: unknown dtype")),
+        }
+    }
+    fn intern_buffer(s: &str) -> Result<&'static str> {
+        match s {
+            "weights_attn.bin" => Ok("weights_attn.bin"),
+            "weights_ffn_gate_up.bin" => Ok("weights_ffn_gate_up.bin"),
+            "weights_ffn_down.bin" => Ok("weights_ffn_down.bin"),
+            "weights_norms.bin" => Ok("weights_norms.bin"),
+            "weights_embed_lmhead.bin" => Ok("weights_embed_lmhead.bin"),
+            _ => Err(PotError::Config("manifest: unknown buffer")),
+        }
+    }
     fn build_entry(g: &BTreeMap<&str, &str>) -> Result<TensorEntry> {
         let shape = get(g, "shape")?
             .split(',')
@@ -952,9 +969,9 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
             })
             .collect::<Result<Vec<u32>>>()?;
         Ok(TensorEntry {
-            dtype: get(g, "dtype")?.to_string(),
+            dtype: intern_dtype(get(g, "dtype")?)?,
             shape,
-            buffer: get(g, "buffer")?.to_string(),
+            buffer: intern_buffer(get(g, "buffer")?)?,
             offset: parse_field(g, "offset")?,
             length: parse_field(g, "length")?,
             d_offset: parse_opt(g, "d_offset")?,
