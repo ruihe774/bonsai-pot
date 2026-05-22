@@ -172,6 +172,7 @@ dependencies = [
  "half",
  "log",
  "once_cell",
+ "serde",
  "thiserror",
  "tokenizers",
  "tree-sitter",

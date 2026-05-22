@@ -36,6 +36,7 @@ const HEADER_BYTES: usize = 32;
 /// `Clone` deep-copies the payload. `Send + Sync` (auto). Use
 /// [`KvSnapshot::to_bytes`] / [`KvSnapshot::from_bytes`] to persist to disk.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct KvSnapshot {
     n_layer: u32,
     kv_dim: u32,

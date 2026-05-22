@@ -30,6 +30,7 @@ use crate::error::{PotError, Result};
 
 /// Metadata for a single tensor in the model manifest.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TensorEntry {
     pub dtype: String,
     pub shape: Vec<u64>,
@@ -43,6 +44,7 @@ pub struct TensorEntry {
 
 /// Parsed `config.ini`: model dimensions, hyper-parameters, and the tensor manifest.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModelConfig {
     pub n_layer: u32,
     pub n_embd: u32,
@@ -87,6 +89,7 @@ impl ModelConfig {
 /// - Constructing the struct directly from bytes obtained by any other means
 ///   (e.g. `include_bytes!`, fetched from the network, embedded in flash).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ModelSnapshot {
     /// Parsed `config.ini` contents.
     pub config: ModelConfig,
