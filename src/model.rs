@@ -1080,6 +1080,15 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
     if cfg.kv_dim != cfg.n_kv_head * cfg.head_dim {
         return Err(PotError::Config("config: kv_dim != n_kv_head * head_dim"));
     }
+    // matmul_q1_0_q8_0 stores two f16 outputs at a time via packHalf2x16, so
+    // every output column dim it sees (q_dim, kv_dim, n_embd, n_ff) must be
+    // even. The act-layout region offsets are likewise aligned to even f16
+    // indices by ActLayout construction.
+    if (cfg.n_embd | cfg.q_dim | cfg.kv_dim | cfg.n_ff) & 1 != 0 {
+        return Err(PotError::Config(
+            "config: n_embd, q_dim, kv_dim, n_ff must all be even (matmul paired f16 store)",
+        ));
+    }
 
     // --- per-tensor checks ---
     // Each spec: (name, dtype, shape as [u64;2-or-1], buffer filename)

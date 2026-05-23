@@ -90,8 +90,7 @@ void main() {
     // same vec4 component. Both halves of the thread's vec4 are in the same
     // RoPE half (lower or upper), since 4 | 64.
     f16vec4 partner = rope_in_sh[tid ^ 16u];
-    bool is_lower = base_pos < HALF_DIM;
-    uint j_base = base_pos - mix(HALF_DIM, 0u, is_lower); // pair index for cos/sin
+    uint j_base = base_pos & ~HALF_DIM;
     uint cs_base = p.rope_offset + (p.pos_base + tok) * HEAD_DIM;
 
     vec4 k_post;
@@ -101,9 +100,10 @@ void main() {
         float s = float(rope_cs[cs_base + j * 2u + 1u]);
         float a = float(k_normed[e]);
         float b = float(partner[e]);
+        s = uintBitsToFloat((base_pos - HALF_DIM) & 0x80000000u ^ floatBitsToUint(s));
         // is_lower:  a*c - b*s   (a is lower, b is upper partner)
-        // upper:     b*s + a*c   (a is upper, b is lower partner)
-        k_post[e] = mix(b * s + a * c, a * c - b * s, is_lower);
+        // upper:     a*c + b*s   (a is upper, b is lower partner)
+        k_post[e] = dot(vec2(a, b), vec2(c, s));
     }
 
     // ---- Per-32-block max-abs for K and V (8-lane subgroup butterfly) ----

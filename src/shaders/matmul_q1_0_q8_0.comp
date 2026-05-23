@@ -28,7 +28,7 @@ p;
 
 layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) readonly buffer ABuf { uint acts[]; };
-layout(set = 0, binding = 2, std430) buffer YBuf { float16_t y[]; };
+layout(set = 0, binding = 2, std430) buffer YBuf { uint y[]; };
 
 #include "lib/q1_0_load.glsl"
 
@@ -181,14 +181,14 @@ void main() {
     [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
         uint m_idx = m_base + ly * TM + tm;
         if (m_idx >= p.m)
-            continue;
-        [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+            break;
+        [[unroll]] for (uint tn = 0u; tn < TN; tn += 2) {
             uint n_idx = n_base + lx * TN + tn;
             if (n_idx >= p.n)
-                continue;
-            uint yi = p.out_offset + m_idx * p.n + n_idx;
-            float val = acc[tm * TN + tn];
-            y[yi] = float16_t(mix(0.0, float(y[yi]), p.accumulate != 0u) + val);
+                break;
+            uint yi = (p.out_offset + m_idx * p.n + n_idx) >> 1u;
+            vec2 val = vec2(acc[tm * TN + tn], acc[tm * TN + tn + 1]);
+            y[yi] = packHalf2x16(p.accumulate != 0u ? unpackHalf2x16(y[yi]) + val : val);
         }
     }
 }
