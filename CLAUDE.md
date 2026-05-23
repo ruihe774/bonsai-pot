@@ -128,7 +128,7 @@ Every dispatch passes a `Params` struct as wgpu push constants via `pass.set_imm
 
 ### Adapter limits
 
-`Model::load` requests `max_storage_buffer_binding_size` + `max_buffer_size` ≥ 300 MB, `max_storage_buffers_per_shader_stage` ≥ 8.
+`Model::load` computes the largest single buffer it will allocate (largest grouped weight buffer / RoPE table / per-buffer KV cache, scaled by `opts.max_seq`), rounds up to the next power of two, and requests that as `max_storage_buffer_binding_size` & `max_buffer_size`. Also requests `max_storage_buffers_per_shader_stage` ≥ 8.
 
 ## When making changes
 

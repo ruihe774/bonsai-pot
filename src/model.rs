@@ -1364,20 +1364,52 @@ impl Model {
             );
         }
 
-        let mut limits = adapter.limits();
-        // Floor at 300 MB so the largest grouped weight buffer (~510 MB at 8B) fits
-        // even on adapters whose wgpu defaults are below that. No upper cap — the
-        // KV cache for 8B at practical 32k ctx needs ~1.27 GB per buffer, so we
-        // rely on the adapter's natural max_buffer_size (typically 2–4 GB on desktop).
-        limits.max_storage_buffer_binding_size = limits
-            .max_storage_buffer_binding_size
-            .max(300 * 1024 * 1024);
-        limits.max_buffer_size = limits.max_buffer_size.max(300 * 1024 * 1024);
-        limits.max_storage_buffers_per_shader_stage =
-            limits.max_storage_buffers_per_shader_stage.max(8);
-        // Immediates (push constants): 128 bytes covers the largest Params struct
-        // (MatvecFusedNormedParams, 72 bytes) with generous headroom.
-        limits.max_immediate_size = limits.max_immediate_size.max(128);
+        // Compute the largest single GPU buffer we will allocate and request
+        // exactly that as the storage-binding limit (rounded up to the next
+        // power of two). `device.limits()` returns exactly what we request
+        // here — the adapter's higher ceiling is not available unless asked
+        // for — so any buffer we ever create must fit under these.
+        //
+        // Storage-bound candidates: each grouped weight buffer, the RoPE
+        // table, and one per-buffer KV cache (kv_k / kv_v).
+        //
+        // `max_buffer_size` additionally needs to cover the kv_snapshot
+        // staging buffer, which holds both K and V for the live prefix in
+        // one allocation (see `kv_snapshot::snapshot` / `apply`) — i.e.
+        // `2 * kv_per_buf_bytes`. It's MAP_READ/COPY only, never bound as
+        // STORAGE, so it doesn't enter the binding-size limit.
+        let kv_nb_per_row = u64::from(cfg.kv_dim / 32);
+        let kv_d_bytes: u64 = u64::from(cfg.n_layer) * u64::from(opts.max_seq) * kv_nb_per_row * 4;
+        let kv_qs_bytes: u64 =
+            u64::from(cfg.n_layer) * u64::from(opts.max_seq) * u64::from(cfg.kv_dim);
+        let kv_per_buf_bytes = kv_d_bytes + kv_qs_bytes;
+        let rope_bytes: u64 = u64::from(opts.max_seq) * u64::from(cfg.head_dim) * 2;
+        let largest_storage_buf: u64 = [
+            snapshot.w_attn.len() as u64,
+            snapshot.w_ffn_gate_up.len() as u64,
+            snapshot.w_ffn_down.len() as u64,
+            snapshot.w_norms.len() as u64,
+            snapshot.w_embed_lmhead.len() as u64,
+            rope_bytes,
+            kv_per_buf_bytes,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let required_binding = largest_storage_buf.next_power_of_two();
+        let kv_snapshot_staging_bytes = 2 * kv_per_buf_bytes;
+        let required_buffer_size = largest_storage_buf
+            .max(kv_snapshot_staging_bytes)
+            .next_power_of_two();
+
+        let limits = wgpu::Limits {
+            max_buffer_size: required_buffer_size,
+            max_storage_buffer_binding_size: required_binding,
+            max_storage_buffers_per_shader_stage: 8,
+            max_immediate_size: 128,
+            ..Default::default()
+        };
+        log::debug!("requesting limits: {limits:?}");
 
         let required_features = wgpu::Features::SHADER_F16
             | wgpu::Features::SUBGROUP
