@@ -127,11 +127,10 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         }
 
         let raw_path = out_dir.join(format!("{name}.raw.spv"));
+        let opt_path = out_dir.join(format!("{name}.opt.spv"));
         run_glslang(&src_path, &raw_path, &define_metal, &lib_dir, debug_shaders);
-        run_spirv_cross_msl(&raw_path, &msl_path);
-        // Rewrite the spec-constant scaffolding to a form that load-time can
-        // patch by simply prepending a `#define`. See `msl_strip` for details.
-        // Runs before minify so the minify pass validates the result.
+        run_spirv_opt(manifest_dir, &raw_path, &opt_path);
+        run_spirv_cross_msl(&opt_path, &msl_path);
         strip_spec_constants_msl(&msl_path);
         minify_msl(&msl_path);
     }
