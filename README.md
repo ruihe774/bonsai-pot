@@ -1,8 +1,8 @@
 # bonsai-pot
 
-A from-scratch, dependency-light **Bonsai (Qwen3-architecture) Q1_0 inference engine** running on **wgpu compute shaders**. Supports the Bonsai 4B and 8B model sizes.
+A from-scratch, dependency-light **Bonsai / Qwen3-architecture inference engine** running on **wgpu compute shaders**. Supports Bonsai 4B and 8B models in **Q1_0** (binary), **Q2_0** (ternary), and **Q8_0** quantization.
 
-The defining property of this engine: **weights are never dequantized**. Q1_0 storage is consumed directly by the matvec/matmul kernels — there is no intermediate FP16 weight tensor, no on-the-fly unpack into shared memory, nothing. Each weight contributes to the dot product as a single sign bit selecting `+x` or `-x`, with one FP16 multiply per 128-weight block to apply the block scale. The hot inner loop has **zero multiplications** — every accumulation is an add or a sign-flipped add.
+The defining property of this engine: **weights are never dequantized**. Quantized weight storage is consumed directly by the matvec/matmul kernels — there is no intermediate FP16 weight tensor, no unpack to float. For Q1_0 each weight is a single sign bit selecting `+x` or `-x`; for Q2_0 a 2-bit ternary code selects `−x`, `0`, or `+x`; for Q8_0 an i8 value is fed directly to `dot4I8Packed`. In all cases one FP16 scale multiply closes out each 128-weight block. The inner loop has **zero float multiplications** per weight.
 
 No `llama.cpp`, no `ggml`, no PyTorch on the hot path. Weights are loaded from a custom flat-file layout (produced from a GGUF by `scripts/extract.py`), every kernel is hand-rolled GLSL (with one hand-ported `.metal` for the Apple `simdgroup_matrix` matmul), and the host side is plain Rust + wgpu 29.
 
@@ -43,13 +43,16 @@ All tools must be on `$PATH` at build time.
 ## Building the model directory
 
 ```sh
-# 4B:
+# Bonsai Q1_0 (binary):
 uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
-# 8B:
 uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
+# Ternary Bonsai Q2_0 (Vulkan only):
+uv run scripts/extract.py path/to/Ternary-Bonsai-4B-Q2_0.gguf --out ./model-ternary-4b
+# Qwen3 Q8_0 (Vulkan only):
+uv run scripts/extract.py path/to/Qwen3-4B-Q8_0.gguf --out ./model-q8
 ```
 
-Both model sizes are available on Hugging Face.
+All models are available on Hugging Face.
 This writes `config.ini`, five `weights_*.bin` files, `vocab.bin`, `vocab_offsets.bin`, and `merges.txt`.
 
 ## Build and run
@@ -89,19 +92,23 @@ Sampling is hybrid: a two-pass multi-WG reduction (`topk_partial.comp` + `topk_m
 
 ## How it works
 
-### Q1_0: dequant-free, multiply-free
+### Weight formats
 
-Q1_0 stores 128 weights per block as 16 bytes of sign bits (±1 per weight) plus a 2-byte FP16 scale `d` — 18 bytes per block. `extract.py` splits each tensor into a contiguous **d-array** of FP16 scales followed by a **qs-array** of raw 16-byte sign blocks, both `u32`-aligned. The manifest in `config.ini` records `d_offset`, `qs_offset`, and `nb` (blocks per row) per tensor.
+Three quantization formats are supported, all sharing the 128-weight super-block layout. `extract.py` splits each tensor into a contiguous **d-array** of FP16 scales followed by a **qs-array** of raw weight codes, both `u32`-aligned. The manifest in `config.ini` records `d_offset`, `qs_offset`, and `nb` (super-blocks per row) per tensor. The format is autodetected from the GGUF and recorded as `quant_format` in `config.ini`.
 
-The shaders consume these two arrays **directly**:
+- **Q1_0** — 16 bytes of sign bits per 128-weight block (1 bit/weight, ±1); 18 B/block total. Binary weights. Supported on Vulkan and Metal.
+- **Q2_0** (Ternary Bonsai) — 32 bytes of 2-bit codes per 128-weight block (−1, 0, +1); 34 B/block total. Vulkan only.
+- **Q8_0** — four native 32-element GGML blocks per super-block (4 × 34 B = 136 B); each native block is 32 i8 weights + 2-byte FP16 scale. Vulkan only.
 
-- **Matvec (`shaders/matvec_q1_0.comp`)** — for each block, the kernel walks 128 sign bits and accumulates `±x` via `select(-xv, xv, bit_set)`. The block contributes one FP16 multiply at the end (`block_sum * d`). No weight is ever materialized as a real number; nothing is unpacked into shared memory; the inner loop has zero multiplications. `matvec_q1_0_fused_normed.comp` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup, amortizes the activation load across them, and additionally folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip. `matvec_q1_0_silu.comp` folds `silu(gate) * up` into the ffn_down matvec.
-- **Matmul (`shaders/matmul_q1_0_q8_0.comp`)** — used in batched prefill. Activations arrive Q8_0-quantized inline by the upstream fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, `attention_prefill_tiled`) — there is no separate quantize pass. The kernel then computes the dot product as `sum_of_signed_q8 * d_w * d_x` per block, using `dot4I8Packed` over the activation bytes with the weight sign bits selecting their sign. Again: no FP16 weight tensor, no dequantize step, weight bits are read straight from storage. (On Apple this kernel is hand-ported to MSL as `matmul_q1_0_q8_0.metal` around `simdgroup_matrix<half,8,8>` MMA instructions, since `simdgroup_matrix` has no GLSL surface; Q1_0 weights and Q8_0 activations are still read directly from storage and materialized to fp16 just-in-time into threadgroup memory.)
+The shaders consume these arrays **directly** with no float dequantization:
+
+- **Matvec (`shaders/matvec_q1_0.comp`)** — the kernel expands each block's weight codes to ±1/0 packed-byte form and accumulates via `dotPacked4x8EXT` (one DP4a instruction per 4-element dot), with one FP16 scale multiply per block. No weight is ever materialized as a float; nothing is unpacked into shared memory beyond what DP4a needs. `matvec_q1_0_fused_normed.comp` packs 2- or 3-range dispatches (QKV; gate+up) into one workgroup, amortizes the activation load across them, and folds `rms_norm(x) * w_norm` over the activation so there's no `act.x_norm` round-trip. `matvec_q1_0_silu.comp` folds `silu(gate) * up` into the ffn_down matvec. On Metal (Q1_0 only) the Q8_0 activation shmem round-trip is skipped in favour of an f32 `select(±a, cond)` accumulate — no DP4a equivalent exists on Apple Silicon.
+- **Matmul (`shaders/matmul_q1_0_q8_0.comp`)** — used in batched prefill. Activations arrive Q8_0-quantized inline from the upstream fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, `attention_prefill_tiled`) — no separate quantize pass. Weight codes are expanded to packed-byte form and the dot product runs via `dot4I8Packed`, with one combined `d_w * d_x` scale multiply per block. On Apple (Q1_0 only) this kernel is hand-ported to MSL as `matmul_q1_0_q8_0.metal` around `simdgroup_matrix<half,8,8>` MMA instructions.
 
 ### Two execution paths
 
 1. **Single-token (matvec) path** — used for all of `--mode gen` and the generation phase of `--mode prompt`. The whole step (embed → transformer layers → output_norm → LM head → topk) is encoded into a single compute pass.
-2. **Batched-prefill (matmul) path** — used by `Session::prefill` and `--mode prompt`. Activations are Q8_0-quantized inline by fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, and `attention_prefill_tiled` for the attn output); weights stay in Q1_0.
+2. **Batched-prefill (matmul) path** — used by `Session::prefill` and `--mode prompt`. Activations are Q8_0-quantized inline by fused kernels (`rms_norm_q8_0`, `silu_mul_q8_0`, and `attention_prefill_tiled` for the attn output); weights stay in their storage format.
 
 Pass setup is expensive (~25 us/pass on RADV), so the matvec generation step batches every dispatch — embed, all layers, output norm, LM head, and the two-pass top-K — into a single compute pass. Per-layer K/V is rms-normed, RoPE'd, Q8_0-quantized, and written directly into the KV cache by `kv_writeback_fused`, replacing the `copy_buffer_to_buffer` that used to break the pass.
 
