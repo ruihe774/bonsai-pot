@@ -82,7 +82,7 @@ fn build_vulkan(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         println!("cargo:rerun-if-changed={}", src_path.display());
 
         run_glslang(&src_path, &raw_path, &[], &lib_dir, debug_shaders);
-        run_spirv_opt(&raw_path, &opt_path);
+        run_spirv_opt(manifest_dir, &raw_path, &opt_path);
     }
 }
 
@@ -195,14 +195,15 @@ fn run_glslang(
     );
 }
 
-fn run_spirv_opt(raw_path: &Path, opt_path: &Path) {
+fn run_spirv_opt(manifest_dir: &Path, raw_path: &Path, opt_path: &Path) {
     let status = Command::new("spirv-opt")
-        .arg("-O")
-        .arg("--strength-reduction")
+        .arg(format!(
+            "-Oconfig={}/spirv-opt.conf",
+            manifest_dir.display()
+        ))
         .arg(raw_path)
         .arg("-o")
         .arg(opt_path)
-        .arg("--trim-capabilities")
         .status()
         .unwrap_or_else(|e| panic!("failed to run spirv-opt: {e}"));
     assert!(
