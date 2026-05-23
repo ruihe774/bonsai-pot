@@ -72,7 +72,7 @@ shared f16vec4 q1_x_sh[K_V4];
 // is spec-constant-derived and thus not a compile-time constant here).
 uint Q1_NB_Q8;
 shared uint q1_a_qs_sh[K_V4]; // K bytes packed as u32 (= K_V4 u32 slots)
-shared float q1_a_d_sh[(K_V4 << 2) / 32];
+shared float q1_a_d_sh[(K_V4 << 2u) / 32u];
 #endif
 shared float sg_partial[NUM_SUBGROUPS];
 
@@ -86,9 +86,9 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #endif
 
 void main() {
-    uint K = K_V4 << 2;
+    uint K = K_V4 << 2u;
 #ifndef METAL_BACKEND
-    uint NB_Q8 = K >> 5;
+    uint NB_Q8 = K >> 5u;
     Q1_NB_Q8 = NB_Q8;
 #endif
     uint wg_idx = gl_WorkGroupID.y * p.dispatch_x_dim + gl_WorkGroupID.x;
@@ -100,15 +100,15 @@ void main() {
     uint nb_q1 = K / 128u;
 
     // ---- Stage 1: load x and w_norm; stage `x * w_norm` into q1_x_sh; accumulate ssq.
-    uint in_v4_off = p.input_offset >> 2;
-    uint w_v4_off = p.w_norm_off >> 2;
+    uint in_v4_off = p.input_offset >> 2u;
+    uint w_v4_off = p.w_norm_off >> 2u;
     float ssq = 0.0;
     for (uint v = tid; v < K_V4; v += WG) {
-        uint base = (in_v4_off + v) << 2;
+        uint base = (in_v4_off + v) << 2u;
         f16vec4 xv4 = f16vec4(act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u]);
         vec4 xv4f = vec4(xv4);
         ssq += xv4f.x * xv4f.x + xv4f.y * xv4f.y + xv4f.z * xv4f.z + xv4f.w * xv4f.w;
-        uint w_base = (w_v4_off + v) << 2;
+        uint w_base = (w_v4_off + v) << 2u;
         f16vec4 wv4 = f16vec4(w_norms[w_base + 0u], w_norms[w_base + 1u], w_norms[w_base + 2u], w_norms[w_base + 3u]);
         q1_x_sh[v] = xv4 * wv4;
     }
@@ -120,14 +120,14 @@ void main() {
     if (tid < NB_Q8) {
         uint block_v4_base = tid * 8u;
         float16_t max_abs_h = float16_t(0.0);
-        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
             f16vec4 af = abs(q1_x_sh[block_v4_base + i]);
             max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
         }
         float max_abs = float(max_abs_h);
         // Don't fold inv_rms here — apply it once at row-write below.
         q1_a_d_sh[tid] = max_abs / 127.0;
-        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
             q1_a_qs_sh[i * NB_Q8 + tid] = packSnorm4x8(vec4(q1_x_sh[block_v4_base + i]) / max(max_abs, 1e-30));
         }
     }
@@ -165,7 +165,7 @@ void main() {
     if (valid) {
         for (uint b = tx; b < nb_q1; b += WG_X) {
             uint d_byte = row_d_byte + b * D_FP16_PER_BLOCK * 2u;
-            uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2;
+            uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2u;
             acc += q1_0_block_dot(qs_word_base, b, d_byte);
         }
     }

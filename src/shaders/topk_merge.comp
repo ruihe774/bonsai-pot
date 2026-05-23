@@ -40,12 +40,12 @@ void main() {
 
     if (tid < p.num_partials) {
         uint slot_base = p.partials_off + tid * (2u * K_MAX);
-        [[unroll]] for (uint i = 0u; i < K_MAX; ++i) {
+        [[unroll]] for (uint i = 0u; i < K_MAX; i += 1u) {
             sh_val[base + i] = float16_t(uintBitsToFloat(result[slot_base + i]));
             sh_idx[base + i] = result[slot_base + K_MAX + i];
         }
     } else {
-        [[unroll]] for (uint i = 0u; i < K_MAX; ++i) {
+        [[unroll]] for (uint i = 0u; i < K_MAX; i += 1u) {
             sh_val[base + i] = NEG_INF_H;
             sh_idx[base + i] = 0u;
         }
@@ -81,7 +81,7 @@ void main() {
             for (uint k = tid; k < n_perstage; k += WG) {
                 uint pair_id = k / (K_MAX / 2u);
                 uint local_k = k % (K_MAX / 2u);
-                uint lo = ((local_k & ~(stride - 1u)) << 1) | (local_k & (stride - 1u));
+                uint lo = ((local_k & ~(stride - 1u)) << 1u) | (local_k & (stride - 1u));
                 uint hi = lo | stride;
                 uint a_base = pair_id * K_MAX;
                 float16_t vlo = sh_val[a_base + lo];
@@ -105,7 +105,7 @@ void main() {
     if (tid == 0u) {
         uint kk = min(p.k, K_MAX);
         [[unroll, min_iterations(1), max_iterations(32), dependency_length(1)]]
-        for (uint i = 0u; i < kk; ++i) {
+        for (uint i = 0u; i < kk; i += 1u) {
             // CPU sampler reads f32; widen at the boundary.
             result[p.out_offset + i] = floatBitsToUint(float(sh_val[i]));
             result[p.out_offset + kk + i] = sh_idx[i];

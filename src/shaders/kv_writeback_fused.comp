@@ -94,7 +94,7 @@ void main() {
     uint cs_base = p.rope_offset + (p.pos_base + tok) * HEAD_DIM;
 
     vec4 k_post;
-    [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+    [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) {
         uint j = j_base + e;
         float c = float(rope_cs[cs_base + j * 2u]);
         float s = float(rope_cs[cs_base + j * 2u + 1u]);
@@ -129,8 +129,8 @@ void main() {
 
     // qs write: one u32 per thread, no cross-lane gather.
     uint qs_byte_in_layer = p.dst_qs_byte_offset + pos_abs * p.kv_dim + head * HEAD_DIM + tid * 4u;
-    kv_k[qs_byte_in_layer >> 2] = pk;
-    kv_v[qs_byte_in_layer >> 2] = pv;
+    kv_k[qs_byte_in_layer >> 2u] = pk;
+    kv_v[qs_byte_in_layer >> 2u] = pv;
 
     // d (FP32 scale) — one writer per block.
     if (lane_in_block == 0u) {

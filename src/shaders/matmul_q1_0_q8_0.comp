@@ -58,7 +58,7 @@ void main() {
     uint ly = tid / WG_N;
 
     float acc[16];
-    [[unroll]] for (uint i = 0u; i < 16u; ++i)
+    [[unroll]] for (uint i = 0u; i < 16u; i += 1u)
         acc[i] = 0.0;
 
     // Bonsai's matmul callers guarantee tile alignment / activation buffer
@@ -70,7 +70,7 @@ void main() {
     // multiple of 4 and at least 16 (smallest case is Wo on 4B). The acc[]
     // update is a length-1 loop carry (associative reduction).
     [[unroll, min_iterations(16), iteration_multiple(4), dependency_length(1)]]
-    for (uint b = 0u; b < nb_q1; ++b) {
+    for (uint b = 0u; b < nb_q1; b += 1u) {
         // ---- Cooperative loads ----
         // Q1_0/Q2_0: 1 FP16 scale per super-block × 64 cols = 64 loads.
         // Q8_0: 4 scales per super-block × 64 cols = 256 loads (1 per thread).
@@ -95,12 +95,12 @@ void main() {
         }
         // Each thread loads one qword per pass; Q1_0 = 1 pass, Q2_0 = 2 passes
         // (4 qwords/block × 64 rows = 256 loads per pass = 1 per thread).
-        [[unroll]] for (uint pass = 0u; pass < (W_QWORDS_PER_BLOCK / 4u); ++pass) {
+        [[unroll]] for (uint pass = 0u; pass < (W_QWORDS_PER_BLOCK / 4u); pass += 1u) {
             uint n_local = tid / 4u;
             uint s = (tid % 4u) + pass * 4u;
             uint n_idx = n_base + n_local;
             uint off = p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + s * 4u;
-            w_bits_lds[s * 64u + n_local] = weights[off >> 2];
+            w_bits_lds[s * 64u + n_local] = weights[off >> 2u];
         }
         {
             uint s = tid / 64u;
@@ -108,15 +108,15 @@ void main() {
             uint m_idx = m_base + m_local;
             uint a_block = b * 4u + s;
             uint off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
-            a_d_lds[s * 64u + m_local] = uintBitsToFloat(acts[off >> 2]);
+            a_d_lds[s * 64u + m_local] = uintBitsToFloat(acts[off >> 2u]);
         }
-        [[unroll]] for (uint li = 0u; li < 8u; ++li) {
+        [[unroll]] for (uint li = 0u; li < 8u; li += 1u) {
             uint idx = li * WG + tid;
             uint m_local = idx / 32u;
             uint su = idx % 32u;
             uint m_idx = m_base + m_local;
             uint off = p.a_qs_offset + m_idx * p.k + b * 128u + su * 4u;
-            a_qs_lds[m_local * 32u + su] = acts[off >> 2];
+            a_qs_lds[m_local * 32u + su] = acts[off >> 2u];
         }
         barrier();
 
@@ -127,26 +127,26 @@ void main() {
         // feed an identical TM × dp4a accumulation. Per-sub-block weight
         // scale `wd[tn]` is broadcast from one FP16 for Q1_0/Q2_0 and read
         // per s for Q8_0.
-        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+        [[unroll]] for (uint s = 0u; s < 4u; s += 1u) {
             uint w[TN][8];
             if (QUANT_FORMAT == 0u) {
-                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
                     uint bw = w_bits_lds[s * 64u + lx * TN + tn];
-                    [[unroll]] for (uint i = 0u; i < 8u; ++i) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
+                    [[unroll]] for (uint i = 0u; i < 8u; i += 1u) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
                 }
             } else if (QUANT_FORMAT == 1u) {
-                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-                    [[unroll]] for (uint wq = 0u; wq < 2u; ++wq) {
+                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
+                    [[unroll]] for (uint wq = 0u; wq < 2u; wq += 1u) {
                         uint qword = w_bits_lds[(s * 2u + wq) * 64u + lx * TN + tn];
-                        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                        [[unroll]] for (uint i = 0u; i < 4u; i += 1u) {
                             w[tn][wq * 4u + i] = expand_8_bits((qword >> (i * 8u)) & 0xFFu);
                         }
                     }
                 }
             } else {
                 // Q8_0: weights are already packed i8 — read 8 qwords directly.
-                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
-                    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
+                    [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
                         w[tn][i] = w_bits_lds[(s * 8u + i) * 64u + lx * TN + tn];
                     }
                 }
@@ -154,31 +154,33 @@ void main() {
 
             float wd[TN];
             uint d_slot = (QUANT_FORMAT == 3u) ? (s * 64u + lx * TN) : (lx * TN);
-            [[unroll]] for (uint tn = 0u; tn < TN; ++tn) { wd[tn] = w_d_lds[d_slot + tn]; }
+            [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) { wd[tn] = w_d_lds[d_slot + tn]; }
 
-            [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
+            [[unroll]] for (uint tm = 0u; tm < TM; tm += 1u) {
                 uint m_local = ly * TM + tm;
                 float a_d = a_d_lds[s * 64u + m_local];
                 uint a_base = m_local * 32u + s * 8u;
                 uint a[8];
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) { a[i] = a_qs_lds[a_base + i]; }
+                [[unroll]] for (uint i = 0u; i < 8u; i += 1u) { a[i] = a_qs_lds[a_base + i]; }
 
                 int sumi[TN];
-                [[unroll]] for (uint tn = 0u; tn < TN; ++tn)
+                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u)
                     sumi[tn] = 0;
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                    [[unroll]] for (uint tn = 0u; tn < TN; ++tn) {
+                [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
+                    [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
                         sumi[tn] = dotPacked4x8EXT(int(w[tn][i]), int(a[i])) + sumi[tn];
                     }
                 }
 
-                [[unroll]] for (uint tn = 0u; tn < TN; ++tn) { acc[tm * TN + tn] += a_d * wd[tn] * float(sumi[tn]); }
+                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
+                    acc[tm * TN + tn] += a_d * wd[tn] * float(sumi[tn]);
+                }
             }
         }
         barrier();
     }
 
-    [[unroll]] for (uint tm = 0u; tm < TM; ++tm) {
+    [[unroll]] for (uint tm = 0u; tm < TM; tm += 1u) {
         uint m_idx = m_base + ly * TM + tm;
         if (m_idx >= p.m)
             break;

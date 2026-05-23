@@ -33,15 +33,15 @@ const uint WG = WG_X * WG_Y;
 const uint ROWS_PER_WG = WG_Y;
 const uint TILE_K = 4096u;
 #ifndef METAL_BACKEND
-const uint Q1_NB_Q8 = TILE_K / 32u;   // = 128, matches WG
-const uint TILE_QS_LEN = TILE_K >> 2; // u32 slots packing the i8 activation
+const uint Q1_NB_Q8 = TILE_K / 32u;    // = 128, matches WG
+const uint TILE_QS_LEN = TILE_K >> 2u; // u32 slots packing the i8 activation
 
 // Layout is **transposed** vs. block-major to dodge LDS bank conflicts:
 // see WGSL doc for full reasoning.
 shared uint q1_a_qs_sh[TILE_QS_LEN];
 shared float q1_a_d_sh[Q1_NB_Q8];
 #else
-const uint TILE_K_V4 = TILE_K >> 2; // f16vec4 slots
+const uint TILE_K_V4 = TILE_K >> 2u; // f16vec4 slots
 
 shared f16vec4 q1_x_sh[TILE_K_V4];
 #endif
@@ -73,12 +73,12 @@ void main() {
         uint nb_q8_tile = tile_size / 32u;
         if (tid < nb_q8_tile) {
             uint elem_base = tile_start + tid * 32u;
-            uint in_v4_off = (p.input_offset + elem_base) >> 2;
+            uint in_v4_off = (p.input_offset + elem_base) >> 2u;
 
             f16vec4 v[8];
             float16_t max_abs_h = float16_t(0.0);
-            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                uint b = (in_v4_off + i) << 2;
+            [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
+                uint b = (in_v4_off + i) << 2u;
                 v[i] = f16vec4(act[b], act[b + 1u], act[b + 2u], act[b + 3u]);
                 f16vec4 af = abs(v[i]);
                 max_abs_h = max(max_abs_h, max(max(af.x, af.y), max(af.z, af.w)));
@@ -86,16 +86,16 @@ void main() {
 
             float max_abs = float(max_abs_h);
             q1_a_d_sh[tid] = max_abs / 127.0;
-            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
                 q1_a_qs_sh[i * Q1_NB_Q8 + tid] = packSnorm4x8(vec4(v[i]) / max(max_abs, 1e-30));
             }
         }
 #else
         // ---- Stage 1: cooperative f16vec4 staging (no Q8_0 round-trip) ----
-        uint tile_v4 = tile_size >> 2;
-        uint in_v4_off = (p.input_offset + tile_start) >> 2;
+        uint tile_v4 = tile_size >> 2u;
+        uint in_v4_off = (p.input_offset + tile_start) >> 2u;
         for (uint v = tid; v < tile_v4; v += WG) {
-            uint base = (in_v4_off + v) << 2;
+            uint base = (in_v4_off + v) << 2u;
             q1_x_sh[v] = f16vec4(act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u]);
         }
 #endif
@@ -107,7 +107,7 @@ void main() {
             for (uint b_local = tx; b_local < nb_q1_tile; b_local += WG_X) {
                 uint b = b_q1_base_global + b_local;
                 uint d_byte = row_d_byte + b * D_FP16_PER_BLOCK * 2u;
-                uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2;
+                uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2u;
                 acc += q1_0_block_dot(qs_word_base, b_local, d_byte);
             }
         }

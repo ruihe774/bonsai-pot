@@ -76,14 +76,14 @@ void main() {
     uvec4 q_base = (uvec4(0u, 1u, 2u, 3u) + g * Q_PER_GROUP) * hd + p.q_offset;
 
     vec4 o[ELEMS_PER_THREAD];
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) { o[i] = vec4(0.0); }
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; i += 1u) { o[i] = vec4(0.0); }
     vec4 m = vec4(-1e30);
     vec4 l = vec4(0.0);
 
     // t loop: at most CHUNK_SIZE=8 iterations (chunk_end - chunk_start <= 8).
     // m/l/o[] are length-1 loop-carried.
     [[unroll, min_iterations(1), max_iterations(8), dependency_length(1)]]
-    for (uint t = chunk_start; t < chunk_end; ++t) {
+    for (uint t = chunk_start; t < chunk_end; t += 1u) {
         vec4 local_v = vec4(0.0);
         // d loop: head_dim=128 elements with WG=64 stride → exactly 2 iters
         // (= ELEMS_PER_THREAD). Pure reduction into local_v.
@@ -102,7 +102,7 @@ void main() {
         l = l * correction + weight;
         m = m_new;
 
-        [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+        [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; i += 1u) {
             uint d = tid + i * WG;
             float v = load_v(t, g_off + d);
             o[i] = o[i] * correction + weight * v;
@@ -110,16 +110,16 @@ void main() {
     }
 
     uint stride_h = p.n_chunks_active * PARTIAL_STRIDE;
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; i += 1u) {
         uint d = tid + i * WG;
-        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        [[unroll]] for (uint j = 0u; j < 4u; j += 1u) {
             uint h = g * Q_PER_GROUP + j;
             uint base = h * stride_h + chunk * PARTIAL_STRIDE;
             partials[base + d] = o[i][j];
         }
     }
     if (tid == 0u) {
-        [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        [[unroll]] for (uint j = 0u; j < 4u; j += 1u) {
             uint h = g * Q_PER_GROUP + j;
             uint base = h * stride_h + chunk * PARTIAL_STRIDE;
             partials[base + hd] = m[j];

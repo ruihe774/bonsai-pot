@@ -54,14 +54,14 @@ void main() {
     uint nb_q8 = p.k / BLOCK_SIZE;
     uint in_base = p.input_offset + token_idx * p.k;
     uint w_base = p.weight_offset;
-    uint qs_token_word = (p.qs_offset + token_idx * p.k) >> 2;
-    uint d_token_word = (p.d_offset >> 2) + token_idx * nb_q8;
+    uint qs_token_word = (p.qs_offset + token_idx * p.k) >> 2u;
+    uint d_token_word = (p.d_offset >> 2u) + token_idx * nb_q8;
 
     // ---- Phase 1: rms_norm sum-of-squares (vec4 per thread) ----
     float s = 0.0;
-    uint k_v4 = p.k >> 2;
+    uint k_v4 = p.k >> 2u;
     for (uint v = tid; v < k_v4; v += WG) {
-        uint b = in_base + (v << 2);
+        uint b = in_base + (v << 2u);
         vec4 x = vec4(act[b], act[b + 1u], act[b + 2u], act[b + 3u]);
         s += dot(x, x);
     }
@@ -77,7 +77,7 @@ void main() {
     uint block_within_iter = tid / LANES_PER_BLOCK;    // 0..7
 
     uint n_iters = nb_q8 / BLOCKS_PER_ITER;
-    for (uint it = 0u; it < n_iters; ++it) {
+    for (uint it = 0u; it < n_iters; it += 1u) {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
         uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
 

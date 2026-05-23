@@ -30,12 +30,12 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
         // packs 32 weights as 8 sign nibbles; each nibble feeds expand_4_bits
         // and contributes one dotPacked4x8 against 4 i8 activation lanes.
         float w_d = load_f16_at(d_byte_base);
-        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+        [[unroll]] for (uint s = 0u; s < 4u; s += 1u) {
             uint qword = weights[qs_word_base + s];
             uint block_l = b_idx * 4u + s;
             float a_d = q1_a_d_sh[block_l];
             int sumi = 0;
-            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
                 uint bits = (qword >> (i * 4u)) & 0xFu;
                 uint w_packed = expand_4_bits(bits);
                 uint a_packed = q1_a_qs_sh[i * Q1_NB_Q8 + block_l];
@@ -49,13 +49,13 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
         // packs 16 weights as 4 bytes of 4 × 2-bit codes; each byte feeds
         // expand_8_bits and contributes one dotPacked4x8 against 4 i8 lanes.
         float w_d = load_f16_at(d_byte_base);
-        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+        [[unroll]] for (uint s = 0u; s < 4u; s += 1u) {
             uint block_l = b_idx * 4u + s;
             float a_d = q1_a_d_sh[block_l];
             int sumi = 0;
-            [[unroll]] for (uint w = 0u; w < 2u; ++w) {
+            [[unroll]] for (uint w = 0u; w < 2u; w += 1u) {
                 uint qword = weights[qs_word_base + s * 2u + w];
-                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                [[unroll]] for (uint i = 0u; i < 4u; i += 1u) {
                     uint byte = (qword >> (i * 8u)) & 0xFFu;
                     uint w_packed = expand_8_bits(byte);
                     uint a_packed = q1_a_qs_sh[(w * 4u + i) * Q1_NB_Q8 + block_l];
@@ -71,12 +71,12 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
         // expand step. One FP16 weight scale per sub-block; the 4 scales sit
         // in 8 contiguous bytes, fetched as two f16vec2 loads.
         vec4 wd = vec4(load_2xf16_at(d_byte_base), load_2xf16_at(d_byte_base + 4u));
-        [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+        [[unroll]] for (uint s = 0u; s < 4u; s += 1u) {
             uint block_l = b_idx * 4u + s;
             float a_d = q1_a_d_sh[block_l];
             float w_d = wd[s];
             int sumi = 0;
-            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
                 uint w_packed = weights[qs_word_base + s * 8u + i];
                 uint a_packed = q1_a_qs_sh[i * Q1_NB_Q8 + block_l];
                 sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;
@@ -90,9 +90,9 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
     float w_d = load_f16_at(d_byte_base);
     uint x_base = b_idx * 32u;
     f16vec4 acc4 = f16vec4(0.0);
-    [[unroll]] for (uint s = 0u; s < 4u; ++s) {
+    [[unroll]] for (uint s = 0u; s < 4u; s += 1u) {
         uint qword = weights[qs_word_base + s];
-        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
             uint bits = (qword >> (i * 4u)); // & 0xFu;
             f16vec4 a4 = q1_x_sh[x_base + s * 8u + i];
             // Q1_0 sign convention: bit=1 → +a, bit=0 → -a.

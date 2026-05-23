@@ -90,10 +90,10 @@ void write_block(float v, uint block_global) {
     uint packed = pack4(qv);
     if ((lane_in_block & 3u) == 0u) {
         uint qs_byte = p.out_qs_offset + block_global * 32u + lane_in_block;
-        outbuf[qs_byte >> 2] = packed;
+        outbuf[qs_byte >> 2u] = packed;
     }
     if (lane_in_block == 0u) {
-        outbuf[(p.out_d_offset >> 2) + block_global] = floatBitsToUint(max_abs / 127.0);
+        outbuf[(p.out_d_offset >> 2u) + block_global] = floatBitsToUint(max_abs / 127.0);
     }
 }
 
@@ -117,15 +117,15 @@ void main() {
     uint t_max = p.pos_base + m_idx.y + uint(ml_valid.y);
 
     uint d_lane[ELEMS_PER_THREAD];
-    [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { d_lane[e] = tid + e * WG; }
+    [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) { d_lane[e] = tid + e * WG; }
 
     // Per-thread Q registers, online-softmax (m/l) state, and output accumulators.
     // [[unroll]] on every loop indexed into these arrays makes the indices
     // compile-time constants in SPIR-V, so the arrays stay in registers.
     float q[Q_TILE][Q_PER_GROUP][ELEMS_PER_THREAD];
-    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
-        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
-            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
+        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; pg += 1u) {
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) {
                 q[ml][pg][e] = float(act[q_base[ml] + pg * hd + d_lane[e]]);
             }
         }
@@ -133,29 +133,29 @@ void main() {
 
     vec4 m_run[Q_TILE];
     vec4 l_run[Q_TILE];
-    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
         m_run[ml] = vec4(NEG_INF);
         l_run[ml] = vec4(0.0);
     }
 
     float o[Q_TILE][Q_PER_GROUP][ELEMS_PER_THREAD];
-    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
-        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
-            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { o[ml][pg][e] = 0.0; }
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
+        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; pg += 1u) {
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) { o[ml][pg][e] = 0.0; }
         }
     }
 
-    for (uint t = 0u; t < t_max; ++t) {
+    for (uint t = 0u; t < t_max; t += 1u) {
         float k_e[ELEMS_PER_THREAD];
-        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { k_e[e] = load_k(t, g_off + d_lane[e]); }
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) { k_e[e] = load_k(t, g_off + d_lane[e]); }
 
         vec4 corr[Q_TILE];
         vec4 w_attn[Q_TILE];
-        [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+        [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
             vec4 local_dots;
-            [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
+            [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; pg += 1u) {
                 float d_acc = 0.0;
-                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { d_acc += q[ml][pg][e] * k_e[e]; }
+                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) { d_acc += q[ml][pg][e] * k_e[e]; }
                 local_dots[pg] = d_acc;
             }
             // wg_sum_v4 early-returns to a single subgroupAdd when the WG fits
@@ -172,11 +172,11 @@ void main() {
         }
 
         float v_e[ELEMS_PER_THREAD];
-        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) { v_e[e] = load_v(t, g_off + d_lane[e]); }
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) { v_e[e] = load_v(t, g_off + d_lane[e]); }
 
-        [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
-            [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
-                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+        [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
+            [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; pg += 1u) {
+                [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) {
                     o[ml][pg][e] = o[ml][pg][e] * corr[ml][pg] + w_attn[ml][pg] * v_e[e];
                 }
             }
@@ -189,13 +189,13 @@ void main() {
     // the pg's slice of head_dim, no half_id needed.
     uint nb_per_token = p.n_head * hd / 32u; // = q_dim / 32 = 128
 
-    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ++ml) {
+    [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
         if (!ml_valid[ml])
             continue;
         vec4 inv = 1.0 / l_run[ml];
         uint block_base = m_idx[ml] * nb_per_token + g * Q_PER_GROUP * 4u;
-        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; ++pg) {
-            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; ++e) {
+        [[unroll]] for (uint pg = 0u; pg < Q_PER_GROUP; pg += 1u) {
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) {
                 write_block(o[ml][pg][e] * inv[pg], block_base + pg * 4u + e);
             }
         }

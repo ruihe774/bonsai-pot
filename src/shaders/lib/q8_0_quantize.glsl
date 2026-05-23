@@ -39,12 +39,12 @@ float block_max_abs(float v) {
             sg_partial_amax[cluster_id] = m;
         }
         barrier();
-        uint group_id = tid >> 5;
+        uint group_id = tid >> 5u;
         uint per_group = 32u / SUBGROUP_SIZE;
         uint g_base = group_id * per_group;
         float mm = 0.0;
         [[unroll]]
-        for (uint i = 0u; i < per_group; ++i) {
+        for (uint i = 0u; i < per_group; i += 1u) {
             mm = max(mm, sg_partial_amax[g_base + i]);
         }
         barrier();
@@ -57,6 +57,6 @@ uint pack4(uint qv) {
     // Gather bytes from the 4-lane cluster and pack into one u32.
     // The cluster base is the lane index with the low 2 bits cleared.
     uint base = gl_SubgroupInvocationID & ~3u;
-    return subgroupShuffle(qv, base + 0u) | (subgroupShuffle(qv, base + 1u) << 8) |
-           (subgroupShuffle(qv, base + 2u) << 16) | (subgroupShuffle(qv, base + 3u) << 24);
+    return subgroupShuffle(qv, base + 0u) | (subgroupShuffle(qv, base + 1u) << 8u) |
+           (subgroupShuffle(qv, base + 2u) << 16u) | (subgroupShuffle(qv, base + 3u) << 24u);
 }

@@ -81,12 +81,12 @@ void main() {
 
     // Phase C: per-thread o accumulation using precomputed weights.
     float o[ELEMS_PER_THREAD];
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i)
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; i += 1u)
         o[i] = 0.0;
-    for (uint c = 0u; c < n; ++c) {
+    for (uint c = 0u; c < n; c += 1u) {
         uint pb = head_base + c * PARTIAL_STRIDE;
         float weight = weights_sh[c];
-        [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+        [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; i += 1u) {
             uint d = tid + i * WG;
             o[i] += partials[pb + d] * weight;
         }
@@ -94,7 +94,7 @@ void main() {
 
     float inv_l = 1.0 / l_global;
     uint out_base = p.out_offset + h * hd;
-    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; ++i) {
+    [[unroll]] for (uint i = 0u; i < ELEMS_PER_THREAD; i += 1u) {
         uint d = tid + i * WG;
         act[out_base + d] = float16_t(o[i] * inv_l);
     }
