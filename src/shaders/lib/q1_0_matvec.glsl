@@ -68,11 +68,13 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
     } else {
         // Q8_0: 32 u32 words per super-block (8 per 32-elem native sub-block);
         // each word is 4 i8 weights consumed directly by dotPacked4x8 — no
-        // expand step. One FP16 weight scale per sub-block.
+        // expand step. One FP16 weight scale per sub-block; the 4 scales sit
+        // in 8 contiguous bytes, fetched as two f16vec2 loads.
+        vec4 wd = vec4(load_2xf16_at(d_byte_base), load_2xf16_at(d_byte_base + 4u));
         [[unroll]] for (uint s = 0u; s < 4u; ++s) {
             uint block_l = b_idx * 4u + s;
             float a_d = q1_a_d_sh[block_l];
-            float w_d = load_f16_at(d_byte_base + s * 2u);
+            float w_d = wd[s];
             int sumi = 0;
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 uint w_packed = weights[qs_word_base + s * 8u + i];

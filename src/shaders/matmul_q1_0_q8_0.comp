@@ -75,13 +75,23 @@ void main() {
         // Q1_0/Q2_0: 1 FP16 scale per super-block × 64 cols = 64 loads.
         // Q8_0: 4 scales per super-block × 64 cols = 256 loads (1 per thread).
         if (QUANT_FORMAT == 3u) {
-            uint s = tid / 64u;
-            uint n_local = tid % 64u;
-            uint n_idx = n_base + n_local;
-            w_d_lds[tid] = load_f16_at(p.w_d_offset + (n_idx * nb_q1 * 4u + b * 4u + s) * 2u);
-        } else if (tid < 64u) {
-            uint n_idx = n_base + tid;
-            w_d_lds[tid] = load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
+            // 4 sub-block scales × 64 cols = 256 FP16's. Pair adjacent
+            // sub-blocks (s, s+1) per thread — 128 threads, one f16vec2 each,
+            // writing two LDS slots.
+            if (tid < 128u) {
+                uint s_pair = tid / 64u; // 0 or 1
+                uint n_local = tid % 64u;
+                uint n_idx = n_base + n_local;
+                uint s = s_pair * 2u;
+                vec2 ds = load_2xf16_at(p.w_d_offset + (n_idx * nb_q1 * 4u + b * 4u + s) * 2u);
+                w_d_lds[s * 64u + n_local] = ds.x;
+                w_d_lds[(s + 1u) * 64u + n_local] = ds.y;
+            }
+        } else {
+            if (tid < 64u) {
+                uint n_idx = n_base + tid;
+                w_d_lds[tid] = load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
+            }
         }
         // Each thread loads one qword per pass; Q1_0 = 1 pass, Q2_0 = 2 passes
         // (4 qwords/block × 64 rows = 256 loads per pass = 1 per thread).

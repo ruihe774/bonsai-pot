@@ -20,11 +20,13 @@ const uint W_QWORDS_PER_BLOCK = 4u << QUANT_FORMAT;
 // Drives the per-row d-array stride at every caller.
 const uint D_FP16_PER_BLOCK = (QUANT_FORMAT == 3u) ? 4u : 1u;
 
-float load_f16_at(uint b_offset) {
-    uint word = weights[b_offset >> 2];
-    uint half_bits = (word >> ((b_offset & 2u) * 8u));
-    return unpackFloat2x16(half_bits).x;
+vec2 load_2xf16_at(uint b_offset) {
+    // b_offset must be 4-byte aligned. All Bonsai d-arrays are u32-aligned
+    // and we only ever pair adjacent (even-indexed-base) f16 scales.
+    return unpackFloat2x16(weights[b_offset >> 2]);
 }
+
+float load_f16_at(uint b_offset) { return load_2xf16_at(b_offset)[(b_offset >> 1u) & 1u]; }
 
 #ifndef METAL_BACKEND
 uint expand_4_bits(uint bits) {
