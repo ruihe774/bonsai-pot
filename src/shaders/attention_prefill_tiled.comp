@@ -187,7 +187,7 @@ void main() {
     // head_dim=128 packs into 4 Q8_0 blocks (32 elems each). With WG=32, every
     // thread contributes one element per (pg, e); e selects the block within
     // the pg's slice of head_dim, no half_id needed.
-    uint nb_per_token = p.n_head * hd / 32u; // = q_dim / 32 = 128
+    uint nb_per_token = (p.n_head * hd) >> 5u; // = q_dim / 32 = 128
 
     [[unroll]] for (uint ml = 0u; ml < Q_TILE; ml += 1u) {
         if (!ml_valid[ml])

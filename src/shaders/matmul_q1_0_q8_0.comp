@@ -50,12 +50,12 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 void main() {
     uint n_base = gl_WorkGroupID.x * TILE_N;
     uint m_base = gl_WorkGroupID.y * TILE_M;
-    uint nb_q1 = p.k / 128u;
-    uint nb_q8 = p.k / 32u;
+    uint nb_q1 = p.k >> 7u;
+    uint nb_q8 = p.k >> 5u;
     uint tid = gl_LocalInvocationIndex;
 
-    uint lx = tid % WG_N;
-    uint ly = tid / WG_N;
+    uint lx = tid & (WG_N - 1u);
+    uint ly = tid >> 4u; // / WG_N
 
     float acc[16];
     [[unroll]] for (uint i = 0u; i < 16u; i += 1u)
@@ -79,8 +79,8 @@ void main() {
             // sub-blocks (s, s+1) per thread — 128 threads, one f16vec2 each,
             // writing two LDS slots.
             if (tid < 128u) {
-                uint s_pair = tid / 64u; // 0 or 1
-                uint n_local = tid % 64u;
+                uint s_pair = tid >> 6u; // 0 or 1
+                uint n_local = tid & 63u;
                 uint n_idx = n_base + n_local;
                 uint s = s_pair * 2u;
                 vec2 ds = load_2xf16_at(p.w_d_offset + (n_idx * nb_q1 * 4u + b * 4u + s) * 2u);
@@ -96,15 +96,15 @@ void main() {
         // Each thread loads one qword per pass; Q1_0 = 1 pass, Q2_0 = 2 passes
         // (4 qwords/block × 64 rows = 256 loads per pass = 1 per thread).
         [[unroll]] for (uint pass = 0u; pass < (W_QWORDS_PER_BLOCK / 4u); pass += 1u) {
-            uint n_local = tid / 4u;
-            uint s = (tid % 4u) + pass * 4u;
+            uint n_local = tid >> 2u;
+            uint s = (tid & 3u) + pass * 4u;
             uint n_idx = n_base + n_local;
             uint off = p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + s * 4u;
             w_bits_lds[s * 64u + n_local] = weights[off >> 2u];
         }
         {
-            uint s = tid / 64u;
-            uint m_local = tid % 64u;
+            uint s = tid >> 6u;
+            uint m_local = tid & 63u;
             uint m_idx = m_base + m_local;
             uint a_block = b * 4u + s;
             uint off = p.a_d_offset + (m_idx * nb_q8 + a_block) * 4u;
@@ -112,8 +112,8 @@ void main() {
         }
         [[unroll]] for (uint li = 0u; li < 8u; li += 1u) {
             uint idx = li * WG + tid;
-            uint m_local = idx / 32u;
-            uint su = idx % 32u;
+            uint m_local = idx >> 5u;
+            uint su = idx & 31u;
             uint m_idx = m_base + m_local;
             uint off = p.a_qs_offset + m_idx * p.k + b * 128u + su * 4u;
             a_qs_lds[m_local * 32u + su] = acts[off >> 2u];

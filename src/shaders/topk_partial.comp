@@ -140,8 +140,8 @@ void main() {
     while (s > 0u) {
         uint n_stage0 = s * K_MAX;
         for (uint k = tid; k < n_stage0; k += WG) {
-            uint pair_id = k / K_MAX;
-            uint i = k % K_MAX;
+            uint pair_id = k >> 5u; // / K_MAX
+            uint i = k & (K_MAX - 1u);
             uint a_base = pair_id * K_MAX;
             uint b_base = (pair_id + s) * K_MAX;
             uint bi = K_MAX - 1u - i;
@@ -160,8 +160,8 @@ void main() {
         [[unroll, min_iterations(4), max_iterations(4), dependency_length(1)]]
         while (stride > 0u) {
             for (uint k = tid; k < n_perstage; k += WG) {
-                uint pair_id = k / (K_MAX / 2u);
-                uint local_k = k % (K_MAX / 2u);
+                uint pair_id = k >> 4u; // / (K_MAX / 2u)
+                uint local_k = k & ((K_MAX / 2u) - 1u);
                 uint lo = ((local_k & ~(stride - 1u)) << 1u) | (local_k & (stride - 1u));
                 uint hi = lo | stride;
                 uint a_base = pair_id * K_MAX;
@@ -176,10 +176,10 @@ void main() {
                 }
             }
             barrier();
-            stride = stride / 2u;
+            stride = stride >> 1u;
         }
 
-        s = s / 2u;
+        s = s >> 1u;
     }
 
     // ---- Phase 3: write top-K_MAX of this WG to scratch ----

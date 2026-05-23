@@ -93,11 +93,11 @@ void main() {
 #endif
     uint wg_idx = gl_WorkGroupID.y * p.dispatch_x_dim + gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationIndex;
-    uint ty = tid / WG_X;
-    uint tx = tid % WG_X;
+    uint ty = tid >> 3u; // / WG_X
+    uint tx = tid & (WG_X - 1u);
     uint global_row = wg_idx * ROWS_PER_WG + ty;
     bool valid = global_row < p.n_total;
-    uint nb_q1 = K / 128u;
+    uint nb_q1 = K >> 7u;
 
     // ---- Stage 1: load x and w_norm; stage `x * w_norm` into q1_x_sh; accumulate ssq.
     uint in_v4_off = p.input_offset >> 2u;

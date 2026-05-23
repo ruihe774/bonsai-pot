@@ -37,7 +37,7 @@ uint load_byte_at(uint b_offset) {
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
-    uint nb = p.k / 128u;
+    uint nb = p.k >> 7u;
     uint row = sample_in[p.sample_offset + gl_WorkGroupID.x];
     uint tid = gl_LocalInvocationID.x;
     if (tid >= nb)

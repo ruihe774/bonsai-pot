@@ -124,7 +124,7 @@ void main() {
     uint pv = packSnorm4x8(v_raw / max(av, 1e-30));
 
     uint pos_abs = p.pos_base + tok;
-    uint block_in_head = tid / LANES_PER_BLOCK;                 // 0..3
+    uint block_in_head = tid >> 3u;                             // 0..3; / LANES_PER_BLOCK
     uint lane_in_block = tid - block_in_head * LANES_PER_BLOCK; // 0..7
 
     // qs write: one u32 per thread, no cross-lane gather.

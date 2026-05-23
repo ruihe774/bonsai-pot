@@ -51,7 +51,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 void main() {
     uint token_idx = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
-    uint nb_q8 = p.k / BLOCK_SIZE;
+    uint nb_q8 = p.k >> 5u; // / BLOCK_SIZE
     uint in_base = p.input_offset + token_idx * p.k;
     uint w_base = p.weight_offset;
     uint qs_token_word = (p.qs_offset + token_idx * p.k) >> 2u;
@@ -74,9 +74,9 @@ void main() {
 
     // ---- Phase 2: per-block normalize + Q8_0 quantize ----
     uint lane_in_block = tid & (LANES_PER_BLOCK - 1u); // 0..7
-    uint block_within_iter = tid / LANES_PER_BLOCK;    // 0..7
+    uint block_within_iter = tid >> 3u;                // 0..7; / LANES_PER_BLOCK
 
-    uint n_iters = nb_q8 / BLOCKS_PER_ITER;
+    uint n_iters = nb_q8 >> 3u; // / BLOCKS_PER_ITER
     for (uint it = 0u; it < n_iters; it += 1u) {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
         uint elem_base = it * ELEMS_PER_ITER + tid * 4u;

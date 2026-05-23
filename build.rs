@@ -198,6 +198,7 @@ fn run_glslang(
 fn run_spirv_opt(raw_path: &Path, opt_path: &Path) {
     let status = Command::new("spirv-opt")
         .arg("-O")
+        .arg("--strength-reduction")
         .arg(raw_path)
         .arg("-o")
         .arg(opt_path)

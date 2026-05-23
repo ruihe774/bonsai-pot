@@ -68,7 +68,7 @@ void main() {
     uint ty = gl_LocalInvocationID.y;
     uint tid = ty * WG_X + tx;
     bool valid = row < p.n;
-    uint nb_q1 = p.k / 128u;
+    uint nb_q1 = p.k >> 7u;
 
     uint row_d_byte = p.d_offset + row * nb_q1 * D_FP16_PER_BLOCK * 2u;
     uint row_qs_byte = p.qs_offset + row * nb_q1 * QS_BYTES_PER_BLOCK;
@@ -77,11 +77,11 @@ void main() {
 
     for (uint tile_start = 0u; tile_start < p.k; tile_start += TILE_K) {
         uint tile_size = min(TILE_K, p.k - tile_start);
-        uint nb_q1_tile = tile_size / 128u;
+        uint nb_q1_tile = tile_size >> 7u;
 
 #ifndef METAL_BACKEND
         // ---- Vulkan: in-LDS Q8_0 quantize of silu(g)*u per Q8_0 block ----
-        uint nb_q8_tile = tile_size / 32u;
+        uint nb_q8_tile = tile_size >> 5u;
         if (tid < nb_q8_tile) {
             uint elem_base = tile_start + tid * 32u;
             uint g_v4_off = (p.gate_offset + elem_base) >> 2u;
@@ -123,7 +123,7 @@ void main() {
         barrier();
 
         if (valid) {
-            uint b_q1_base_global = tile_start / 128u;
+            uint b_q1_base_global = tile_start >> 7u;
             for (uint b_local = tx; b_local < nb_q1_tile; b_local += WG_X) {
                 uint b = b_q1_base_global + b_local;
                 uint d_byte = row_d_byte + b * D_FP16_PER_BLOCK * 2u;
