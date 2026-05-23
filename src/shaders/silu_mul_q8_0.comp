@@ -57,14 +57,18 @@ void main() {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
         uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
 
-        f16vec4 gh = f16vec4(act[g_base + elem_base + 0u],
-                             act[g_base + elem_base + 1u],
-                             act[g_base + elem_base + 2u],
-                             act[g_base + elem_base + 3u]);
-        f16vec4 uh = f16vec4(act[u_base + elem_base + 0u],
-                             act[u_base + elem_base + 1u],
-                             act[u_base + elem_base + 2u],
-                             act[u_base + elem_base + 3u]);
+        f16vec4 gh = f16vec4(
+            act[g_base + elem_base + 0u],
+            act[g_base + elem_base + 1u],
+            act[g_base + elem_base + 2u],
+            act[g_base + elem_base + 3u]
+        );
+        f16vec4 uh = f16vec4(
+            act[u_base + elem_base + 0u],
+            act[u_base + elem_base + 1u],
+            act[u_base + elem_base + 2u],
+            act[u_base + elem_base + 3u]
+        );
         vec4 g = vec4(gh);
         vec4 s = g / (vec4(1.0) + exp(-g));
         vec4 v = s * vec4(uh);

@@ -81,14 +81,18 @@ void main() {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
         uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
 
-        vec4 x = vec4(act[in_base + elem_base + 0u],
-                      act[in_base + elem_base + 1u],
-                      act[in_base + elem_base + 2u],
-                      act[in_base + elem_base + 3u]);
-        vec4 wv = vec4(w[w_base + elem_base + 0u],
-                       w[w_base + elem_base + 1u],
-                       w[w_base + elem_base + 2u],
-                       w[w_base + elem_base + 3u]);
+        vec4 x = vec4(
+            act[in_base + elem_base + 0u],
+            act[in_base + elem_base + 1u],
+            act[in_base + elem_base + 2u],
+            act[in_base + elem_base + 3u]
+        );
+        vec4 wv = vec4(
+            w[w_base + elem_base + 0u],
+            w[w_base + elem_base + 1u],
+            w[w_base + elem_base + 2u],
+            w[w_base + elem_base + 3u]
+        );
         vec4 v = x * inv_h * wv;
 
         vec4 av = abs(v);

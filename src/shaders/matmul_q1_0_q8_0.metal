@@ -54,14 +54,16 @@ constant uint TILE_M = 64u; // SG_GRID_M * TM_SG * 8
 constant uint TILE_N = 64u; // SG_GRID_N * TN_SG * 8
 constant uint W_HALF = 64u * TILE_N;
 
-kernel void cs_main(constant Params &p [[buffer(0)]],
-                    device const uint *weights [[buffer(1)]],
-                    device const uint *acts [[buffer(2)]],
-                    device half *y [[buffer(3)]],
-                    uint3 wg_id [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]],
-                    uint sg_id [[simdgroup_index_in_threadgroup]],
-                    uint sg_lane [[thread_index_in_simdgroup]]) {
+kernel void cs_main(
+    constant Params &p [[buffer(0)]],
+    device const uint *weights [[buffer(1)]],
+    device const uint *acts [[buffer(2)]],
+    device half *y [[buffer(3)]],
+    uint3 wg_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint sg_lane [[thread_index_in_simdgroup]]
+) {
     // Full-Q1_0-block fp16 weight tile, row-major as B[k_in_block, n_local],
     // laid out as two contiguous halves of 64 K-rows × 64 N-cols each (8 KB
     // per half, 16 KB total). The MMA inner loop walks the halves
