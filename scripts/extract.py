@@ -7,8 +7,8 @@
 # ]
 # ///
 """
-Extract a Bonsai (Qwen3-family) Q1_0 or Q2_0 GGUF into a flat directory the
-Rust runtime can load.
+Extract a Bonsai/Qwen3-family Q1_0, Q2_0, or Q8_0 GGUF into a flat directory
+the Rust runtime can load.
 
 Output layout (under --out, default ./model):
   config.ini        hyperparams + tensor manifest (offsets & shapes within
@@ -26,10 +26,14 @@ Output layout (under --out, default ./model):
 
 Q1_0 tensors store 128-element blocks as 16 bytes of sign bits + 2-byte FP16
 scale (= 18 B/block); Q2_0 tensors store the same 128-element blocks as
-32 bytes of 2-bit codes + 2-byte FP16 scale (= 34 B/block). The model-wide
-format is autodetected from the GGUF; `quant_format` in `config.ini` records
-which one. Per row, we split into a d-array (FP16 scales) followed by a
-qs-array; both halves are u32-aligned. Each tensor's region is 4-byte padded.
+32 bytes of 2-bit codes + 2-byte FP16 scale (= 34 B/block). Q8_0 is the GGML-
+native 32-element block (32 i8 + 2-byte FP16 scale = 34 B/block); we treat it
+as a 128-element super-block of 4 native sub-blocks (= 8 B d + 128 B qs per
+super-block) so all three formats share `nb = n_in/128`. The model-wide format
+is autodetected from the GGUF; `quant_format` in `config.ini` records which
+one. Per row, we split into a d-array (FP16 scales — `nb` for Q1_0/Q2_0,
+`4*nb` for Q8_0) followed by a qs-array; both halves are u32-aligned. Each
+tensor's region is 4-byte padded.
 
 Norms (originally F32 in the GGUF) are downcast to F16 on disk so the
 runtime can bind them as `array<f16>` without a load-time conversion.
@@ -40,6 +44,7 @@ Usage:
   uv run scripts/extract.py path/to/Bonsai-8B-Q1_0.gguf --out ./model-8b
   uv run scripts/extract.py path/to/Bonsai-4B-Q1_0.gguf --out ./model
   uv run scripts/extract.py path/to/Ternary-Bonsai-4B-Q2_0.gguf --out ./model-ternary-4b
+  uv run scripts/extract.py path/to/Qwen3-4B-Q8_0.gguf --out ./model-q8
 """
 import argparse, os, struct
 import gguf
@@ -53,9 +58,9 @@ def field_str(f):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Extract a Bonsai/Qwen3 Q1_0 or Q2_0 GGUF into a flat model dir.",
+        description="Extract a Bonsai/Qwen3 Q1_0, Q2_0, or Q8_0 GGUF into a flat model dir.",
     )
-    ap.add_argument("gguf", help="path to a Bonsai-*.gguf (Qwen3 Q1_0/Q2_0 family)")
+    ap.add_argument("gguf", help="path to a Bonsai-*.gguf or Qwen3-*.gguf (Q1_0/Q2_0/Q8_0)")
     ap.add_argument("--out", default="./model",
                     help="output directory (default: ./model)")
     args = ap.parse_args()
@@ -80,7 +85,12 @@ def main():
         "padding_token_id": int(fld("tokenizer.ggml.padding_token_id")),
         "add_bos":   bool(fld("tokenizer.ggml.add_bos_token") or False),
         "context_length": int(fld("qwen3.context_length")),
-        "rope_orig_context": int(fld("qwen3.rope.scaling.original_context_length")),
+        # Bonsai GGUFs carry the (pre-scaling) RoPE original context length as
+        # a separate field; stock Qwen3 GGUFs lack it — fall back to
+        # context_length in that case (no YaRN/NTK scaling configured).
+        "rope_orig_context": int(
+            fld("qwen3.rope.scaling.original_context_length") or fld("qwen3.context_length")
+        ),
     }
     cfg["n_kv_groups"] = cfg["n_head"] // cfg["n_kv_head"]
     cfg["q_dim"]  = cfg["n_head"] * cfg["head_dim"]
@@ -92,11 +102,12 @@ def main():
     by_name = {t.name: t for t in r.tensors}
     n_layer = cfg["n_layer"]
 
-    QK = 128  # weights per block (same for Q1_0 and Q2_0)
-    # (gguf type, blk_bytes) per supported quant format.
+    QK = 128  # weights per super-block (Q1_0/Q2_0 native; Q8_0 = 4 × native 32-elem block)
+    # (gguf type, super-block bytes, native blocks per super-block) per supported quant format.
     QFORMATS = {
-        "Q1_0": (gguf.GGMLQuantizationType.Q1_0, 18),  # 2 d + 16 qs
-        "Q2_0": (gguf.GGMLQuantizationType.Q2_0, 34),  # 2 d + 32 qs
+        "Q1_0": (gguf.GGMLQuantizationType.Q1_0, 18, 1),  # 2 d + 16 qs
+        "Q2_0": (gguf.GGMLQuantizationType.Q2_0, 34, 1),  # 2 d + 32 qs
+        "Q8_0": (gguf.GGMLQuantizationType.Q8_0, 4 * 34, 4),  # 4 × (2 d + 32 qs) = 8 d + 128 qs
     }
     def pad4(n):
         return (n + 3) & ~3
@@ -105,17 +116,17 @@ def main():
     # All Q tensors in a Bonsai model share a single format.
     detected = None
     for t in r.tensors:
-        for fmt, (gtype, _) in QFORMATS.items():
+        for fmt, (gtype, _, _) in QFORMATS.items():
             if t.tensor_type == gtype:
                 detected = fmt
                 break
         if detected is not None:
             break
     if detected is None:
-        raise RuntimeError("no Q1_0 or Q2_0 tensors found in GGUF")
+        raise RuntimeError("no Q1_0/Q2_0/Q8_0 tensors found in GGUF")
     cfg["quant_format"] = detected
-    QUANT_GTYPE, QUANT_BLK_BYTES = QFORMATS[detected]
-    print(f"quant format: {detected} ({QUANT_BLK_BYTES} B/block)")
+    QUANT_GTYPE, QUANT_BLK_BYTES, NATIVE_PER_SUPER = QFORMATS[detected]
+    print(f"quant format: {detected} ({QUANT_BLK_BYTES} B per 128-elem super-block)")
 
     manifest = {"tensors": {}}
 
@@ -138,10 +149,14 @@ def main():
             assert expected_dtype == detected, f"{name}: dtype mismatch"
             n_in, n_out = shape[0], shape[1] if len(shape) > 1 else 1
             nb = n_in // QK
-            qs_bytes = QUANT_BLK_BYTES - 2
-            raw = data.reshape(n_out, nb, QUANT_BLK_BYTES)
-            d_arr  = np.ascontiguousarray(raw[:, :, :2])
-            qs_arr = np.ascontiguousarray(raw[:, :, 2:])
+            # For Q1_0/Q2_0: one (d, qs) pair per 128-elem super-block.
+            # For Q8_0: 4 native (d, qs) pairs per 128-elem super-block — we
+            # reshape and slice so the d-array carries `4*nb` FP16 scales per
+            # row and the qs-array carries `128*nb` i8 bytes per row.
+            native_bytes = QUANT_BLK_BYTES // NATIVE_PER_SUPER  # 18 / 34 / 34
+            raw = data.reshape(n_out, nb, NATIVE_PER_SUPER, native_bytes)
+            d_arr  = np.ascontiguousarray(raw[:, :, :, :2])    # (n_out, nb, native, 2 B)
+            qs_arr = np.ascontiguousarray(raw[:, :, :, 2:])    # (n_out, nb, native, native_bytes-2 B)
             d_offset = out_f.tell()
             out_f.write(d_arr.tobytes())
             pad = pad4(out_f.tell()) - out_f.tell()

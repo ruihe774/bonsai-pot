@@ -1,19 +1,24 @@
-// Q1_0 / Q2_0 weight helpers.
+// Q1_0 / Q2_0 / Q8_0 weight helpers.
 // Contract: caller declares `WBuf { uint weights[]; }` at an appropriate binding.
 
-// Pipeline-time format selector: 0 = Q1_0 (16 qs bytes/block, binary signs),
-// 1 = Q2_0 (32 qs bytes/block, 2-bit codes). Patched at `Model::load` via
-// `spirv_set_spec_const_u32`; the driver constant-folds the conditional below
-// so only the active arm survives.
+// Pipeline-time format selector. Encoded so the `<< QUANT_FORMAT` shifts
+// below give the right qs stride per 128-elem super-block:
+//   0 = Q1_0 (16 qs bytes, binary signs)
+//   1 = Q2_0 (32 qs bytes, ternary 2-bit codes)
+//   3 = Q8_0 (128 qs bytes = 4 × 32 native i8 blocks, 4 FP16 d/super-block)
+// Patched at `Model::load` via `spirv_set_spec_const_u32`; the driver
+// constant-folds the conditionals below so only the active arm survives.
 layout(constant_id = 3) const uint QUANT_FORMAT = 0u;
 
-// Per-block qs byte stride. Q1_0 packs 128 weights as 16 bytes of sign bits;
-// Q2_0 packs the same 128 weights as 32 bytes of 2-bit codes.
+// Per-super-block qs byte stride: 16 / 32 / 128 for Q1_0/Q2_0/Q8_0.
 const uint QS_BYTES_PER_BLOCK = 16u << QUANT_FORMAT;
 
-// Q1_0: 4 u32 qwords per 128-weight block (16 qs bytes). Q2_0: 8 qwords
-// (32 qs bytes). Driver folds the conditional via SpecConstId 3.
+// Per-super-block u32 word count: 4 / 8 / 32 for Q1_0/Q2_0/Q8_0.
 const uint W_QWORDS_PER_BLOCK = 4u << QUANT_FORMAT;
+
+// FP16 d-scales per 128-elem super-block: 1 for Q1_0/Q2_0, 4 for Q8_0.
+// Drives the per-row d-array stride at every caller.
+const uint D_FP16_PER_BLOCK = (QUANT_FORMAT == 3u) ? 4u : 1u;
 
 float load_f16_at(uint b_offset) {
     uint word = weights[b_offset >> 2];

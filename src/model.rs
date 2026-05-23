@@ -956,6 +956,7 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
         match s {
             "Q1_0" => Ok("Q1_0"),
             "Q2_0" => Ok("Q2_0"),
+            "Q8_0" => Ok("Q8_0"),
             "F16" => Ok("F16"),
             _ => Err(PotError::Config("manifest: unknown dtype")),
         }
@@ -964,6 +965,7 @@ fn parse_config_ini(text: &str) -> Result<ModelConfig> {
         match s {
             "Q1_0" => Ok("Q1_0"),
             "Q2_0" => Ok("Q2_0"),
+            "Q8_0" => Ok("Q8_0"),
             _ => Err(PotError::Config("config: unknown quant_format")),
         }
     }
@@ -1089,7 +1091,7 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
     let kv_dim = cfg.kv_dim;
     let n_vocab = cfg.n_vocab;
     let head_dim = cfg.head_dim;
-    let qf = cfg.quant_format; // "Q1_0" or "Q2_0"
+    let qf = cfg.quant_format; // "Q1_0", "Q2_0", or "Q8_0"
 
     // Per-layer tensors (iterated over all layers).
     let layer_specs: &[(&str, &str, &[u32], &str)] = &[
@@ -1160,8 +1162,15 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
             return Err(PotError::Config("manifest: tensor is in wrong buffer file"));
         }
         match dtype {
-            "Q1_0" | "Q2_0" => {
-                let qs_bytes_per_block: u32 = if dtype == "Q1_0" { 16 } else { 32 };
+            "Q1_0" | "Q2_0" | "Q8_0" => {
+                // Per 128-elem super-block: (d_fp16_per_block × 2 B) + qs_bytes_per_block.
+                // Q8_0 fuses 4 native 32-elem blocks per super-block → 4 d, 128 qs.
+                let (d_fp16_per_block, qs_bytes_per_block): (u32, u32) = match dtype {
+                    "Q1_0" => (1, 16),
+                    "Q2_0" => (1, 32),
+                    "Q8_0" => (4, 128),
+                    _ => unreachable!(),
+                };
                 let n_in = shape[0];
                 let n_out = if shape.len() > 1 { shape[1] } else { 1 };
                 if !n_in.is_multiple_of(128) {
@@ -1173,10 +1182,10 @@ fn validate_cfg(cfg: &ModelConfig) -> Result<()> {
                 if e.nb != nb {
                     return Err(PotError::Config("manifest: Q-tensor nb != n_in/128"));
                 }
-                let expected_qs_offset = pad4(e.d_offset + n_out * nb * 2);
+                let expected_qs_offset = pad4(e.d_offset + n_out * nb * d_fp16_per_block * 2);
                 if e.qs_offset != expected_qs_offset {
                     return Err(PotError::Config(
-                        "manifest: Q-tensor qs_offset != pad4(d_offset + n_out*nb*2)",
+                        "manifest: Q-tensor qs_offset != pad4(d_offset + n_out*nb*d_fp16_per_block*2)",
                     ));
                 }
                 let expected_length =
@@ -1729,13 +1738,25 @@ impl Model {
             }};
         }
         let no_spec: &[(u32, u32)] = &[];
-        let quant_fmt_id: u32 = if cfg.quant_format == "Q2_0" {
-            if cfg!(target_vendor = "apple") {
-                return Err(PotError::Config("Q2_0 is not supported in Metal backend"));
+        // Spec-constant values: Q1_0=0, Q2_0=1, Q8_0=3. The encoding lets the
+        // existing `16u << QUANT_FORMAT` / `4u << QUANT_FORMAT` formulas in
+        // lib/q1_0_load.glsl yield 128 qs bytes / 32 u32 words per 128-elem
+        // super-block for Q8_0 without any per-format branch on the size.
+        let quant_fmt_id: u32 = match cfg.quant_format {
+            "Q1_0" => 0,
+            "Q2_0" => {
+                if cfg!(target_vendor = "apple") {
+                    return Err(PotError::Config("Q2_0 is not supported in Metal backend"));
+                }
+                1
             }
-            1
-        } else {
-            0
+            "Q8_0" => {
+                if cfg!(target_vendor = "apple") {
+                    return Err(PotError::Config("Q8_0 is not supported in Metal backend"));
+                }
+                3
+            }
+            _ => return Err(PotError::Config("unknown quant_format")),
         };
         let qf_spec: &[(u32, u32)] = &[(SPEC_QUANT_FORMAT, quant_fmt_id)];
 

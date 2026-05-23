@@ -1,6 +1,6 @@
 #version 460
 
-// Q1_0 / Q2_0 row gather: dequant ONE row of the embedding matrix into f16.
+// Q1_0 / Q2_0 / Q8_0 row gather: dequant ONE row of the embedding matrix into f16.
 // Reads the row index (token_id) from `sample[sample_offset + wg.x]`; this
 // lets us chain steps on the GPU without a CPU round-trip — argmax of step
 // N writes the input token for step N+1.
@@ -43,11 +43,12 @@ void main() {
     if (tid >= nb)
         return;
     uint b = tid;
-    uint d_bits = load_half_bits(p.d_offset + (row * nb + b) * 2u);
+    uint d_byte_base = p.d_offset + (row * nb + b) * D_FP16_PER_BLOCK * 2u;
     uint qs_b = p.qs_offset + (row * nb + b) * QS_BYTES_PER_BLOCK;
     uint out_base = p.output_offset + gl_WorkGroupID.x * p.k + b * 128u;
     if (QUANT_FORMAT == 0u) {
-        // Q1_0: 16 qs bytes/block, each byte = 8 sign bits.
+        // Q1_0: 16 qs bytes/super-block, each byte = 8 sign bits.
+        uint d_bits = load_half_bits(d_byte_base);
         [[unroll]]
         for (uint k = 0u; k < 16u; ++k) {
             uint qb = load_byte_at(qs_b + k);
@@ -58,9 +59,10 @@ void main() {
                 x[out_base + k * 8u + bit] = uint16BitsToHalf(uint16_t(signed_bits));
             }
         }
-    } else {
-        // Q2_0: 32 qs bytes/block, each byte = 4 codes of 2 bits;
+    } else if (QUANT_FORMAT == 1u) {
+        // Q2_0: 32 qs bytes/super-block, each byte = 4 codes of 2 bits;
         // weight = (q - 1) * d for q ∈ {0,1,2,3}.
+        uint d_bits = load_half_bits(d_byte_base);
         [[unroll]]
         for (uint k = 0u; k < 32u; ++k) {
             uint qb = load_byte_at(qs_b + k);
@@ -68,6 +70,20 @@ void main() {
             for (uint c = 0u; c < 4u; ++c) {
                 int q = int((qb >> (c * 2u)) & 0x3u);
                 x[out_base + k * 4u + c] = float16_t(q - 1) * uint16BitsToHalf(uint16_t(d_bits));
+            }
+        }
+    } else {
+        // Q8_0: 128 qs bytes/super-block = 4 native 32-elem sub-blocks, each
+        // with its own FP16 d. Weight = i8(qb) * d_sub.
+        [[unroll]]
+        for (uint s = 0u; s < 4u; ++s) {
+            float16_t d_h = uint16BitsToHalf(uint16_t(load_half_bits(d_byte_base + s * 2u)));
+            [[unroll]]
+            for (uint k = 0u; k < 32u; ++k) {
+                int q = int(load_byte_at(qs_b + s * 32u + k));
+                // Sign-extend the i8: bit 7 maps the 0..255 byte to -128..127.
+                q = (q ^ 0x80) - 0x80;
+                x[out_base + s * 32u + k] = float16_t(q) * d_h;
             }
         }
     }
