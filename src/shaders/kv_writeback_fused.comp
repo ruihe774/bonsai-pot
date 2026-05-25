@@ -37,9 +37,9 @@ layout(push_constant) uniform Params {
 }
 p;
 
-layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
-layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w_norms[]; };
-layout(set = 0, binding = 2, std430) readonly buffer RopeBuf { float16_t rope_cs[]; };
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf { f16vec4 act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf { f16vec4 w_norms[]; };
+layout(set = 0, binding = 2, std430) readonly buffer RopeBuf { f16vec2 rope_cs[]; };
 layout(set = 0, binding = 3, std430) buffer KBuf { uint kv_k[]; };
 layout(set = 0, binding = 4, std430) buffer VBuf { uint kv_v[]; };
 
@@ -68,14 +68,14 @@ void main() {
 
     uint kv_token_off = tok * p.kv_dim + head * HEAD_DIM;
     uint base_pos = tid * ELEMS_PER_THREAD; // 0..124, head_dim element offset
-    uint k_load = p.k_cur_off + kv_token_off + base_pos;
-    uint v_load = p.v_cur_off + kv_token_off + base_pos;
-    uint w_load = p.w_k_norm_off + base_pos;
+    uint k_load = (p.k_cur_off + kv_token_off + base_pos) >> 2u;
+    uint v_load = (p.v_cur_off + kv_token_off + base_pos) >> 2u;
+    uint w_load = (p.w_k_norm_off + base_pos) >> 2u;
 
     // ---- Load K, V, w_k_norm as vec4 ----
-    vec4 k_raw = vec4(act[k_load + 0u], act[k_load + 1u], act[k_load + 2u], act[k_load + 3u]);
-    vec4 v_raw = vec4(act[v_load + 0u], act[v_load + 1u], act[v_load + 2u], act[v_load + 3u]);
-    f16vec4 wkn = f16vec4(w_norms[w_load + 0u], w_norms[w_load + 1u], w_norms[w_load + 2u], w_norms[w_load + 3u]);
+    vec4 k_raw = vec4(act[k_load]);
+    vec4 v_raw = vec4(act[v_load]);
+    f16vec4 wkn = w_norms[w_load];
 
     // ---- RMS sum-of-squares over the K head (128 elements) ----
     float inv_h = inversesqrt(wg_sum(dot(k_raw, k_raw)) / float(HEAD_DIM) + p.eps);
@@ -91,19 +91,18 @@ void main() {
     // RoPE half (lower or upper), since 4 | 64.
     f16vec4 partner = rope_in_sh[tid ^ 16u];
     uint j_base = base_pos & ~HALF_DIM;
-    uint cs_base = p.rope_offset + (p.pos_base + tok) * HEAD_DIM;
+    uint cs_base = (p.rope_offset + (p.pos_base + tok) * HEAD_DIM) >> 1u;
 
     vec4 k_post;
     [[unroll]] for (uint e = 0u; e < ELEMS_PER_THREAD; e += 1u) {
         uint j = j_base + e;
-        float c = float(rope_cs[cs_base + j * 2u]);
-        float s = float(rope_cs[cs_base + j * 2u + 1u]);
+        vec2 cs = rope_cs[cs_base + j];
         float a = float(k_normed[e]);
         float b = float(partner[e]);
-        s = uintBitsToFloat((base_pos - HALF_DIM) & 0x80000000u ^ floatBitsToUint(s));
+        b = uintBitsToFloat((base_pos - HALF_DIM) & 0x80000000u ^ floatBitsToUint(b));
         // is_lower:  a*c - b*s   (a is lower, b is upper partner)
         // upper:     a*c + b*s   (a is upper, b is lower partner)
-        k_post[e] = dot(vec2(a, b), vec2(c, s));
+        k_post[e] = dot(vec2(a, b), cs);
     }
 
     // ---- Per-32-block max-abs for K and V (8-lane subgroup butterfly) ----

@@ -30,15 +30,14 @@ layout(push_constant) uniform Params {
 }
 p;
 
-layout(set = 0, binding = 0, std430) readonly buffer ActBuf { float16_t act[]; };
-layout(set = 0, binding = 1, std430) readonly buffer WBuf { float16_t w[]; };
+layout(set = 0, binding = 0, std430) readonly buffer ActBuf { f16vec4 act[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WBuf { f16vec4 w[]; };
 layout(set = 0, binding = 2, std430) buffer OutBuf { uint outbuf[]; };
 
 const uint WG = 64u;
 const uint BLOCK_SIZE = 32u;
 const uint LANES_PER_BLOCK = BLOCK_SIZE / 4u;      // 8
 const uint BLOCKS_PER_ITER = WG / LANES_PER_BLOCK; // 8
-const uint ELEMS_PER_ITER = WG * 4u;               // 256
 const uint NUM_SUBGROUPS = (WG + SUBGROUP_SIZE - 1u) / SUBGROUP_SIZE;
 
 shared float sg_partial[NUM_SUBGROUPS];
@@ -52,8 +51,8 @@ void main() {
     uint token_idx = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint nb_q8 = p.k >> 5u; // / BLOCK_SIZE
-    uint in_base = p.input_offset + token_idx * p.k;
-    uint w_base = p.weight_offset;
+    uint in_base = (p.input_offset + token_idx * p.k) >> 2u;
+    uint w_base = p.weight_offset >> 2u;
     uint qs_token_word = (p.qs_offset + token_idx * p.k) >> 2u;
     uint d_token_word = (p.d_offset >> 2u) + token_idx * nb_q8;
 
@@ -61,8 +60,8 @@ void main() {
     float s = 0.0;
     uint k_v4 = p.k >> 2u;
     for (uint v = tid; v < k_v4; v += WG) {
-        uint b = in_base + (v << 2u);
-        vec4 x = vec4(act[b], act[b + 1u], act[b + 2u], act[b + 3u]);
+        uint b = in_base + v;
+        vec4 x = vec4(act[b]);
         s += dot(x, x);
     }
     float total_sq = wg_sum(s);
@@ -79,20 +78,10 @@ void main() {
     uint n_iters = nb_q8 >> 3u; // / BLOCKS_PER_ITER
     for (uint it = 0u; it < n_iters; it += 1u) {
         uint block_global = it * BLOCKS_PER_ITER + block_within_iter;
-        uint elem_base = it * ELEMS_PER_ITER + tid * 4u;
+        uint elem_base = it * WG + tid;
 
-        vec4 x = vec4(
-            act[in_base + elem_base + 0u],
-            act[in_base + elem_base + 1u],
-            act[in_base + elem_base + 2u],
-            act[in_base + elem_base + 3u]
-        );
-        vec4 wv = vec4(
-            w[w_base + elem_base + 0u],
-            w[w_base + elem_base + 1u],
-            w[w_base + elem_base + 2u],
-            w[w_base + elem_base + 3u]
-        );
+        vec4 x = vec4(act[in_base + elem_base]);
+        vec4 wv = vec4(w[w_base + elem_base]);
         vec4 v = x * inv_h * wv;
 
         vec4 av = abs(v);
