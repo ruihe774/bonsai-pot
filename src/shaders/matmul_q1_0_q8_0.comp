@@ -176,10 +176,12 @@ void main() {
                 }
             }
 
+            float wd[TN];
+            [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) { wd[tn] = w_d_lds[d_slot + tn]; }
             [[unroll]] for (uint tm = 0u; tm < TM; tm += 1u) {
                 float a_d = a_d_lds[s * 64u + ly * TM + tm];
                 [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
-                    acc[tm * TN + tn] += a_d * w_d_lds[d_slot + tn] * float(sumi[tm * TN + tn]);
+                    acc[tm * TN + tn] += a_d * wd[tn] * float(sumi[tm * TN + tn]);
                 }
             }
         }
