@@ -2,12 +2,14 @@
 
 // dotPacked4x8EXT matmul: Q1_0/Q2_0/Q8_0 weights × Q8_0 activations -> f16.
 //
-// 64×64 tile, 256 threads, each thread = 4×4 = 16 cells. The decode step
-// (filling `w[TN][8]` packed-i8 weight quads per Q8_0 sub-block) branches on
-// QUANT_FORMAT — Q1_0 unpacks 8 nibbles per qword via expand_4_bits, Q2_0
-// unpacks 4 bytes from each of 2 qwords via expand_8_bits, Q8_0 reads 8 raw
-// qwords (no expand) — but the TM × dp4a accumulation that consumes those
-// quads is shared between formats.
+// 64×64 tile, 256 threads, each thread = 4×4 = 16 cells. Weights are decoded
+// cooperatively into `w_quads_lds[s*512 + i*64 + n_col]` at load time (Q1_0
+// expands 8 nibbles/qword via expand_4_bits, Q2_0 expands 4 bytes from each of
+// 2 qwords via expand_8_bits, Q8_0 stores the raw qwords). The inner
+// accumulation then streams one `i` worth of weights (`w_i[TN]`, 4 regs) from
+// LDS at a time and fans it out across all TM rows — versus the older
+// per-thread `w[TN][8]` (32 regs) cache. Net register save ~25/thread lifts
+// occupancy on register-bound GPUs (NVIDIA Blackwell).
 //
 // Per-sub-block weight scale: Q1_0/Q2_0 broadcast one FP16 d across all 4
 // sub-blocks of a 128-elem super-block; Q8_0 carries 4 distinct FP16 d.
@@ -41,7 +43,7 @@ const uint TILE_N = 64u;
 const uint TILE_M = 64u;
 
 shared float w_d_lds[64 * D_FP16_PER_BLOCK]; // 1 (Q1_0/Q2_0) or 4 (Q8_0) scales × 64 cols
-shared uint w_bits_lds[256 << QUANT_FORMAT];
+shared uint w_quads_lds[2048];               // [s*512 + i*64 + n_col] decoded packed-i8 weight quads
 shared float a_d_lds[256];
 shared uint a_qs_lds[2048];
 
@@ -57,8 +59,8 @@ void main() {
     uint lx = tid & (WG_N - 1u);
     uint ly = tid >> 4u; // / WG_N
 
-    float acc[16];
-    [[unroll]] for (uint i = 0u; i < 16u; i += 1u)
+    float acc[TM * TN];
+    [[unroll]] for (uint i = 0u; i < TM * TN; i += 1u)
         acc[i] = 0.0;
 
     // Bonsai's matmul callers guarantee tile alignment / activation buffer
@@ -93,14 +95,41 @@ void main() {
                 w_d_lds[tid] = load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u);
             }
         }
-        // Each thread loads one qword per pass; Q1_0 = 1 pass, Q2_0 = 2 passes
-        // (4 qwords/block × 64 rows = 256 loads per pass = 1 per thread).
-        [[unroll]] for (uint pass = 0u; pass < (W_QWORDS_PER_BLOCK / 4u); pass += 1u) {
-            uint n_local = tid >> 2u;
-            uint s = (tid & 3u) + pass * 4u;
+        // Decode weights cooperatively into `w_quads_lds[s*512 + i*64 + n_col]`.
+        // Q1_0: 256 threads × 1 qword → 8 decoded quads each.
+        // Q2_0: 256 threads × 2 qwords → 4 decoded quads per qword.
+        // Q8_0: 256 threads × 8 qwords (raw, no decode), kept by existing pass loop.
+        if (QUANT_FORMAT == 0u) {
+            uint s = tid >> 6u;
+            uint n_local = tid & 63u;
             uint n_idx = n_base + n_local;
             uint off = p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + s * 4u;
-            w_bits_lds[s * 64u + n_local] = weights[off >> 2u];
+            uint bw = weights[off >> 2u];
+            [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
+                w_quads_lds[s * 512u + i * 64u + n_local] = expand_4_bits((bw >> (i * 4u)) & 0xFu);
+            }
+        } else if (QUANT_FORMAT == 1u) {
+            uint s = tid >> 6u;
+            uint n_local = tid & 63u;
+            uint n_idx = n_base + n_local;
+            [[unroll]] for (uint wq = 0u; wq < 2u; wq += 1u) {
+                uint off =
+                    p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + (s * 2u + wq) * 4u;
+                uint qword = weights[off >> 2u];
+                [[unroll]] for (uint i = 0u; i < 4u; i += 1u) {
+                    w_quads_lds[s * 512u + (wq * 4u + i) * 64u + n_local] = expand_8_bits((qword >> (i * 8u)) & 0xFFu);
+                }
+            }
+        } else {
+            // Q8_0: 8 passes of 256 raw qwords. Flat qword index s∈[0,32) maps
+            // directly to (sub_s*8 + i), matching w_quads_lds[(s*8+i)*64+n_col].
+            [[unroll]] for (uint pass = 0u; pass < 8u; pass += 1u) {
+                uint n_local = tid >> 2u;
+                uint s = (tid & 3u) + pass * 4u;
+                uint n_idx = n_base + n_local;
+                uint off = p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + s * 4u;
+                w_quads_lds[s * 64u + n_local] = weights[off >> 2u];
+            }
         }
         {
             uint s = tid >> 6u;
@@ -120,60 +149,37 @@ void main() {
         }
         barrier();
 
-        // 4 Q8_0 sub-blocks per 128-elem super-block. The decode step differs
-        // by format (Q1_0: 1 qword/sub-block, 8 nibbles via expand_4_bits;
-        // Q2_0: 2 qwords/sub-block, 4 bytes each via expand_8_bits; Q8_0: 8
-        // raw qwords, no expand) but the resulting 8 packed-i8 weight quads
-        // feed an identical TM × dp4a accumulation. Per-sub-block weight
-        // scale `wd[tn]` is broadcast from one FP16 for Q1_0/Q2_0 and read
-        // per s for Q8_0.
+        // 4 Q8_0 sub-blocks per 128-elem super-block. Inner loop streams one
+        // `i` worth of weight quads from LDS at a time (4 regs) and fans it
+        // out across all TM rows — avoids materializing the full `w[TN][8]`
+        // (32 regs) per thread.
         [[unroll]] for (uint s = 0u; s < 4u; s += 1u) {
-            uint w[TN][8];
-            if (QUANT_FORMAT == 0u) {
+            uint d_slot = (QUANT_FORMAT == 3u) ? (s * 64u + lx * TN) : (lx * TN);
+
+            int sumi[TM * TN];
+            [[unroll]] for (uint t = 0u; t < TM * TN; t += 1u)
+                sumi[t] = 0;
+
+            [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
+                uint w_i[TN];
                 [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
-                    uint bw = w_bits_lds[s * 64u + lx * TN + tn];
-                    [[unroll]] for (uint i = 0u; i < 8u; i += 1u) { w[tn][i] = expand_4_bits((bw >> (i * 4u)) & 0xFu); }
+                    w_i[tn] = w_quads_lds[s * 512u + i * 64u + lx * TN + tn];
                 }
-            } else if (QUANT_FORMAT == 1u) {
-                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
-                    [[unroll]] for (uint wq = 0u; wq < 2u; wq += 1u) {
-                        uint qword = w_bits_lds[(s * 2u + wq) * 64u + lx * TN + tn];
-                        [[unroll]] for (uint i = 0u; i < 4u; i += 1u) {
-                            w[tn][wq * 4u + i] = expand_8_bits((qword >> (i * 8u)) & 0xFFu);
-                        }
-                    }
+                uint a_tm[TM];
+                [[unroll]] for (uint tm = 0u; tm < TM; tm += 1u) {
+                    a_tm[tm] = a_qs_lds[(ly * TM + tm) * 32u + s * 8u + i];
                 }
-            } else {
-                // Q8_0: weights are already packed i8 — read 8 qwords directly.
-                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
-                    [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
-                        w[tn][i] = w_bits_lds[(s * 8u + i) * 64u + lx * TN + tn];
+                [[unroll]] for (uint tm = 0u; tm < TM; tm += 1u) {
+                    [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
+                        sumi[tm * TN + tn] += dotPacked4x8EXT(int(w_i[tn]), int(a_tm[tm]));
                     }
                 }
             }
 
-            float wd[TN];
-            uint d_slot = (QUANT_FORMAT == 3u) ? (s * 64u + lx * TN) : (lx * TN);
-            [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) { wd[tn] = w_d_lds[d_slot + tn]; }
-
             [[unroll]] for (uint tm = 0u; tm < TM; tm += 1u) {
-                uint m_local = ly * TM + tm;
-                float a_d = a_d_lds[s * 64u + m_local];
-                uint a_base = m_local * 32u + s * 8u;
-                uint a[8];
-                [[unroll]] for (uint i = 0u; i < 8u; i += 1u) { a[i] = a_qs_lds[a_base + i]; }
-
-                int sumi[TN];
-                [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u)
-                    sumi[tn] = 0;
-                [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
-                    [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
-                        sumi[tn] = dotPacked4x8EXT(int(w[tn][i]), int(a[i])) + sumi[tn];
-                    }
-                }
-
+                float a_d = a_d_lds[s * 64u + ly * TM + tm];
                 [[unroll]] for (uint tn = 0u; tn < TN; tn += 1u) {
-                    acc[tm * TN + tn] += a_d * wd[tn] * float(sumi[tn]);
+                    acc[tm * TN + tn] += a_d * w_d_lds[d_slot + tn] * float(sumi[tm * TN + tn]);
                 }
             }
         }
