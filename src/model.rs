@@ -872,11 +872,11 @@ pub const BENCH_QS_SLOTS: u32 = 2048;
 /// Cache positions per workgroup in the split-K attention pass. Must match
 /// `CHUNK_SIZE` in `attention_split.comp`.
 pub const ATTN_CHUNK_SIZE: u32 = 8;
-/// System-wide GPU queue scheduling priority, passed via `VK_EXT_global_priority`.
+/// System-wide GPU queue scheduling priority, passed via `VK_KHR_global_priority`.
 ///
 /// Controls how the OS/driver kernel schedules this process's GPU work relative
 /// to *all* other GPU clients (compositors, games, other ML processes). Requires
-/// driver support for `VK_EXT_global_priority`; if unsupported the requested
+/// driver support for `VK_KHR_global_priority`; if unsupported the requested
 /// value is ignored and a warning is logged.
 #[cfg(not(target_vendor = "apple"))]
 pub use ash::vk::QueueGlobalPriorityKHR as GlobalPriority;
@@ -906,12 +906,12 @@ pub struct LoadOptions {
     /// a sequence-length limit, so any value up to the model's
     /// `context_length` is supported (subject to VRAM).
     pub max_seq: u32,
-    /// System-wide GPU scheduling priority via `VK_EXT_global_priority`.
+    /// System-wide GPU scheduling priority via `VK_KHR_global_priority`.
     ///
     /// See [`GlobalPriority`] for the available levels. Default is
     /// [`GlobalPriority::LOW`] — yields to compositors and other GPU clients,
     /// which is appropriate for background inference. If the driver does not
-    /// expose `VK_EXT_global_priority` this field is silently ignored.
+    /// expose `VK_KHR_global_priority` this field is silently ignored.
     #[cfg(not(target_vendor = "apple"))]
     pub priority: GlobalPriority,
     /// Power Preference when choosing a physical adapter.
@@ -1455,7 +1455,7 @@ impl Model {
         // chosen family index through to `device_from_raw`.
         #[cfg(not(target_vendor = "apple"))]
         let hal_open = unsafe {
-            use ash::ext::global_priority;
+            use ash::khr::global_priority;
             use ash::vk;
             use wgpu::hal::api::Vulkan as VulkanApi;
 
@@ -1500,7 +1500,7 @@ impl Model {
                 qci = qci.push_next(&mut gp_info);
             } else {
                 log::warn!(
-                    "VK_EXT_global_priority not supported; ignoring global_priority {:?}",
+                    "VK_KHR_global_priority not supported; ignoring global_priority {:?}",
                     opts.priority
                 );
             }
