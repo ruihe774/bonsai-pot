@@ -1455,7 +1455,7 @@ impl Model {
         // chosen family index through to `device_from_raw`.
         #[cfg(not(target_vendor = "apple"))]
         let hal_open = unsafe {
-            use ash::khr::global_priority;
+            use ash::khr::{global_priority, shader_maximal_reconvergence};
             use ash::vk;
             use wgpu::hal::api::Vulkan as VulkanApi;
 
@@ -1484,11 +1484,24 @@ impl Model {
             let mut enabled_phd_features =
                 hal_adapter.physical_device_features(&enabled_extensions, desc.required_features);
 
-            let gp_supported = instance
+            let supported_extensions = instance
                 .enumerate_device_extension_properties(pd)
-                .unwrap_or_default()
-                .iter()
-                .any(|e| e.extension_name_as_c_str() == Ok(global_priority::NAME));
+                .unwrap_or_default();
+            let mut gp_supported = false;
+            let mut mr_supported = false;
+            for e in supported_extensions {
+                let name = e.extension_name_as_c_str();
+                if name == Ok(global_priority::NAME) {
+                    gp_supported = true;
+                } else if name == Ok(shader_maximal_reconvergence::NAME) {
+                    mr_supported = true;
+                } else {
+                    continue;
+                }
+                if gp_supported && mr_supported {
+                    break;
+                }
+            }
 
             let priorities = [global_priority_fallback_to_queue_prio(opts.priority)];
             let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
@@ -1510,11 +1523,24 @@ impl Model {
             if gp_supported {
                 str_pointers.push(global_priority::NAME.as_ptr());
             }
+            if mr_supported {
+                str_pointers.push(shader_maximal_reconvergence::NAME.as_ptr());
+            }
 
             let pre_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_infos)
                 .enabled_extension_names(&str_pointers);
-            let info = enabled_phd_features.add_to_device_create(pre_info);
+            let mut info = enabled_phd_features.add_to_device_create(pre_info);
+
+            let mut mr = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default()
+                .shader_maximal_reconvergence(true);
+            if mr_supported {
+                info = info.push_next(&mut mr);
+            } else {
+                log::warn!(
+                    "VK_KHR_shader_maximal_reconvergence not supported; shader behaviors may be unexpected"
+                );
+            }
 
             let raw_device = match instance.create_device(pd, &info, None) {
                 Ok(d) => d,
