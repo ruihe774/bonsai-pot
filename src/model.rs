@@ -1325,6 +1325,9 @@ impl Model {
         if !features.contains(wgpu::Features::SHADER_F16) {
             return Err(PotError::FeatureUnsupported("SHADER_F16"));
         }
+        if !features.contains(wgpu::Features::SHADER_I16) {
+            return Err(PotError::FeatureUnsupported("SHADER_I16"));
+        }
         if !features.contains(wgpu::Features::SUBGROUP) {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
@@ -1412,6 +1415,7 @@ impl Model {
         log::debug!("requesting limits: {limits:?}");
 
         let required_features = wgpu::Features::SHADER_F16
+            | wgpu::Features::SHADER_I16
             | wgpu::Features::SUBGROUP
             | {
                 if cfg!(target_vendor = "apple") {
