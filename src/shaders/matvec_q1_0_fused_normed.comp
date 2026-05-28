@@ -107,7 +107,7 @@ void main() {
         uint base = (in_v4_off + v) << 2u;
         f16vec4 xv4 = f16vec4(act[base + 0u], act[base + 1u], act[base + 2u], act[base + 3u]);
         vec4 xv4f = vec4(xv4);
-        ssq += xv4f.x * xv4f.x + xv4f.y * xv4f.y + xv4f.z * xv4f.z + xv4f.w * xv4f.w;
+        ssq += dot(xv4f, xv4f);
         uint w_base = (w_v4_off + v) << 2u;
         f16vec4 wv4 = f16vec4(w_norms[w_base + 0u], w_norms[w_base + 1u], w_norms[w_base + 2u], w_norms[w_base + 3u]);
         q1_x_sh[v] = xv4 * wv4;
