@@ -39,8 +39,6 @@ const SHADERS: &[&str] = &[
     "topk_merge.comp",
 ];
 
-const HAND_PORTED_MSL: &[&str] = &["matmul_q1_0_q8_0.comp"];
-
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -110,22 +108,6 @@ fn build_apple(manifest_dir: &Path, out_dir: &Path, debug_shaders: bool) {
         let src_path = manifest_dir.join("src/shaders").join(name);
         let msl_path = out_dir.join(format!("{name}.msl"));
         println!("cargo:rerun-if-changed={}", src_path.display());
-
-        if HAND_PORTED_MSL.contains(name) {
-            // Hand-ported MSL bypass: copy the .metal sibling into OUT_DIR
-            // under the same `.msl` name the load-time include macro expects.
-            let metal_path = src_path.with_extension("metal");
-            println!("cargo:rerun-if-changed={}", metal_path.display());
-            fs::copy(&metal_path, &msl_path).unwrap_or_else(|e| {
-                panic!(
-                    "failed to copy hand-ported {} → {}: {e}",
-                    metal_path.display(),
-                    msl_path.display()
-                )
-            });
-            minify_msl(&msl_path);
-            continue;
-        }
 
         let raw_path = out_dir.join(format!("{name}.raw.spv"));
         let opt_path = out_dir.join(format!("{name}.opt.spv"));

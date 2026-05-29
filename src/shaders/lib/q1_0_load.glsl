@@ -28,7 +28,6 @@ vec2 load_2xf16_at(uint b_offset) {
 
 float load_f16_at(uint b_offset) { return load_2xf16_at(b_offset)[(b_offset >> 1u) & 1u]; }
 
-#ifndef METAL_BACKEND
 uint expand_4_bits(uint bits) {
     // Spread 4 input bits to 4 byte LSBs: bit i → byte i, value 0 or 1.
     // 0x00204081 has bits at positions {0,7,14,21}; the mul+mask lands each
@@ -47,6 +46,5 @@ uint expand_8_bits(uint byte) {
     uint trail = mask & 0x01010101u;
     return (((mask >> 1u) & trail) * 0xFFu) | trail;
 }
-#else
+
 float reduce_add(vec4 v) { return v.x + v.y + v.z + v.w; }
-#endif
