@@ -134,10 +134,13 @@ void main() {
         barrier();
     }
 
+    if (!valid)
+        return;
+
     acc += subgroupShuffleXor(acc, 1u);
     acc += subgroupShuffleXor(acc, 2u);
     acc += subgroupShuffleXor(acc, 4u);
-    if (tx == 0u && valid) {
+    if (tx == 0u) {
         uint yi = p.output_offset + row;
         act[yi] = float16_t(p.accumulate != 0u ? float(act[yi]) + acc : acc);
     }

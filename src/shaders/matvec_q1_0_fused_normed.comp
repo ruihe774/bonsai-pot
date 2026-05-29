@@ -134,46 +134,45 @@ void main() {
     barrier();
 #endif
 
+    if (!valid)
+        return;
+
     // ---- Stage 3: matvec inner loop ----
     uint d_off = 0u;
     uint qs_off = 0u;
     uint out_off = 0u;
     uint local_row = 0u;
-    if (valid) {
-        if (global_row < p.n_0) {
-            d_off = p.d_offset_0;
-            qs_off = p.qs_offset_0;
-            out_off = p.output_offset_0;
-            local_row = global_row;
-        } else if (global_row < p.n_0 + p.n_1) {
-            d_off = p.d_offset_1;
-            qs_off = p.qs_offset_1;
-            out_off = p.output_offset_1;
-            local_row = global_row - p.n_0;
-        } else {
-            d_off = p.d_offset_2;
-            qs_off = p.qs_offset_2;
-            out_off = p.output_offset_2;
-            local_row = global_row - p.n_0 - p.n_1;
-        }
+    if (global_row < p.n_0) {
+        d_off = p.d_offset_0;
+        qs_off = p.qs_offset_0;
+        out_off = p.output_offset_0;
+        local_row = global_row;
+    } else if (global_row < p.n_0 + p.n_1) {
+        d_off = p.d_offset_1;
+        qs_off = p.qs_offset_1;
+        out_off = p.output_offset_1;
+        local_row = global_row - p.n_0;
+    } else {
+        d_off = p.d_offset_2;
+        qs_off = p.qs_offset_2;
+        out_off = p.output_offset_2;
+        local_row = global_row - p.n_0 - p.n_1;
     }
 
     uint row_d_byte = d_off + local_row * nb_q1 * D_FP16_PER_BLOCK * 2u;
     uint row_qs_byte = qs_off + local_row * nb_q1 * QS_BYTES_PER_BLOCK;
 
     float acc = 0.0;
-    if (valid) {
-        for (uint b = tx; b < nb_q1; b += WG_X) {
-            uint d_byte = row_d_byte + b * D_FP16_PER_BLOCK * 2u;
-            uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2u;
-            acc += q1_0_block_dot(qs_word_base, b, d_byte);
-        }
+    for (uint b = tx; b < nb_q1; b += WG_X) {
+        uint d_byte = row_d_byte + b * D_FP16_PER_BLOCK * 2u;
+        uint qs_word_base = (row_qs_byte + b * QS_BYTES_PER_BLOCK) >> 2u;
+        acc += q1_0_block_dot(qs_word_base, b, d_byte);
     }
 
     acc += subgroupShuffleXor(acc, 1u);
     acc += subgroupShuffleXor(acc, 2u);
     acc += subgroupShuffleXor(acc, 4u);
-    if (tx == 0u && valid) {
+    if (tx == 0u) {
         uint yi = out_off + local_row;
         act[yi] = float16_t(acc * inv_rms); // fused matvecs don't accumulate
     }
