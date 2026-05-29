@@ -77,6 +77,7 @@ shared vec4 sg_partial4[NUM_SUBGROUPS];
 // with the first write_block call.
 shared float sg_partial_amax[NUM_SUBGROUPS];
 
+#include "lib/bitfield.glsl"
 #include "lib/kv_cache_load.glsl"
 #include "lib/q8_0_quantize.glsl"
 #include "lib/subgroup_reduce_v4.glsl"
@@ -86,7 +87,7 @@ void write_block(float v, uint block_global) {
     uint lane_in_block = gl_LocalInvocationID.x;
     float max_abs = block_max_abs(v);
     float id_inv = 127.0 / max(max_abs, 1e-30);
-    uint qv = uint(int(clamp(round(v * id_inv), -127.0, 127.0))) & 0xFFu;
+    uint qv = extract_bits(uint(int(clamp(round(v * id_inv), -127.0, 127.0))), 0u, 8u);
     uint packed = pack4(qv);
     if ((lane_in_block & 3u) == 0u) {
         uint qs_byte = p.out_qs_offset + block_global * 32u + lane_in_block;

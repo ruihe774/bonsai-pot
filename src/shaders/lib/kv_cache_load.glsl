@@ -9,7 +9,7 @@ float load_k(uint t, uint e_local) {
     uint qs_byte_idx = p.k_qs_byte_offset + elem_idx;
     uint qs_word = k_cache[qs_byte_idx >> 2u];
     uint shift = (qs_byte_idx & 3u) << 3u;
-    int qs_signed = int(qs_word >> shift << 24u) >> 24u;
+    int qs_signed = extract_bits_signed(int(qs_word), shift, 8u);
     return scale * float(qs_signed);
 }
 
@@ -20,6 +20,6 @@ float load_v(uint t, uint e_local) {
     uint qs_byte_idx = p.v_qs_byte_offset + elem_idx;
     uint qs_word = v_cache[qs_byte_idx >> 2u];
     uint shift = (qs_byte_idx & 3u) << 3u;
-    int qs_signed = int(qs_word >> shift << 24u) >> 24u;
+    int qs_signed = extract_bits_signed(int(qs_word), shift, 8u);
     return scale * float(qs_signed);
 }

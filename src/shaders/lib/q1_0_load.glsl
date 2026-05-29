@@ -26,7 +26,7 @@ vec2 load_2xf16_at(uint b_offset) {
     return unpackHalf2x16(weights[b_offset >> 2u]);
 }
 
-float load_f16_at(uint b_offset) { return load_2xf16_at(b_offset)[(b_offset >> 1u) & 1u]; }
+float load_f16_at(uint b_offset) { return load_2xf16_at(b_offset)[extract_bits(b_offset, 1u, 1u)]; }
 
 uint expand_4_bits(uint bits) {
     // Spread 4 input bits to 4 byte LSBs: bit i → byte i, value 0 or 1.

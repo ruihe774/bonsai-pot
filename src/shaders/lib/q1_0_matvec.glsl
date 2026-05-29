@@ -36,7 +36,7 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
             float a_d = q1_a_d_sh[block_l];
             int sumi = 0;
             [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
-                uint bits = (qword >> (i * 4u)) & 0xFu;
+                uint bits = extract_bits(qword, i * 4u, 4u);
                 uint w_packed = expand_4_bits(bits);
                 uint a_packed = q1_a_qs_sh[i * Q1_NB_Q8 + block_l];
                 sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;
@@ -56,7 +56,7 @@ float q1_0_block_dot(uint qs_word_base, uint b_idx, uint d_byte_base) {
             [[unroll]] for (uint w = 0u; w < 2u; w += 1u) {
                 uint qword = weights[qs_word_base + s * 2u + w];
                 [[unroll]] for (uint i = 0u; i < 4u; i += 1u) {
-                    uint byte = (qword >> (i * 8u)) & 0xFFu;
+                    uint byte = extract_bits(qword, i * 8u, 8u);
                     uint w_packed = expand_8_bits(byte);
                     uint a_packed = q1_a_qs_sh[(w * 4u + i) * Q1_NB_Q8 + block_l];
                     sumi = dotPacked4x8EXT(int(w_packed), int(a_packed)) + sumi;

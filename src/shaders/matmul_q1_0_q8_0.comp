@@ -32,6 +32,7 @@ layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) readonly buffer ABuf { uint acts[]; };
 layout(set = 0, binding = 2, std430) buffer YBuf { uint y[]; };
 
+#include "lib/bitfield.glsl"
 #include "lib/q1_0_load.glsl"
 
 const uint WG_N = 16u;
@@ -106,7 +107,8 @@ void main() {
             uint off = p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + s * 4u;
             uint bw = weights[off >> 2u];
             [[unroll]] for (uint i = 0u; i < 8u; i += 1u) {
-                w_quads_lds[s * 512u + i * 64u + n_local] = expand_4_bits((bw >> (i * 4u)) & 0xFu);
+                uint bits = extract_bits(bw, i * 4u, 4u);
+                w_quads_lds[s * 512u + i * 64u + n_local] = expand_4_bits(bits);
             }
         } else if (QUANT_FORMAT == 1u) {
             uint s = tid >> 6u;
@@ -117,7 +119,8 @@ void main() {
                     p.w_qs_offset + n_idx * (nb_q1 * QS_BYTES_PER_BLOCK) + b * QS_BYTES_PER_BLOCK + (s * 2u + wq) * 4u;
                 uint qword = weights[off >> 2u];
                 [[unroll]] for (uint i = 0u; i < 4u; i += 1u) {
-                    w_quads_lds[s * 512u + (wq * 4u + i) * 64u + n_local] = expand_8_bits((qword >> (i * 8u)) & 0xFFu);
+                    uint byte = extract_bits(qword, i * 8u, 8u);
+                    w_quads_lds[s * 512u + (wq * 4u + i) * 64u + n_local] = expand_8_bits(byte);
                 }
             }
         } else {

@@ -25,6 +25,7 @@ p;
 layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
 layout(set = 0, binding = 1, std430) buffer ActBuf { float16_t act[]; };
 
+#include "lib/bitfield.glsl"
 #include "lib/q1_0_load.glsl"
 
 const uint WG_X = 8u;
