@@ -459,6 +459,19 @@ const WG_MATVEC: (u32, u32, u32) = wg_pick((8, 16, 1), (8, 16, 1));
 const WG_MATVEC_SILU: (u32, u32, u32) = wg_pick((8, 32, 1), (8, 16, 1));
 const WG_MATVEC_FUSED_NORMED: (u32, u32, u32) = wg_pick((256, 1, 1), (128, 1, 1));
 const WG_MATMUL: (u32, u32, u32) = wg_pick((256, 1, 1), (256, 1, 1));
+// Coopmat matmul: one workgroup == one subgroup (whole WG), so the WG width is
+// the pinned subgroup size — 32 on Apple (simdgroup), 64 on RDNA (wave64).
+const WG_MATMUL_COOPMAT: (u32, u32, u32) = wg_pick((32, 1, 1), (64, 1, 1));
+
+/// Cooperative-matrix tile dimension: 8 on Apple (`simdgroup_matrix<_,8,8>`),
+/// 16 on Vulkan (RDNA WMMA / NVIDIA tensor cores). Must equal `CM` in
+/// `matmul_q1_0_q8_0_coopmat.comp`.
+const COOPMAT_CM: u32 = if cfg!(target_vendor = "apple") { 8 } else { 16 };
+/// Output tile (rows × cols) computed per coopmat-matmul workgroup. Mirror of
+/// `CM_TILES_M`/`CM_TILES_N` × `CM` in the shader; drives the dispatch grid in
+/// `forward::dispatch_matmul_q1_0`.
+pub const MATMUL_COOPMAT_TILE_M: u32 = 2 * COOPMAT_CM;
+pub const MATMUL_COOPMAT_TILE_N: u32 = 4 * COOPMAT_CM;
 const WG_ATTN_PREFILL_TILED: (u32, u32, u32) = wg_pick((32, 1, 1), (32, 1, 1));
 const WG_ATTN_SPLIT: (u32, u32, u32) = wg_pick((32, 1, 1), (64, 1, 1));
 const WG_ATTN_MERGE: (u32, u32, u32) = wg_pick((32, 1, 1), (128, 1, 1));
@@ -1331,6 +1344,9 @@ impl Model {
         if !features.contains(wgpu::Features::SUBGROUP) {
             return Err(PotError::FeatureUnsupported("SUBGROUP"));
         }
+        if !features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+            return Err(PotError::FeatureUnsupported("EXPERIMENTAL_COOPERATIVE_MATRIX"));
+        }
         #[cfg(not(target_vendor = "apple"))]
         if !features.contains(wgpu::Features::SUBGROUP_SIZE_CONTROL) {
             return Err(PotError::FeatureUnsupported("SUBGROUP_SIZE_CONTROL"));
@@ -1417,6 +1433,7 @@ impl Model {
         let required_features = wgpu::Features::SHADER_F16
             | wgpu::Features::SHADER_I16
             | wgpu::Features::SUBGROUP
+            | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
             | {
                 if cfg!(target_vendor = "apple") {
                     wgpu::Features::empty()
@@ -1443,7 +1460,7 @@ impl Model {
             required_features,
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::MemoryUsage,
-            experimental_features: wgpu::ExperimentalFeatures::default(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             trace: wgpu::Trace::Off,
         };
         // Open the Vulkan device via the HAL so we can select the async compute
@@ -1730,6 +1747,8 @@ impl Model {
             pick_subgroup_config(wg_lanes(WG_RMS_NORM_Q8), sg_min, sg_max);
         let (sg_choice_silu_q8, _sg_spec_silu_q8) =
             pick_subgroup_config(wg_lanes(WG_SILU_MUL_Q8), sg_min, sg_max);
+        let (sg_choice_matmul_coopmat, _sg_spec_matmul_coopmat) =
+            pick_subgroup_config(wg_lanes(WG_MATMUL_COOPMAT), sg_min, sg_max);
 
         // Pre-flight: check the attention_merge LDS budget before shader compile.
         // weights_sh needs MAX_CHUNKS f32 slots; sg_partial needs NUM_SUBGROUPS f32 slots.
@@ -1848,7 +1867,9 @@ impl Model {
             ],
             WG_MATVEC_FUSED_NORMED
         );
-        let sh_matmul = load_shader!("matmul_q1_0_q8_0", qf_spec, WG_MATMUL);
+        // let sh_matmul = load_shader!("matmul_q1_0_q8_0", qf_spec, WG_MATMUL);
+        let sh_matmul_coopmat =
+            load_shader!("matmul_q1_0_q8_0_coopmat", qf_spec, WG_MATMUL_COOPMAT);
         let sh_attn_prefill_tiled = load_shader!(
             "attention_prefill_tiled",
             &[(SPEC_SUBGROUP_SIZE, sg_spec_attn_prefill_tiled)],
@@ -1984,10 +2005,10 @@ impl Model {
             ),
             matmul: mk_pipe(
                 &bgls.matmul,
-                &sh_matmul,
-                "matmul",
+                &sh_matmul_coopmat,
+                "matmul_coopmat",
                 size_of::<MatmulParams>() as u32,
-                wgpu::SubgroupSize::Varying,
+                sg_choice_matmul_coopmat,
             ),
             attention_prefill_tiled: mk_pipe(
                 &bgls.attn_prefill_tiled,

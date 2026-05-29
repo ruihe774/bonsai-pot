@@ -1,0 +1,194 @@
+#version 460
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// Cooperative-matrix matmul: Q1_0/Q2_0/Q8_0 weights × Q8_0 activations -> f16.
+//
+// One GLSL source shared by Vulkan and Metal. The hardware MMA tile size is the
+// only backend difference: Metal `simdgroup_matrix` is fixed at 8×8, while AMD
+// (RDNA WMMA) / NVIDIA (tensor cores) expose 16×16. We gate the tile dimension
+// `CM` on `METAL_BACKEND` and parameterize everything else off it, so the same
+// algorithm compiles to MSL `simdgroup_matrix` (via spirv-cross, MSL ≥ 3.1) and
+// to Vulkan `OpCooperativeMatrix*KHR`.
+//
+// One workgroup == one subgroup (WG = subgroup width: 64 on RDNA, 32 on Apple).
+// `gl_ScopeSubgroup` coopmats therefore span the whole WG and we never have to
+// reason about multi-subgroup merges. The WG computes a `TILE_M × TILE_N` output
+// tile = `CM_TILES_M × CM_TILES_N` cooperative-matrix accumulators held in
+// registers across the K reduction.
+//
+// Quantization is dissolved at staging time, exactly like the hand-ported Metal
+// kernel this replaces: activations are dequantized Q8_0 → fp16 (per-sub-block
+// scale baked in) and weights are materialized → fp16 (Q1_0 ±d / Q2_0 (q-1)·d /
+// Q8_0 q·d baked in) into threadgroup memory. The MMA is then a plain fp16×fp16
+// → fp32 accumulate; scales never enter the inner loop. Both staged tiles cover
+// one 128-element Q1_0 super-block of K per outer iteration.
+
+#ifdef METAL_BACKEND
+#define CM 8u
+const uint WG = 32u;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#else
+#define CM 16u
+const uint WG = 64u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+// Output tile, as a grid of CM×CM cooperative-matrix tiles. TILE_M/TILE_N must
+// stay multiples of CM (trivially true) and the host dispatch grid in
+// `forward.rs` must match (`MATMUL_COOPMAT_TILE_{M,N}` in model.rs).
+#define CM_TILES_M 2u
+#define CM_TILES_N 4u
+#define TILE_M (CM_TILES_M * CM)
+#define TILE_N (CM_TILES_N * CM)
+#define SUPERBLK 128u // Q1_0 super-block (also a multiple of 8 and 16).
+
+layout(push_constant) uniform Params {
+    uint k;
+    uint n;
+    uint m;
+    uint w_d_offset;
+    uint w_qs_offset;
+    uint a_d_offset;
+    uint a_qs_offset;
+    uint out_offset;
+    uint accumulate;
+}
+p;
+
+layout(set = 0, binding = 0, std430) readonly buffer WBuf { uint weights[]; };
+layout(set = 0, binding = 1, std430) readonly buffer ABuf { uint acts[]; };
+layout(set = 0, binding = 2, std430) buffer YBuf { uint y[]; };
+
+#include "lib/q1_0_load.glsl"
+
+// Activations A[m][k], fp16, scale baked: a_sh[m_local * SUPERBLK + k].
+shared float16_t a_sh[TILE_M * SUPERBLK];
+// Weights B[k][n], fp16, ±scale baked, row-major in k: w_sh[k * TILE_N + n_local].
+shared float16_t w_sh[SUPERBLK * TILE_N];
+// fp32 accumulator staging for the final cooperative store to y.
+shared float c_sh[TILE_M * TILE_N];
+
+void main() {
+    uint n_base = gl_WorkGroupID.x * TILE_N;
+    uint m_base = gl_WorkGroupID.y * TILE_M;
+    uint nb_q1 = p.k >> 7u; // 128-elem super-blocks
+    uint nb_q8 = p.k >> 5u; // 32-elem Q8_0 blocks (activation scales)
+    uint tid = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator> sums[CM_TILES_M * CM_TILES_N];
+    [[unroll]] for (uint i = 0u; i < CM_TILES_M * CM_TILES_N; i += 1u) {
+        sums[i] = coopmat<float, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    for (uint b = 0u; b < nb_q1; b += 1u) {
+        // ---- Stage activations: Q8_0 -> fp16, per-sub-block scale baked ----
+        // TILE_M tokens × 32 u32-words (128 i8) each.
+        for (uint wi = tid; wi < TILE_M * 32u; wi += WG) {
+            uint m_local = wi >> 5u;
+            uint w = wi & 31u; // word within token's super-block
+            uint sub = w >> 3u; // 0..3 Q8_0 sub-block
+            uint m_idx = m_base + m_local;
+            float a_d = uintBitsToFloat(acts[(p.a_d_offset + (m_idx * nb_q8 + b * 4u + sub) * 4u) >> 2u]);
+            uint qword = acts[(p.a_qs_offset + m_idx * p.k + b * SUPERBLK + w * 4u) >> 2u];
+            uint k0 = w * 4u;
+            [[unroll]] for (uint j = 0u; j < 4u; j += 1u) {
+                int v = bitfieldExtract(int(qword), int(j * 8u), 8);
+                a_sh[m_local * SUPERBLK + k0 + j] = float16_t(float(v) * a_d);
+            }
+        }
+
+        // ---- Stage weights: dequant -> fp16, scale baked ----
+        if (QUANT_FORMAT == 0u) {
+            // Q1_0: 4 sign-words/row, each 32 ±1 weights. bit=1 -> +d, 0 -> -d.
+            for (uint wi = tid; wi < TILE_N * 4u; wi += WG) {
+                uint n_local = wi >> 2u;
+                uint s = wi & 3u;
+                uint n_idx = n_base + n_local;
+                float dw = float(load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u));
+                uint sw = weights[(p.w_qs_offset + n_idx * (nb_q1 * 16u) + b * 16u + s * 4u) >> 2u];
+                float16_t pos = float16_t(dw);
+                float16_t neg = float16_t(-dw);
+                uint k0 = s * 32u;
+                [[unroll]] for (uint i = 0u; i < 32u; i += 1u) {
+                    w_sh[(k0 + i) * TILE_N + n_local] = ((sw >> i) & 1u) != 0u ? pos : neg;
+                }
+            }
+        } else if (QUANT_FORMAT == 1u) {
+            // Q2_0: 8 words/row, 16 ternary 2-bit codes each. value = (q-1)·d.
+            for (uint wi = tid; wi < TILE_N * 8u; wi += WG) {
+                uint n_local = wi >> 3u;
+                uint wq = wi & 7u;
+                uint n_idx = n_base + n_local;
+                float dw = float(load_f16_at(p.w_d_offset + (n_idx * nb_q1 + b) * 2u));
+                uint word = weights[(p.w_qs_offset + n_idx * (nb_q1 * 32u) + b * 32u + wq * 4u) >> 2u];
+                uint k0 = wq * 16u;
+                [[unroll]] for (uint c = 0u; c < 16u; c += 1u) {
+                    uint code = (word >> (c * 2u)) & 3u;
+                    w_sh[(k0 + c) * TILE_N + n_local] = float16_t(float(int(code) - 1) * dw);
+                }
+            }
+        } else {
+            // Q8_0: 32 words/row (128 i8), 4 distinct sub-block scales. value = q·d.
+            for (uint wi = tid; wi < TILE_N * 32u; wi += WG) {
+                uint n_local = wi >> 5u;
+                uint w = wi & 31u;
+                uint sub = w >> 3u;
+                uint n_idx = n_base + n_local;
+                float dw = float(load_f16_at(p.w_d_offset + (n_idx * nb_q1 * 4u + b * 4u + sub) * 2u));
+                uint qword = weights[(p.w_qs_offset + n_idx * (nb_q1 * 128u) + b * 128u + w * 4u) >> 2u];
+                uint k0 = w * 4u;
+                [[unroll]] for (uint j = 0u; j < 4u; j += 1u) {
+                    int v = bitfieldExtract(int(qword), int(j * 8u), 8);
+                    w_sh[(k0 + j) * TILE_N + n_local] = float16_t(float(v) * dw);
+                }
+            }
+        }
+        barrier();
+
+        // ---- MMA over the staged 128-deep K slab ----
+        [[unroll]] for (uint kk = 0u; kk < SUPERBLK / CM; kk += 1u) {
+            coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA> a_t[CM_TILES_M];
+            [[unroll]] for (uint im = 0u; im < CM_TILES_M; im += 1u) {
+                coopMatLoad(a_t[im], a_sh, (im * CM) * SUPERBLK + kk * CM, SUPERBLK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB> b_t[CM_TILES_N];
+            [[unroll]] for (uint jn = 0u; jn < CM_TILES_N; jn += 1u) {
+                coopMatLoad(b_t[jn], w_sh, (kk * CM) * TILE_N + jn * CM, TILE_N,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint im = 0u; im < CM_TILES_M; im += 1u) {
+                [[unroll]] for (uint jn = 0u; jn < CM_TILES_N; jn += 1u) {
+                    sums[im * CM_TILES_N + jn] = coopMatMulAdd(a_t[im], b_t[jn], sums[im * CM_TILES_N + jn]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // ---- Store accumulators -> c_sh, then cooperatively write to y ----
+    [[unroll]] for (uint im = 0u; im < CM_TILES_M; im += 1u) {
+        [[unroll]] for (uint jn = 0u; jn < CM_TILES_N; jn += 1u) {
+            coopMatStore(sums[im * CM_TILES_N + jn], c_sh, (im * CM) * TILE_N + jn * CM, TILE_N,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+    barrier();
+
+    // Paired f16 store via packHalf2x16 (matches the dp4a kernel; n is even).
+    for (uint pi = tid; pi < TILE_M * (TILE_N / 2u); pi += WG) {
+        uint m_local = pi / (TILE_N / 2u);
+        uint n_local = (pi % (TILE_N / 2u)) * 2u;
+        uint m_idx = m_base + m_local;
+        if (m_idx >= p.m)
+            continue;
+        uint n_idx = n_base + n_local;
+        if (n_idx >= p.n)
+            continue;
+        uint yi = (p.out_offset + m_idx * p.n + n_idx) >> 1u;
+        vec2 val = vec2(c_sh[m_local * TILE_N + n_local], c_sh[m_local * TILE_N + n_local + 1u]);
+        y[yi] = packHalf2x16(p.accumulate != 0u ? unpackHalf2x16(y[yi]) + val : val);
+    }
+}

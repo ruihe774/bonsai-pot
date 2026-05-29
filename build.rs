@@ -34,6 +34,7 @@ const SHADERS: &[&str] = &[
     "matvec_q1_0_silu.comp",
     "matvec_q1_0_fused_normed.comp",
     "matmul_q1_0_q8_0.comp",
+    "matmul_q1_0_q8_0_coopmat.comp",
     "topk_partial.comp",
     "topk_merge.comp",
 ];
@@ -229,14 +230,19 @@ fn minify_msl(msl_path: &Path) {
 }
 
 fn run_spirv_cross_msl(spv_path: &Path, msl_path: &Path) {
-    // `--msl-version 30000` matches MSL 3.0; subgroup ops require >= 2.1
-    // and several kernels lean on `simdgroupShuffleXor` etc. Renaming
-    // entry points keeps the pipeline `entry_point` field constant
+    // `--msl-version 30100` matches MSL 3.1. Subgroup ops require >= 2.1
+    // (several kernels lean on `simdgroupShuffleXor` etc.); cooperative
+    // matrices (`matmul_q1_0_q8_0_coopmat.comp` -> `simdgroup_matrix`)
+    // require >= 3.1 and a spirv-cross new enough to lower
+    // `OpCooperativeMatrix*KHR` to `simdgroup_load`/
+    // `simdgroup_multiply_accumulate`/`simdgroup_store`
+    // (Vulkan SDK >= 1.4.350).
+    // Renaming entry points keeps the pipeline `entry_point` field constant
     // across hand-ported and translated MSL.
     let status = Command::new("spirv-cross")
         .arg("--msl")
         .arg("--msl-version")
-        .arg("30000")
+        .arg("30100")
         .arg("--msl-fixed-subgroup-size")
         .arg("32")
         .arg("--relax-nan-checks")

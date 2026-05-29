@@ -29,7 +29,8 @@ use wgpu::PollType;
 use crate::error::{PotError, Result};
 use crate::model::{
     ATTN_CHUNK_SIZE, AttnMergeParams, AttnPrefillTiledParams, AttnSplitParams, EmbedParams,
-    KvWritebackFusedParams, MATVEC_FUSED_NORMED_ROWS_PER_WG, MATVEC_SILU_ROWS_PER_WG, MatmulParams,
+    KvWritebackFusedParams, MATMUL_COOPMAT_TILE_M, MATMUL_COOPMAT_TILE_N,
+    MATVEC_FUSED_NORMED_ROWS_PER_WG, MATVEC_SILU_ROWS_PER_WG, MatmulParams,
     MatvecFusedNormedParams, MatvecParams, MatvecSiluParams, ModelConfig, QNormRopeFusedParams,
     RmsNormParams, RmsNormQ8Params, SiluMulQ8Params, TOPK_MAX, TOPK_NUM_PARTIAL_WG,
     TopKMergeParams, TopKPartialParams, WeightSet,
@@ -563,7 +564,11 @@ fn dispatch_matmul_q1_0(
     pass.set_pipeline(&session.model.pipes.matmul);
     pass.set_bind_group(0, matmul_bg(session, weights), &[]);
     pass.set_immediates(0, bytemuck::bytes_of(&p));
-    pass.dispatch_workgroups(n.div_ceil(64), m.div_ceil(64), 1);
+    pass.dispatch_workgroups(
+        n.div_ceil(MATMUL_COOPMAT_TILE_N),
+        m.div_ceil(MATMUL_COOPMAT_TILE_M),
+        1,
+    );
 }
 
 /// Q-tiled + GQA-batched FlashAttention-2 prefill kernel with fused `Q8_0`
