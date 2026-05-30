@@ -431,7 +431,7 @@ impl<'m> Session<'m> {
 
     /// Borrow the [`Model`] this session was opened against.
     #[must_use]
-    pub const fn model(&self) -> &Model {
+    pub const fn model(&self) -> &'m Model {
         self.model
     }
 
