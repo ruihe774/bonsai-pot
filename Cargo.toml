@@ -50,6 +50,7 @@ bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", default-features = false, features = ["bytemuck"] }
 log = { version = "0.4", default-features = false }
 once_cell = { version = "1", default-features = false, features = ["parking_lot"] }
+parking_lot = "0.12"
 thiserror = { version = "2", default-features = false }
 
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).

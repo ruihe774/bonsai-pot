@@ -22,7 +22,7 @@ jobs:
     - name: Extract model
       run: uv run scripts/extract.py Bonsai-4B-Q1_0.gguf
     - name: Run tests
-      run: cargo test --all-features -- --test-threads=1
+      run: cargo test --all-features
     - name: Run prompt & gen
       run: |
         uv run scripts/bpe.py ./model "Once upon a time" | cargo run --all-features -- ./model --mode prompt --max-new-tokens 64 --temperature 0 --seed 0 | tee prompt.txt

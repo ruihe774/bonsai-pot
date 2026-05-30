@@ -1,9 +1,11 @@
 #![cfg(feature = "std")]
+#![allow(clippy::significant_drop_tightening, reason = "tests")]
 
 use std::env;
 use std::path::{Path, PathBuf};
 
-use bonsai_pot::{GenerateOptions, KvSnapshot, Model, PotError, Sampler, StopReason};
+use bonsai_pot::{GenerateOptions, KvSnapshot, Model, PotError, Sampler, Session, StopReason};
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard, const_mutex};
 use wgpu::DeviceLostReason;
 
 fn model_dir() -> PathBuf {
@@ -14,6 +16,14 @@ fn model_dir() -> PathBuf {
 fn load_model() -> Model {
     let dir = model_dir();
     Model::load(&dir).unwrap_or_else(|e| panic!("failed to load {}: {e}", dir.display()))
+}
+
+static SHARED_SESSION: Mutex<Option<Session<'static>>> = const_mutex(None);
+
+fn shared_session() -> MappedMutexGuard<'static, Session<'static>> {
+    MutexGuard::map(SHARED_SESSION.lock(), |o| {
+        o.get_or_insert_with(|| Box::leak(Box::new(load_model())).new_session())
+    })
 }
 
 fn greedy_sampler() -> Sampler {
@@ -51,7 +61,8 @@ fn model_load_bad_path_is_io_error() {
 
 #[test]
 fn vocab_round_trip_specials() {
-    let model = load_model();
+    let session = shared_session();
+    let model = session.model();
     for tok in ["<|im_start|>", "<|im_end|>", "<|endoftext|>"] {
         let id = model
             .token_id(tok)
@@ -62,7 +73,8 @@ fn vocab_round_trip_specials() {
 
 #[test]
 fn decode_tokens_round_trip_specials() {
-    let model = load_model();
+    let session = shared_session();
+    let model = session.model();
     // Special tokens contain only printable ASCII chars, so decode_token_bytes
     // maps each char back to its own byte.
     for tok in ["<|im_start|>", "<|im_end|>", "<|endoftext|>"] {
@@ -78,15 +90,15 @@ fn decode_tokens_round_trip_specials() {
 fn batched_prefill_pos_nonzero_matches_matvec_loop() {
     // Batched matmul prefill at pos > 0 must yield the same first-sampled token
     // as the matvec-loop variant under greedy sampling.
-    let model = load_model();
     let prompt = short_prompt();
     let greedy = greedy_sampler();
 
-    let mut sess_matmul = model.new_session();
+    let mut sess_matmul = shared_session();
+    sess_matmul.reset();
     let _ = sess_matmul.prefill(&prompt, &greedy).unwrap();
     let first_matmul = sess_matmul.prefill(&prompt, &greedy).unwrap();
 
-    let mut sess_matvec = model.new_session();
+    let mut sess_matvec = sess_matmul.model().new_session();
     let _ = sess_matvec.prefill_one_at_a_time(&prompt, &greedy).unwrap();
     let first_matvec = sess_matvec.prefill_one_at_a_time(&prompt, &greedy).unwrap();
 
@@ -99,11 +111,11 @@ fn batched_prefill_pos_nonzero_matches_matvec_loop() {
 
 #[test]
 fn prefill_context_overflow_rejected() {
-    let model = load_model();
-    let mut sess = model.new_session();
+    let mut sess = shared_session();
+    sess.reset();
     // Prompts longer than max_seq must be rejected up front (chunking can't
     // help since the KV cache itself isn't large enough).
-    let too_many: Vec<u32> = vec![1u32; (model.max_seq_len() + 1) as usize];
+    let too_many: Vec<u32> = vec![1u32; (sess.model().max_seq_len() + 1) as usize];
     let err = sess.prefill(&too_many, &greedy_sampler()).unwrap_err();
     assert!(
         matches!(err, PotError::ContextOverflow { .. }),
@@ -115,15 +127,15 @@ fn prefill_context_overflow_rejected() {
 
 #[test]
 fn greedy_is_byte_deterministic() {
-    let model = load_model();
     let prompt = short_prompt();
     let opts = greedy_opts(16);
 
-    let mut sess1 = model.new_session();
+    let mut sess1 = shared_session();
+    sess1.reset();
     let first1 = sess1.prefill(&prompt, &greedy_sampler()).unwrap();
     let (toks1, _) = sess1.generate(first1, &opts).unwrap();
 
-    let mut sess2 = model.new_session();
+    let mut sess2 = sess1.model().new_session();
     let first2 = sess2.prefill(&prompt, &greedy_sampler()).unwrap();
     let (toks2, _) = sess2.generate(first2, &opts).unwrap();
 
@@ -141,13 +153,13 @@ fn greedy_is_byte_deterministic() {
 /// kernel changes.
 #[test]
 fn greedy_does_not_collapse_into_low_entropy_loop() {
-    let model = load_model();
     // BPE encoding of "Once upon a time" against `./model`'s tokenizer.
     // Hard-coded so the test doesn't depend on `scripts/bpe.py` at runtime.
     let prompt: Vec<u32> = vec![12522, 5193, 264, 882];
     let opts = greedy_opts(24);
 
-    let mut sess = model.new_session();
+    let mut sess = shared_session();
+    sess.reset();
     let first = sess.prefill(&prompt, &greedy_sampler()).unwrap();
     let (toks, _) = sess.generate(first, &opts).unwrap();
 
@@ -168,14 +180,14 @@ fn greedy_does_not_collapse_into_low_entropy_loop() {
 #[test]
 fn matvec_matmul_parity_first_token() {
     // Both prefill paths must sample the same first token under greedy sampling.
-    let model = load_model();
     let prompt = short_prompt();
     let greedy = greedy_sampler();
 
-    let mut sess_matmul = model.new_session();
+    let mut sess_matmul = shared_session();
+    sess_matmul.reset();
     let first_matmul = sess_matmul.prefill(&prompt, &greedy).unwrap();
 
-    let mut sess_matvec = model.new_session();
+    let mut sess_matvec = sess_matmul.model().new_session();
     let first_matvec = sess_matvec.prefill_one_at_a_time(&prompt, &greedy).unwrap();
 
     assert_eq!(
@@ -186,7 +198,6 @@ fn matvec_matmul_parity_first_token() {
 
 #[test]
 fn seeded_sampler_reproducibility() {
-    let model = load_model();
     let prompt = short_prompt();
     let seeded = Sampler {
         temperature: 1.0,
@@ -199,7 +210,7 @@ fn seeded_sampler_reproducibility() {
             stop_pred: Some((|_| false) as fn(u32) -> bool),
             sampler: s.clone(),
         };
-        let mut sess = model.new_session();
+        let mut sess = shared_session().model().new_session();
         let first = sess.prefill(&prompt, s).unwrap();
         let (toks, _) = sess.generate(first, &opts_local).unwrap();
         (first, toks)
@@ -224,8 +235,8 @@ fn seeded_sampler_reproducibility() {
 
 #[test]
 fn generate_max_tokens_zero_returns_immediately() {
-    let model = load_model();
-    let mut sess = model.new_session();
+    let mut sess = shared_session();
+    sess.reset();
     let opts = GenerateOptions {
         max_new_tokens: 0,
         stop_pred: Some((|_| false) as fn(u32) -> bool),
@@ -245,18 +256,18 @@ fn generate_max_tokens_zero_returns_immediately() {
 
 #[test]
 fn snapshot_restore_round_trip_continues_identically() {
-    let model = load_model();
     let prompt = short_prompt();
     let greedy = greedy_sampler();
 
     // Original session: prefill, snapshot, continue.
-    let mut sess = model.new_session();
+    let mut sess = shared_session();
+    sess.reset();
     let first = sess.prefill(&prompt, &greedy).unwrap();
     let snap = sess.snapshot().unwrap();
     let (toks_orig, _) = sess.generate(first, &greedy_opts(8)).unwrap();
 
     // Restored session: restore snapshot, continue from same point.
-    let mut sess2 = model.new_session();
+    let mut sess2 = sess.model().new_session();
     sess2.restore(&snap).unwrap();
     assert_eq!(sess2.pos(), snap.pos());
     let (toks_restored, _) = sess2.generate(first, &greedy_opts(8)).unwrap();
@@ -269,11 +280,11 @@ fn snapshot_restore_round_trip_continues_identically() {
 
 #[test]
 fn snapshot_to_bytes_round_trip() {
-    let model = load_model();
     let prompt = short_prompt();
     let greedy = greedy_sampler();
 
-    let mut sess = model.new_session();
+    let mut sess = shared_session();
+    sess.reset();
     let first = sess.prefill(&prompt, &greedy).unwrap();
     let snap = sess.snapshot().unwrap();
     let (toks_orig, _) = sess.generate(first, &greedy_opts(4)).unwrap();
@@ -281,7 +292,7 @@ fn snapshot_to_bytes_round_trip() {
     // Serialize → deserialize → restore.
     let bytes = snap.to_bytes();
     let snap2 = KvSnapshot::from_bytes(&bytes).unwrap();
-    let mut sess2 = model.new_session();
+    let mut sess2 = sess.model().new_session();
     sess2.restore(&snap2).unwrap();
     let (toks_via_disk, _) = sess2.generate(first, &greedy_opts(4)).unwrap();
 
@@ -293,13 +304,13 @@ fn snapshot_to_bytes_round_trip() {
 
 #[test]
 fn restore_pos_zero_snapshot_leaves_session_ready_for_prefill() {
-    let model = load_model();
     // Empty snapshot (pos=0) should restore to a clean state, allowing prefill.
-    let mut sess = model.new_session();
+    let mut sess = shared_session();
+    sess.reset();
     let snap = sess.snapshot().unwrap();
     assert_eq!(snap.pos(), 0);
 
-    let mut sess2 = model.new_session();
+    let mut sess2 = sess.model().new_session();
     sess2.restore(&snap).unwrap();
     assert_eq!(sess2.pos(), 0);
 
@@ -317,7 +328,7 @@ fn restore_pos_zero_snapshot_leaves_session_ready_for_prefill() {
 /// if run alone.
 #[test]
 fn two_sessions_interleaved_are_independent() {
-    let model = load_model();
+    let model = shared_session().model();
     let prompt_a = short_prompt();
     // A distinct prompt for session B so the test exercises two different KV states.
     let prompt_b: Vec<u32> = vec![9u32, 8, 7, 6, 5, 4, 3, 2];
@@ -342,7 +353,8 @@ fn two_sessions_interleaved_are_independent() {
     // generate B.  If the shared activation buffers are not properly
     // re-initialised between sessions this will produce garbage for at least
     // one of them.
-    let mut sess_a = model.new_session();
+    let mut sess_a = shared_session();
+    sess_a.reset();
     let mut sess_b = model.new_session();
 
     let first_a = sess_a.prefill(&prompt_a, &greedy).unwrap();
@@ -374,7 +386,7 @@ fn two_sessions_interleaved_are_independent() {
 /// running the same prompt must still yield the baseline output.
 #[test]
 fn session_reuse_after_prior_session_dropped() {
-    let model = load_model();
+    let model = shared_session().model();
     let prompt = short_prompt();
     let greedy = greedy_sampler();
     let opts = greedy_opts(8);
@@ -394,7 +406,8 @@ fn session_reuse_after_prior_session_dropped() {
     }
 
     // Third session must still match baseline.
-    let mut s3 = model.new_session();
+    let mut s3 = shared_session();
+    s3.reset();
     let first3 = s3.prefill(&prompt, &greedy).unwrap();
     let (toks3, _) = s3.generate(first3, &opts).unwrap();
 
@@ -412,6 +425,8 @@ fn session_reuse_after_prior_session_dropped() {
 
 #[test]
 fn device_lost_is_surfaced_as_error_and_model_is_recoverable() {
+    // Must use a private model — this test destroys the device, which would
+    // corrupt the shared statics for all other tests.
     let model = load_model();
 
     // Confirm liveness before we destroy the device.
