@@ -60,8 +60,8 @@ pub struct ModelConfig {
     pub q_dim: u32,
     pub kv_dim: u32,
     pub tied_embeddings: bool,
-    /// Weight quantization format: "Q1_0" (binary signs, 16 B qs/block) or
-    /// "Q2_0" (ternary 2-bit codes, 32 B qs/block). Selected at extract time;
+    /// Weight quantization format: "`Q1_0`" (binary signs, 16 B qs/block) or
+    /// "`Q2_0`" (ternary 2-bit codes, 32 B qs/block). Selected at extract time;
     /// every Q tensor in `manifest` shares this format.
     pub quant_format: &'static str,
     pub manifest: BTreeMap<String, TensorEntry>,
@@ -419,8 +419,8 @@ impl ActLayout {
 pub const SPEC_SUBGROUP_SIZE: u32 = 0;
 pub const SPEC_MAX_CHUNKS: u32 = 1;
 pub const SPEC_N_EMBD_V4: u32 = 2;
-/// Weight quantization format selector for Q-tensor shaders: `0` = Q1_0
-/// (16 qs bytes/block, binary signs), `1` = Q2_0 (32 qs bytes/block, ternary
+/// Weight quantization format selector for Q-tensor shaders: `0` = `Q1_0`
+/// (16 qs bytes/block, binary signs), `1` = `Q2_0` (32 qs bytes/block, ternary
 /// 2-bit codes). Driver compilers fold the spec constant so the inactive arm
 /// of each `if (QUANT_FORMAT == ...)` branch is dead code.
 pub const SPEC_QUANT_FORMAT: u32 = 3;
@@ -1387,7 +1387,7 @@ impl Model {
             u64::from(cfg.n_layer) * u64::from(opts.max_seq) * u64::from(cfg.kv_dim);
         let kv_per_buf_bytes = kv_d_bytes + kv_qs_bytes;
         let rope_bytes: u64 = u64::from(opts.max_seq) * u64::from(cfg.head_dim) * 2;
-        let largest_storage_buf: u64 = [
+        let Some(largest_storage_buf) = [
             snapshot.w_attn.len() as u64,
             snapshot.w_ffn_gate_up.len() as u64,
             snapshot.w_ffn_down.len() as u64,
@@ -1397,8 +1397,9 @@ impl Model {
             kv_per_buf_bytes,
         ]
         .into_iter()
-        .max()
-        .unwrap();
+        .max() else {
+            unreachable!();
+        };
         let required_binding = largest_storage_buf.next_power_of_two();
         let kv_snapshot_staging_bytes = 2 * kv_per_buf_bytes;
         let required_buffer_size = largest_storage_buf
