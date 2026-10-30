@@ -338,6 +338,9 @@ pub struct Pipelines {
     pub(crate) attn_qk: wgpu::ComputePipeline,
     pub(crate) attn_split: wgpu::ComputePipeline,
     pub(crate) attn_prefill: wgpu::ComputePipeline,
+    /// Cooperative-matrix (f16) flash attention for batched prefill, when the
+    /// device supports 16×16×16 f16 WMMA with a fixed subgroup size of 32.
+    pub(crate) attn_prefill_cm: Option<wgpu::ComputePipeline>,
     pub(crate) attn_out_rot_q8: wgpu::ComputePipeline,
     pub(crate) silu_mul_rot_q8: wgpu::ComputePipeline,
     pub(crate) topk_partial: wgpu::ComputePipeline,
@@ -811,6 +814,11 @@ impl Model {
             attn_qk: pipeline!("attn_qk_norm_rope_kv"),
             attn_split: pipeline!("attn_split"),
             attn_prefill: pipeline!("attn_prefill"),
+            attn_prefill_cm: if coop.f16 && attn_coopmat_from_env() {
+                Some(pipeline!("attn_prefill_cm", wgpu::SubgroupSize::Fixed(32)))
+            } else {
+                None
+            },
             attn_out_rot_q8: pipeline!("attn_out_rot_q8"),
             silu_mul_rot_q8: pipeline!("silu_mul_rot_q8"),
             topk_partial: pipeline!("topk_partial"),
@@ -984,6 +992,19 @@ enum CoopChoice {
     I8,
     F16,
     Off,
+}
+
+/// `BONSAI_POT_ATTN=scalar` forces the scalar prefill attention kernel even
+/// when f16 cooperative matrices are available.
+fn attn_coopmat_from_env() -> bool {
+    #[cfg(feature = "std")]
+    {
+        var_os("BONSAI_POT_ATTN").is_none_or(|v| v != "scalar")
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// `BONSAI_POT_COOPMAT=i8|f16|off` overrides the prefill matmul selection

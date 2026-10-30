@@ -24,6 +24,7 @@ const SHADERS: &[&str] = &[
     "attn_qk_norm_rope_kv.comp",
     "attn_split.comp",
     "attn_prefill.comp",
+    "attn_prefill_cm.comp",
     "attn_out_rot_q8.comp",
     "silu_mul_rot_q8.comp",
     "topk_partial.comp",

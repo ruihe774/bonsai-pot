@@ -31,6 +31,7 @@ struct Args {
     mode: String,
     n_gen: u32,
     pp_n: u32,
+    pp_pos: Option<u32>,
     tg_n: u32,
     max_seq: u32,
     repeats: u32,
@@ -85,6 +86,10 @@ GEN/PROMPT OPTIONS:
 BENCH OPTIONS:
     --pp <n>               Prefill batch size for the pp{N} bench row.
                            [default: 512]
+    --pp-pos <n>           (--mode microbench only) pos_base of the measured
+                           prefill step, to profile attention at depth; the
+                           KV cache before it is left unfilled.
+                           [default: --pp]
     --tg <n>               Token-generation length for the tg{N} bench row;
                            also the measurement pos for --mode microbench.
                            [default: 128]
@@ -141,6 +146,7 @@ fn parse_args() -> Args {
         mode: "gen".to_string(),
         n_gen: 32,
         pp_n: 512,
+        pp_pos: None,
         tg_n: 128,
         max_seq: 32768,
         repeats: 5,
@@ -172,6 +178,10 @@ fn parse_args() -> Args {
             }
             "--pp" => {
                 a.pp_n = parse_or_die("--pp", &next());
+                i += 2;
+            }
+            "--pp-pos" => {
+                a.pp_pos = Some(parse_or_die("--pp-pos", &next()));
                 i += 2;
             }
             "--tg" => {
@@ -279,11 +289,17 @@ fn main() {
             }
             #[cfg(not(feature = "ci"))]
             {
-                __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker)
-                    .unwrap_or_else(|e| {
-                        eprintln!("microbench error: {e}");
-                        exit(3)
-                    });
+                __bench::microbench_pp(
+                    &model,
+                    args.pp_n,
+                    args.pp_pos,
+                    args.repeats,
+                    args.no_marker,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("microbench error: {e}");
+                    exit(3)
+                });
                 __bench::microbench_tg(&model, args.tg_n, args.repeats, args.no_marker)
                     .unwrap_or_else(|e| {
                         eprintln!("microbench error: {e}");

@@ -12,10 +12,22 @@ AMD RX 9070 (RDNA4, 16 GB, RADV), `Ternary-Bonsai-2-27B-PTQ1_0`, `--mode bench -
 
 | backend | pp512 t/s | tg128 t/s (GPU) | e2e_tg128 t/s |
 |---|---:|---:|---:|
-| **bonsai2-pot** | **483** | **77.4** | **75.8** |
+| **bonsai2-pot** | **492** | **77.0** | **75.3** |
 | PrismML llama.cpp fork, Vulkan (`llama-bench -p 512 -n 128`) | 485 | 54.6 | — |
 
 `e2e_tg128` runs `Session::generate` end-to-end with stochastic sampling and encode pipelining (the next step's command buffer is encoded while the GPU runs the current one). The decode floor set by weight bandwidth is about 110 t/s (5.7 GB of weights per token at 640 GB/s); the matvecs run at about 540 GB/s.
+
+Long-context prefill: one 512-token chunk at a given KV depth (`--mode microbench --pp 512 --pp-pos N`, `max_seq` sized to the depth; fork: `llama-bench -p 512 -d N -fa 1`):
+
+| depth | bonsai2-pot t/s | fork (Vulkan, FA) t/s |
+|---|---:|---:|
+| 512 | 494 | 487 |
+| 8K | 471 | 454 |
+| 16K | 449 | 434 |
+| 32K | 408 | 399 |
+| 57K | 361 | — |
+
+A real 39.5K-token prompt prefills in 115 s end to end. Before the cooperative-matrix attention kernel the same chunk ran at 105 t/s at 32K and 67 t/s at 57K, and the prompt took 261 s.
 
 ## Correctness
 
@@ -44,7 +56,7 @@ Tokenization is intentionally outside the Rust crate.
 - **Rust** ≥ 1.87
 - **`glslangValidator`** ≥ 16 (`glslang-tools`) and **`spirv-opt`** (`spirv-tools`) on `$PATH` at build time
 - **`uv`** for the scripts
-- A Vulkan 1.3 GPU with subgroup ops, integer dot product, 16-bit storage and ≥ 32 KiB workgroup memory. Cooperative matrices (`VK_KHR_cooperative_matrix`, 16×16×16 u8×s8→s32 or f16×f16→f32) are used for prefill when available. Set `BONSAI_POT_COOPMAT=i8|f16|off` to override the choice.
+- A Vulkan 1.3 GPU with subgroup ops, integer dot product, 16-bit storage and ≥ 32 KiB workgroup memory. Cooperative matrices (`VK_KHR_cooperative_matrix`, 16×16×16 u8×s8→s32 or f16×f16→f32) are used for prefill when available. Set `BONSAI_POT_COOPMAT=i8|f16|off` to override the matmul choice, and `BONSAI_POT_ATTN=scalar` to force the scalar prefill attention kernel.
 
 ## Building the model directory
 
@@ -106,9 +118,9 @@ Each kernel that produces a projection input fuses this transform: RMSNorm, SwiG
    - Residual adds are fused into the output projections.
 2. **Batched prefill (≤ 512 tokens per chunk):** the same kernels over M rows.
    - Projections use `matmul_ptq1_0_cmi8`: int8 cooperative matrices, with a per-128-block rescale through LDS into f32 accumulators. The fallbacks are `matmul_ptq1_0_cm` (f16 coopmat) and `matmul_ptq1_0` (DP4a).
-   - `attn_prefill` is causal FA-2 with f16 LDS tiles.
+   - Attention uses `attn_prefill_cm`: causal FA-2 on f16 cooperative matrices. One workgroup handles a KV head × 48 query rows (8 tokens × 6 GQA heads). Each K/V tile is dequantized from the Q8_0 cache once per workgroup with 16-byte loads, prefetched one tile ahead. The softmax uses a lazy rescale: O is only rescaled when a row max grows by more than 2^8. It runs at about 30 TFLOPS at 32K. The fallback without cooperative matrices is `attn_prefill`, a scalar FA-2 kernel with f16 LDS tiles, about 17× slower at depth.
    - The GDN conv and recurrence scan the chunk sequentially.
-   - Prefill is submitted in groups of 16 layers so no GPU job approaches the driver's ~2 s timeout.
+   - Prefill is submitted in groups of 16 layers to stay under the driver's 2 s job timeout. Attention cost grows with depth: with `attn_prefill_cm` a group takes about 0.35 s at 57K, but with the scalar fallback a group crosses 2 s near 60K tokens (earlier if the KV cache spills to system memory).
 
 ### Memory
 

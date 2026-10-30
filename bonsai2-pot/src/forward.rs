@@ -542,13 +542,23 @@ fn attn_block<M: StepMarker>(
             q_dim: cfg.q_dim(),
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
         };
+        // Coopmat kernel: 48 query rows (48 / G tokens) per workgroup;
+        // scalar fallback: 2 tokens per workgroup.
+        let (pipe, tokens_per_wg) = s
+            .model
+            .pipes
+            .attn_prefill_cm
+            .as_ref()
+            .map_or((&s.model.pipes.attn_prefill, 2), |p| {
+                (p, ATTN_CM_ROWS / (cfg.n_head / cfg.n_kv_head))
+            });
         dispatch(
             s,
             pass,
-            &s.model.pipes.attn_prefill,
+            pipe,
             s.model.win_attn,
             &pp,
-            (cfg.n_kv_head, m.div_ceil(2), 1),
+            (cfg.n_kv_head, m.div_ceil(tokens_per_wg), 1),
         );
         marker.mark(pass, "attn_prefill");
         let po = AttnOutParams {
@@ -873,8 +883,10 @@ pub fn prefill_topk<M: StepMarker>(
     let n_groups = layers.len().div_ceil(PREFILL_LAYERS_PER_SUBMIT);
     let mut se = StepEncoder::new(s);
     upload_sample(s, &mut se.encoder, 0, bytemuck::cast_slice(prompt));
-    // One submission per group of layers keeps every GPU job well below the
-    // driver's lockup timeout (about 2 s on amdgpu) even for M_MAX tokens.
+    // One submission per group of layers keeps GPU jobs below the driver's
+    // lockup timeout (2 s on amdgpu). Attention cost grows with `pos_base`:
+    // with `attn_prefill_cm` a group of M_MAX tokens stays far below it, but
+    // the scalar fallback `attn_prefill` crosses 2 s near pos 60K.
     for (gi, group) in layers.chunks(PREFILL_LAYERS_PER_SUBMIT).enumerate() {
         let last = gi + 1 == n_groups;
         {
@@ -908,6 +920,9 @@ pub fn prefill_topk<M: StepMarker>(
     s.model.queue.submit(Some(se.finish()));
     wait_topk_readback(s, k)
 }
+
+/// Query rows (tokens × GQA heads) per workgroup of `attn_prefill_cm.comp`.
+const ATTN_CM_ROWS: u32 = 48;
 
 /// Layers per command buffer in batched prefill (see [`prefill_topk`]).
 const PREFILL_LAYERS_PER_SUBMIT: usize = 16;

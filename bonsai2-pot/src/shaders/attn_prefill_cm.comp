@@ -1,0 +1,283 @@
+#version 460
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+// Causal flash attention for batched prefill on cooperative matrices
+// (VK_KHR_cooperative_matrix, 16×16×16 f16 × f16 → f32). Same push constants,
+// output and dispatch shape as attn_prefill.comp, but QT = 48 / G tokens.
+//
+// One workgroup = one KV head × R = 48 query rows (row r = token r / G of the
+// tile, head r % G of the group; rows ≥ G·QT are padding). Six wave32
+// subgroups: subgroup sg owns row block rb = sg / 2 (16 rows) and half
+// hf = sg % 2. Per 32-key tile:
+//   1. K tile (Q8_0 → f16) into LDS;
+//   2. S = Q·Kᵀ: subgroup (rb, hf) computes keys [16hf, 16hf+16) of its rows
+//      (Q fragments live in registers, pre-scaled by scale·log2 e) → LDS f32;
+//   3. V tile into LDS, online softmax (4 threads per row, log2 domain) → P f16;
+//   4. O += P·V: subgroup (rb, hf) owns head dims [128hf, 128hf+128) of its
+//      rows as 8 f32 accumulators.
+// Lazy rescale: a row's reference max only moves when the tile max exceeds it
+// by more than TAU (so P ≤ 2^TAU fits f16); only then is O rescaled, through
+// a per-subgroup LDS stage (accumulator element→row mapping is opaque).
+//
+// Requires a subgroup size of exactly 32 (pipeline created with Fixed(32)).
+// dispatch: (n_kv_head, ceil(m_tokens / (48 / G)), 1).
+
+layout(push_constant) uniform Params {
+    uint qg_off;     // act offset of the [q|gate] projection (row stride 2*q_dim)
+    uint o_off;      // act offset of the output rows (row stride q_dim)
+    uint n_head;
+    uint n_kv_head;
+    uint m_tokens;
+    uint pos_base;
+    uint kv_dim;
+    uint kv_d_word;
+    uint kv_qs_byte;
+    uint q_dim;
+    float scale;
+}
+p;
+
+#define KV_QUAL readonly
+#include "lib/bindings.glsl"
+
+layout(local_size_x = 192, local_size_y = 1, local_size_z = 1) in;
+
+const uint NT = 192u;
+const uint HD = 256u;
+const uint R = 48u;          // query rows per workgroup (3 row blocks)
+const uint KT = 32u;         // keys per tile
+const uint LS4 = HD / 4u + 2u; // K/V/Q LDS row stride in f16vec4 (+8 halves pad)
+const uint SS = KT + 4u;     // S row stride (floats)
+const uint PS = KT + 8u;     // P row stride (halves)
+const float NEG = -1e30;
+const float TAU = 8.0;       // lazy-rescale threshold (log2 units)
+
+// 16-byte views of the K/V caches (qs and scale sections are 16-byte
+// aligned for every (position, KV head)).
+layout(set = 0, binding = 4, std430) readonly buffer KBuf4 { uvec4 kv_k4[]; };
+layout(set = 0, binding = 5, std430) readonly buffer VBuf4 { uvec4 kv_v4[]; };
+
+const uint NI = (KT * (HD / 16u) + NT - 1u) / NT; // 16-element items per thread
+
+shared f16vec4 k_sh[KT * LS4];   // K tile; with v_sh also the Q staging area
+shared f16vec4 v_sh[KT * LS4];   // V tile
+shared float s_sh[R * SS];       // scores; also the per-subgroup O stage
+shared float16_t p_sh[R * PS];   // probabilities
+shared float corr_sh[R];
+shared float l_sh[R];
+
+// Raw Q8_0 words + scales of the next tile, held in registers (prefetch).
+uvec4 kq[NI];
+uvec4 vq[NI];
+float kd[NI];
+float vd[NI];
+
+void fetch(uint g, uint k0, uint n_valid) {
+    [[unroll]] for (uint i = 0u; i < NI; i += 1u) {
+        uint it = gl_LocalInvocationID.x + i * NT;
+        uint kk = it >> 4u;
+        uint c = it & 15u;
+        kq[i] = uvec4(0u);
+        vq[i] = uvec4(0u);
+        kd[i] = 0.0;
+        vd[i] = 0.0;
+        if (it < KT * 16u && k0 + kk < n_valid) {
+            uint e = (k0 + kk) * p.kv_dim + g * HD + 16u * c;
+            uint qi = (p.kv_qs_byte + e) >> 4u;
+            uint di = p.kv_d_word + (e >> 5u);
+            kq[i] = kv_k4[qi];
+            vq[i] = kv_v4[qi];
+            kd[i] = uintBitsToFloat(kv_k[di]);
+            vd[i] = uintBitsToFloat(kv_v[di]);
+        }
+    }
+}
+
+f16vec4 deq(uint word, float d) { return f16vec4(vec4(unpack8(int(word))) * d); }
+
+void store_tile() {
+    [[unroll]] for (uint i = 0u; i < NI; i += 1u) {
+        uint it = gl_LocalInvocationID.x + i * NT;
+        if (it < KT * 16u) {
+            uint o = (it >> 4u) * LS4 + 4u * (it & 15u);
+            k_sh[o] = deq(kq[i].x, kd[i]);
+            k_sh[o + 1u] = deq(kq[i].y, kd[i]);
+            k_sh[o + 2u] = deq(kq[i].z, kd[i]);
+            k_sh[o + 3u] = deq(kq[i].w, kd[i]);
+            v_sh[o] = deq(vq[i].x, vd[i]);
+            v_sh[o + 1u] = deq(vq[i].y, vd[i]);
+            v_sh[o + 2u] = deq(vq[i].z, vd[i]);
+            v_sh[o + 3u] = deq(vq[i].w, vd[i]);
+        }
+    }
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint g = gl_WorkGroupID.x;
+    uint G = p.n_head / p.n_kv_head;
+    uint QT = R / G;
+    uint m0 = gl_WorkGroupID.y * QT;
+    uint qg_stride = 2u * p.q_dim;
+    uint rb = sg >> 1u;
+    uint hf = sg & 1u;
+
+    // ---- stage Q (f16, pre-scaled to the log2 domain) and keep it in registers
+    float qscale = p.scale * 1.4426950408889634;
+    for (uint idx = t; idx < R * (HD / 4u); idx += NT) {
+        uint r = idx / (HD / 4u);
+        uint d4 = idx % (HD / 4u);
+        uint j = r / G;
+        uint hh = r % G;
+        vec4 q = vec4(0.0);
+        if (j < QT && m0 + j < p.m_tokens) {
+            uint qi = p.qg_off + (m0 + j) * qg_stride + (g * G + hh) * 2u * HD + 4u * d4;
+            q = vec4(act[qi], act[qi + 1u], act[qi + 2u], act[qi + 3u]) * qscale;
+        }
+        if (r < KT) {
+            k_sh[r * LS4 + d4] = f16vec4(q);
+        } else {
+            v_sh[(r - KT) * LS4 + d4] = f16vec4(q);
+        }
+    }
+    barrier();
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> qf[HD / 16u];
+    [[unroll]] for (uint ks = 0u; ks < HD / 16u; ks += 1u) {
+        if (rb < KT / 16u) {
+            coopMatLoad(qf[ks], k_sh, (16u * rb) * LS4 + 4u * ks, LS4, gl_CooperativeMatrixLayoutRowMajor);
+        } else {
+            coopMatLoad(qf[ks], v_sh, (16u * rb - KT) * LS4 + 4u * ks, LS4, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> o[8];
+    [[unroll]] for (uint j = 0u; j < 8u; j += 1u) {
+        o[j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    // ---- softmax thread role: row sr, columns sc + 4i ----------------------
+    uint sr = t >> 2u;
+    uint sc = t & 3u;
+    uint s_tok = m0 + sr / G;
+    bool s_row_ok = (sr / G) < QT && s_tok < p.m_tokens;
+    uint s_last_key = p.pos_base + s_tok; // inclusive causal bound
+    float m_ref = NEG;
+    float l = 0.0;
+
+    uint m_last = min(m0 + QT, p.m_tokens) - 1u;
+    uint n_valid = p.pos_base + m_last + 1u;
+    fetch(g, 0u, n_valid);
+    for (uint k0 = 0u; k0 < n_valid; k0 += KT) {
+        barrier(); // previous tile's P·V done with k_sh / v_sh / p_sh; Q frags loaded
+        store_tile();
+        barrier();
+        if (k0 + KT < n_valid) {
+            fetch(g, k0 + KT, n_valid); // consumed by the next iteration's store_tile
+        }
+
+        // ---- S = Q·Kᵀ for keys [16hf, 16hf + 16) -----------------------------
+        {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> s =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint ks = 0u; ks < HD / 16u; ks += 1u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> kb;
+                coopMatLoad(kb, k_sh, (16u * hf) * LS4 + 4u * ks, LS4, gl_CooperativeMatrixLayoutColumnMajor);
+                s = coopMatMulAdd(qf[ks], kb, s);
+            }
+            coopMatStore(s, s_sh, (16u * rb) * SS + 16u * hf, SS, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        // ---- online softmax -------------------------------------------------
+        {
+            float sv[KT / 4u];
+            float mx = NEG;
+            [[unroll]] for (uint i = 0u; i < KT / 4u; i += 1u) {
+                uint key = k0 + sc + 4u * i;
+                bool ok = s_row_ok && key <= s_last_key;
+                sv[i] = ok ? s_sh[sr * SS + sc + 4u * i] : NEG;
+                mx = max(mx, sv[i]);
+            }
+            mx = subgroupClusteredMax(mx, 4u);
+            float corr = 1.0;
+            if (m_ref <= NEG * 0.5) {
+                m_ref = mx; // first visible keys: O and l are still zero
+            } else if (mx > m_ref + TAU) {
+                corr = exp2(m_ref - mx);
+                m_ref = mx;
+                l *= corr;
+            }
+            float sum = 0.0;
+            [[unroll]] for (uint i = 0u; i < KT / 4u; i += 1u) {
+                float e = sv[i] <= NEG * 0.5 ? 0.0 : exp2(sv[i] - m_ref);
+                p_sh[sr * PS + sc + 4u * i] = float16_t(e);
+                sum += e;
+            }
+            l += subgroupClusteredAdd(sum, 4u);
+            if (sc == 0u) {
+                corr_sh[sr] = corr;
+            }
+        }
+        barrier();
+
+        // ---- lazy rescale of this subgroup's O rows --------------------------
+        float my_corr = lane < 16u ? corr_sh[16u * rb + lane] : 1.0;
+        if (subgroupAny(my_corr != 1.0)) {
+            uint st = sg * 256u;
+            [[unroll]] for (uint j = 0u; j < 8u; j += 1u) {
+                coopMatStore(o[j], s_sh, st, 16, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                for (uint e = lane; e < 256u; e += 32u) {
+                    s_sh[st + e] *= corr_sh[16u * rb + (e >> 4u)];
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                coopMatLoad(o[j], s_sh, st, 16, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+            }
+        }
+
+        // ---- O += P·V for head dims [128hf, 128hf + 128) ---------------------
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pa[KT / 16u];
+        [[unroll]] for (uint kk = 0u; kk < KT / 16u; kk += 1u) {
+            coopMatLoad(pa[kk], p_sh, (16u * rb) * PS + 16u * kk, PS, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint j = 0u; j < 8u; j += 1u) {
+            [[unroll]] for (uint kk = 0u; kk < KT / 16u; kk += 1u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> vb;
+                coopMatLoad(vb, v_sh, (16u * kk) * LS4 + 4u * (8u * hf + j), LS4, gl_CooperativeMatrixLayoutRowMajor);
+                o[j] = coopMatMulAdd(pa[kk], vb, o[j]);
+            }
+        }
+    }
+
+    // ---- epilogue: O / l → act ---------------------------------------------
+    if (sc == 0u) {
+        l_sh[sr] = l;
+    }
+    barrier();
+    uint st = sg * 256u;
+    [[unroll]] for (uint j = 0u; j < 8u; j += 1u) {
+        coopMatStore(o[j], s_sh, st, 16, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint e = lane; e < 256u; e += 32u) {
+            uint r = 16u * rb + (e >> 4u);
+            uint jt = r / G;
+            uint tok = m0 + jt;
+            if (jt < QT && tok < p.m_tokens) {
+                uint h = g * G + r % G;
+                uint d = 128u * hf + 16u * j + (e & 15u);
+                act[p.o_off + tok * p.q_dim + h * HD + d] = s_sh[st + e] / l_sh[r];
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+}

@@ -257,19 +257,29 @@ fn run_step(
     Ok(())
 }
 
-/// Per-kernel breakdown of one prefill of `m` tokens at `pos_base = m`.
+/// Per-kernel breakdown of one prefill of `m` tokens at `pos_base = pos`.
+///
+/// `pos` defaults to `m`. Positions before `pos_base` other than the first `m`
+/// are never written, so only timings (not outputs) are meaningful at depth.
 #[cfg(not(feature = "ci"))]
-pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Result<()> {
+pub fn microbench_pp(
+    model: &Model,
+    m: u32,
+    pos: Option<u32>,
+    repeats: u32,
+    no_marker: bool,
+) -> Result<()> {
     let m = m.min(model.max_prefill_tokens()).max(1);
-    if 2 * m > model.max_seq {
+    let pos = pos.unwrap_or(m);
+    if pos.saturating_add(m) > model.max_seq {
         return Err(PotError::ContextOverflow {
-            pos: m,
+            pos,
             n: m,
             max: model.max_seq,
         });
     }
     eprintln!(
-        "--- microbench pp (m={m}, pos_base={m}, repeats={repeats}{}) ---",
+        "--- microbench pp (m={m}, pos_base={pos}, repeats={repeats}{}) ---",
         if no_marker { ", NO MARKER" } else { "" }
     );
     let prompt: Vec<u32> = (0..m).map(|i| (i % (model.cfg.n_vocab - 1)) + 1).collect();
@@ -286,7 +296,7 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     if no_marker {
         eprintln!(">>> PROFILE BEGIN: pp measurement ({repeats} submit(s)) <<<");
         for _ in 0..repeats {
-            let _ = prefill_topk(&session, &prompt, m, 1, &mut super::NoMarker)?;
+            let _ = prefill_topk(&session, &prompt, pos, 1, &mut super::NoMarker)?;
             wait()?;
         }
         eprintln!(">>> PROFILE END: pp measurement <<<");
@@ -295,7 +305,7 @@ pub fn microbench_pp(model: &Model, m: u32, repeats: u32, no_marker: bool) -> Re
     let mut steps = Vec::with_capacity(repeats as usize);
     for i in 0..=repeats {
         let mut marker = MicroMarker::new(&session);
-        let _ = prefill_topk(&session, &prompt, m, 1, &mut marker)?;
+        let _ = prefill_topk(&session, &prompt, pos, 1, &mut marker)?;
         wait()?;
         let spans = marker.resolve()?;
         if i > 0 {

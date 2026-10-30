@@ -17,7 +17,7 @@ Pick the crate that matches your model; the two do not depend on each other and 
 - **No `llama.cpp`, `ggml` or PyTorch on the hot path.** Weights come from a flat-file layout produced from a GGUF by `scripts/extract.py`, every kernel is hand-rolled GLSL compiled to SPIR-V at build time, and the host side is plain Rust + wgpu.
 - **Fast on consumer GPUs, with realistic numbers.** End-to-end throughput includes stochastic sampling and encode pipelining, not just bare-forward microbenchmarks.
   - `bonsai-pot` on an RX 9070: Bonsai-4B reaches ~2284 t/s prefill and ~385 t/s decode, and Bonsai-8B ~1294 / ~256 t/s.
-  - `bonsai2-pot` on an RX 9070: the 27B model reaches ~483 t/s prefill and ~76 t/s end-to-end decode, vs 54.6 t/s for the PrismML llama.cpp fork on Vulkan.
+  - `bonsai2-pot` on an RX 9070: the 27B model reaches ~492 t/s prefill (~408 t/s at 32K context) and ~75 t/s end-to-end decode, vs 54.6 t/s for the PrismML llama.cpp fork on Vulkan.
 - **Verified against a reference.** `bonsai2-pot` produces greedy generations token-identical to the PrismML llama.cpp fork, with per-layer residual cosine ≥ 0.9998.
 - **Small, embeddable library.** Each crate exposes `Model`, `Session`, `Sampler` and `GenerateOptions`. `bonsai-pot` is imported as `bonsai_pot`, and `bonsai2-pot` as `bonsai2_pot`. Each also ships a demo CLI and an interactive chat example. `no_std + alloc` is supported without the default `std` feature.
 - **Tokenization stays out of the Rust crates.** Use the `scripts/bpe.py` in each crate and pipe `u32` ids into the CLI.
