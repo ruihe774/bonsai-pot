@@ -996,19 +996,21 @@ enum CoopChoice {
     Off,
 }
 
-/// Largest staging chunk used to upload weights (see [`Uploader`]).
+/// Largest staging chunk used for uploads (see [`Uploader`]).
 const UPLOAD_CHUNK_BYTES: u64 = 64 << 20;
 
-/// Uploads `STORAGE` buffers through one reusable staging buffer of at most
-/// [`UPLOAD_CHUNK_BYTES`], waiting for each chunk's copy before reusing it.
+/// Uploads host data to the GPU through one reusable staging buffer of at
+/// most [`UPLOAD_CHUNK_BYTES`], waiting for each chunk's copy before reusing
+/// it. Used for the weights at load time and for snapshot restore.
 ///
 /// `create_buffer_init` stages every buffer through its own equally large
 /// host-visible allocation, which with resizable BAR lives in VRAM. Loading the
 /// weights then briefly needed about twice their size, and a session created
 /// right after found VRAM full: the kernel placed its KV cache in system
 /// memory and never moved it back, halving attention speed. With one bounded
-/// staging buffer the peak is the weights plus one chunk.
-struct Uploader<'a> {
+/// staging buffer the peak is the weights plus one chunk. `Queue::write_buffer`
+/// has the same problem when called for gigabytes before a submit.
+pub struct Uploader<'a> {
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     lost: &'a OnceCell<DeviceLostInfo>,
@@ -1018,7 +1020,7 @@ struct Uploader<'a> {
 
 impl<'a> Uploader<'a> {
     /// Staging sized for the largest upload, capped at [`UPLOAD_CHUNK_BYTES`].
-    fn new(
+    pub fn new(
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
         lost: &'a OnceCell<DeviceLostInfo>,
@@ -1052,7 +1054,25 @@ impl<'a> Uploader<'a> {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut offset = 0u64;
+        self.copy_chunks(&buf, 0, bytes)?;
+        Ok(buf)
+    }
+
+    /// Write `bytes` into `buf` (which needs `COPY_DST`) at `offset`. Both
+    /// must be 4-byte aligned: unlike [`Self::upload`] there is no padding,
+    /// which would overwrite the bytes after the range.
+    pub fn write(&self, buf: &wgpu::Buffer, offset: u64, bytes: &[u8]) -> Result<()> {
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        if !offset.is_multiple_of(align) || !(bytes.len() as u64).is_multiple_of(align) {
+            return Err(PotError::Config("upload range is not 4-byte aligned"));
+        }
+        self.copy_chunks(buf, offset, bytes)
+    }
+
+    /// Copy `bytes` to `buf[offset..]` chunk by chunk; a ragged tail is
+    /// zero-padded to 4 bytes.
+    fn copy_chunks(&self, buf: &wgpu::Buffer, mut offset: u64, bytes: &[u8]) -> Result<()> {
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
         for part in bytes.chunks(self.chunk as usize) {
             let n = (part.len() as u64).next_multiple_of(align);
             {
@@ -1065,7 +1085,7 @@ impl<'a> Uploader<'a> {
             let mut enc = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            enc.copy_buffer_to_buffer(&self.staging, 0, &buf, offset, n);
+            enc.copy_buffer_to_buffer(&self.staging, 0, buf, offset, n);
             enc.map_buffer_on_submit(&self.staging, wgpu::MapMode::Write, .., |_| ());
             self.queue.submit([enc.finish()]);
             self.device
@@ -1079,7 +1099,7 @@ impl<'a> Uploader<'a> {
             }
             offset += n;
         }
-        Ok(buf)
+        Ok(())
     }
 }
 

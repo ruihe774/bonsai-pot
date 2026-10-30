@@ -20,13 +20,14 @@
 use alloc::vec::Vec;
 
 use crate::error::{PotError, Result};
-use crate::model::Model;
+use crate::model::{Model, Uploader};
 use crate::session::Session;
 
 const MAGIC: &[u8; 8] = b"BONSAI2S";
 const VERSION: u32 = 2;
 const HEADER_BYTES: usize = 40;
-/// Largest single staging buffer used by capture / restore.
+/// Largest single readback staging buffer used by capture (restore uploads
+/// through [`Uploader`]).
 const CHUNK_BYTES: u64 = 256 << 20;
 
 /// Opaque host-resident copy of a session's KV cache and recurrent state.
@@ -267,19 +268,16 @@ pub fn apply(session: &mut Session<'_>, snap: &KvSnapshot) -> Result<()> {
     let model = session.model;
     validate_against(snap, model)?;
     let segs = segments(session, snap.pos);
+    // A bounded staging buffer: `write_buffer` for the whole payload would
+    // stage a snapshot-sized copy in VRAM next to the live KV cache.
+    let max_len = segs.iter().map(|&(_, _, len)| len).max().unwrap_or(0);
+    let up = Uploader::new(&model.device, &model.queue, &model.lost, max_len);
     let mut src = 0usize;
     for (buf, off, len) in segs {
-        let mut done = 0u64;
-        while done < len {
-            let n = (len - done).min(CHUNK_BYTES);
-            model
-                .queue
-                .write_buffer(buf, off + done, &snap.payload[src..src + n as usize]);
-            src += n as usize;
-            done += n;
-        }
+        up.write(buf, off, &snap.payload[src..src + len as usize])?;
+        src += len as usize;
     }
-    model.queue.submit([]);
+    drop(up);
     session.pos = snap.pos;
     Ok(())
 }
