@@ -730,7 +730,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -1372,7 +1372,7 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -1400,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -1430,7 +1430,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "wgpu-hal",
 ]
@@ -1438,7 +1438,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -1472,7 +1472,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -1481,7 +1481,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "29.0.3"
-source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
 dependencies = [
  "bitflags",
  "bytemuck",

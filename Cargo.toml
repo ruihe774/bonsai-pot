@@ -56,7 +56,7 @@ thiserror = { version = "2", default-features = false }
 # Bin-only deps (gated behind `bench-internals`, which the bin requires).
 env_logger = { version = "0.11", optional = true }
 
-wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "staging", default-features = false, features = ["std", "parking_lot", "vulkan"] }
+wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "relax-4gib-buffer-limits", default-features = false, features = ["std", "parking_lot", "vulkan"] }
 ash = "0.38"
 
 [dev-dependencies]
