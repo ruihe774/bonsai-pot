@@ -1,0 +1,81 @@
+#version 460
+
+// Gated delta rule over m_tokens consecutive tokens (sequential scan):
+//   S ← S · exp(g);  kv = Sᵀ k;  δ = β (v − kv);  S ← S + k δᵀ;  o = Sᵀ q · scale
+// S is per value head h: 128 (k rows) × 128 (v columns), stored column-major
+// st[state_off + h*16384 + col*128 + row]. Value head h reads q/k head
+// h % n_k_heads (Qwen3.5 tiled layout). q and k arrive L2-normalized.
+// Four invocations share a column (rows i*4 + lane), 32 columns per workgroup.
+// dispatch: (n_v_heads, 128 / 32, 1).
+
+layout(push_constant) uniform Params {
+    uint m_tokens;
+    uint qkv_off;   // act offset of conv output rows: q | k | v (row stride `stride`)
+    uint stride;
+    uint k_base;    // channel offset of k within a row (= n_k_heads * 128)
+    uint v_base;    // channel offset of v within a row (= 2 * n_k_heads * 128)
+    uint gates_off; // act offset of gates (row stride 2*n_v_heads: g | beta)
+    uint o_off;     // act offset of the output (row stride n_v_heads * 128)
+    uint state_off; // st offset of this layer's ssm state
+    uint n_k_heads;
+    uint n_v_heads;
+    float scale;    // 1 / sqrt(128)
+    uint fresh;
+}
+p;
+
+#include "lib/bindings.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+shared float k_sh[128];
+shared float q_sh[128];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint col = gl_WorkGroupID.y * 32u + (t >> 2u);
+    uint lane = t & 3u;
+    uint kh = h % p.n_k_heads;
+    uint sbase = p.state_off + h * 16384u + col * 128u;
+
+    float s[32];
+    [[unroll]] for (uint i = 0u; i < 32u; i += 1u) {
+        s[i] = p.fresh != 0u ? 0.0 : st[sbase + i * 4u + lane];
+    }
+
+    uint H = p.n_v_heads;
+    for (uint m = 0u; m < p.m_tokens; m += 1u) {
+        uint row = p.qkv_off + m * p.stride;
+        barrier();
+        q_sh[t] = act[row + kh * 128u + t];
+        k_sh[t] = act[row + p.k_base + kh * 128u + t];
+        barrier();
+        float g = exp(act[p.gates_off + m * 2u * H + h]);
+        float beta = act[p.gates_off + m * 2u * H + H + h];
+        float v = act[row + p.v_base + h * 128u + col];
+
+        float kv = 0.0;
+        [[unroll]] for (uint i = 0u; i < 32u; i += 1u) {
+            s[i] *= g;
+            kv += s[i] * k_sh[i * 4u + lane];
+        }
+        kv += subgroupShuffleXor(kv, 1u);
+        kv += subgroupShuffleXor(kv, 2u);
+        float delta = (v - kv) * beta;
+        float o = 0.0;
+        [[unroll]] for (uint i = 0u; i < 32u; i += 1u) {
+            s[i] += k_sh[i * 4u + lane] * delta;
+            o += s[i] * q_sh[i * 4u + lane];
+        }
+        o += subgroupShuffleXor(o, 1u);
+        o += subgroupShuffleXor(o, 2u);
+        if (lane == 0u) {
+            act[p.o_off + m * H * 128u + h * 128u + col] = o * p.scale;
+        }
+    }
+
+    [[unroll]] for (uint i = 0u; i < 32u; i += 1u) {
+        st[sbase + i * 4u + lane] = s[i];
+    }
+}

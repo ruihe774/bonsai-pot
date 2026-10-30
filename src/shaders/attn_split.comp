@@ -1,0 +1,158 @@
+#version 460
+
+// Split-K decode attention (one query token), GQA-batched and tiled: each
+// workgroup scans cache positions [c*chunk_len, min((c+1)*chunk_len, n_kv)) of
+// one KV head for the G = n_head / n_kv_head query heads sharing it in 32-key
+// tiles (scores: one 256-dim dot per invocation, K read straight from the
+// cache; output: one head dim per invocation, V read straight from the
+// cache — only q and the probabilities live in LDS), and writes per-head partial
+// (o[256] unnormalized, m, l) for the log-sum-exp merge in attn_out_rot_q8.
+// dispatch: (n_kv_head, n_chunks, 1); chunk_len is a multiple of 32.
+
+layout(push_constant) uniform Params {
+    uint q_off;      // act offset of the [q|gate] projection row
+    uint n_head;
+    uint n_kv_head;
+    uint n_kv;       // number of valid cache positions
+    uint chunk_len;
+    uint n_chunks;
+    uint kv_dim;
+    uint kv_d_word;  // kv word offset of this layer's scale section
+    uint kv_qs_byte; // kv byte offset of this layer's qs section
+    uint part_off;   // act offset of the partials ((n_head × n_chunks) × 258)
+    float scale;
+}
+p;
+
+#define KV_QUAL readonly
+#include "lib/bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint HD = 256u;
+const uint MAX_G = 8u;
+const uint KT = 32u;
+const uint PSTRIDE = HD + 2u;
+
+shared f16vec4 q_sh[MAX_G][HD / 4u];
+shared float p_sh[MAX_G][KT];
+shared float corr_sh[MAX_G];
+shared float m_sh[MAX_G];
+shared float l_sh[MAX_G];
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint G = p.n_head / p.n_kv_head;
+    uint k_begin = c * p.chunk_len;
+    uint k_end = min(k_begin + p.chunk_len, p.n_kv);
+
+    for (uint idx = t; idx < G * (HD / 4u); idx += 256u) {
+        uint r = idx / (HD / 4u);
+        uint d4 = idx % (HD / 4u);
+        uint qi = p.q_off + (g * G + r) * 2u * HD + 4u * d4;
+        q_sh[r][d4] = f16vec4(vec4(act[qi], act[qi + 1u], act[qi + 2u], act[qi + 3u]) * p.scale);
+    }
+    if (t < MAX_G) {
+        m_sh[t] = -1e30;
+        l_sh[t] = 0.0;
+    }
+    float o[MAX_G];
+    [[unroll]] for (uint r = 0u; r < MAX_G; r += 1u) {
+        o[r] = 0.0;
+    }
+
+    for (uint k0 = k_begin; k0 < k_end; k0 += KT) {
+        barrier();
+        // Scores, then the online-softmax update of each 32-key row. With
+        // subgroups of >= 32 lanes a row is one 32-lane cluster.
+        bool fast = gl_SubgroupSize >= 32u;
+        float sc = -1e30;
+        uint r = t / KT;
+        uint kk = t % KT;
+        if (t < G * KT && k0 + kk < k_end) {
+            uint kbase = (k0 + kk) * p.kv_dim + g * HD;
+            // 8 Q8_0 blocks of 32: one scale and 8 words each.
+            float acc = 0.0;
+            [[unroll]] for (uint blk = 0u; blk < HD / 32u; blk += 1u) {
+                uint e = kbase + 32u * blk;
+                uint w0 = (p.kv_qs_byte + e) >> 2u;
+                vec4 a4 = vec4(0.0);
+                [[unroll]] for (uint j = 0u; j < 8u; j += 1u) {
+                    a4 += vec4(q_sh[r][8u * blk + j]) * vec4(unpack8(int(kv_k[w0 + j])));
+                }
+                acc += (a4.x + a4.y + a4.z + a4.w) * uintBitsToFloat(kv_k[p.kv_d_word + (e >> 5u)]);
+            }
+            sc = acc;
+        }
+        if (fast) {
+            float m_old = t < G * KT ? m_sh[r] : 0.0;
+            float mx = max(m_old, subgroupClusteredMax(sc, 32u));
+            float e = sc <= -1e29 ? 0.0 : exp(sc - mx);
+            float sum = subgroupClusteredAdd(e, 32u);
+            barrier();
+            if (t < G * KT) {
+                p_sh[r][kk] = e;
+                if (kk == 0u) {
+                    float cr = exp(m_old - mx);
+                    corr_sh[r] = cr;
+                    l_sh[r] = l_sh[r] * cr + sum;
+                    m_sh[r] = mx;
+                }
+            }
+        } else {
+            if (t < G * KT) {
+                p_sh[r][kk] = sc;
+            }
+            barrier();
+            if (t < G) {
+                float mx = m_sh[t];
+                for (uint k = 0u; k < KT; k += 1u) {
+                    mx = max(mx, p_sh[t][k]);
+                }
+                float cr = exp(m_sh[t] - mx);
+                float l = l_sh[t] * cr;
+                for (uint k = 0u; k < KT; k += 1u) {
+                    float e = p_sh[t][k] <= -1e29 ? 0.0 : exp(p_sh[t][k] - mx);
+                    p_sh[t][k] = e;
+                    l += e;
+                }
+                m_sh[t] = mx;
+                l_sh[t] = l;
+                corr_sh[t] = cr;
+            }
+        }
+        // O update: invocation t owns head dim t.
+        float v[KT];
+        [[unroll]] for (uint j = 0u; j < KT; j += 1u) {
+            v[j] = 0.0;
+            if (k0 + j < k_end) {
+                uint e = (k0 + j) * p.kv_dim + g * HD + t;
+                uint qb = p.kv_qs_byte + e;
+                v[j] = float(bitfieldExtract(int(kv_v[qb >> 2u]), int((qb & 3u) * 8u), 8)) *
+                       uintBitsToFloat(kv_v[p.kv_d_word + (e >> 5u)]);
+            }
+        }
+        [[unroll]] for (uint r2 = 0u; r2 < MAX_G; r2 += 1u) {
+            if (r2 < G) {
+                float acc = o[r2] * corr_sh[r2];
+                [[unroll]] for (uint j = 0u; j < KT; j += 1u) {
+                    acc += p_sh[r2][j] * v[j];
+                }
+                o[r2] = acc;
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < MAX_G; r += 1u) {
+        if (r < G) {
+            uint pb = p.part_off + ((g * G + r) * p.n_chunks + c) * PSTRIDE;
+            act[pb + t] = o[r];
+            if (t == 0u) {
+                act[pb + HD] = m_sh[r];
+                act[pb + HD + 1u] = l_sh[r];
+            }
+        }
+    }
+}

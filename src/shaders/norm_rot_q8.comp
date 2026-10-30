@@ -1,0 +1,64 @@
+#version 460
+
+// RMSNorm → (optional f32 copy) → Hadamard signs → blockwise FWHT → Q8/128.
+//   v  = x * rsqrt(mean(x²) + eps) * w_norm
+//   xn = v                                  (if FLAG_WRITE_XN; un-rotated copy)
+//   q8 = Q8(FWHT(s ⊙ v))
+// dispatch: (k / 1024, m_tokens, 1). Each workgroup recomputes the row's sum
+// of squares and then transforms one 1024-element block.
+
+layout(push_constant) uniform Params {
+    uint k;         // row width (multiple of 1024)
+    uint in_off;    // act offset of the input rows
+    uint in_stride; // act stride between input rows
+    uint norm_off;  // ws word offset of the f32 norm weights
+    uint signs_off; // ws word offset of the k sign bits
+    uint xn_off;    // act offset of the un-rotated output (row stride k)
+    uint q8_qs;     // q8 word offset of the qs section (row stride k/4 words)
+    uint q8_d;      // q8 word offset of the scale section (row stride k/128)
+    uint q8_s;      // q8 word offset of the scale*sum section (row stride k/128)
+    float eps;
+    uint flags;
+}
+p;
+
+const uint FLAG_WRITE_XN = 1u;
+
+#define Q8_QUAL writeonly
+#include "lib/bindings.glsl"
+#include "lib/wg_reduce.glsl"
+#include "lib/fwht_q8.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint row = p.in_off + m * p.in_stride;
+
+    float ss = 0.0;
+    for (uint i = t; i < p.k; i += 256u) {
+        float x = act[row + i];
+        ss += x * x;
+    }
+    ss = wg_sum(ss);
+    float scale = inversesqrt(ss / float(p.k) + p.eps);
+
+    uint e0 = blk * 1024u + 4u * t;
+    vec4 x = vec4(act[row + e0], act[row + e0 + 1u], act[row + e0 + 2u], act[row + e0 + 3u]);
+    vec4 wn = vec4(ws_f32(p.norm_off + e0), ws_f32(p.norm_off + e0 + 1u), ws_f32(p.norm_off + e0 + 2u),
+                   ws_f32(p.norm_off + e0 + 3u));
+    vec4 v = x * scale * wn;
+    if ((p.flags & FLAG_WRITE_XN) != 0u) {
+        uint o = p.xn_off + m * p.k + e0;
+        act[o + 0u] = v.x;
+        act[o + 1u] = v.y;
+        act[o + 2u] = v.z;
+        act[o + 3u] = v.w;
+    }
+    v = fwht1024(v * hsign4(p.signs_off, e0));
+    uint nb = p.k >> 7u;
+    store_q8_1024(v, p.q8_qs + ((m * p.k + blk * 1024u) >> 2u), p.q8_d + m * nb + blk * 8u,
+                  p.q8_s + m * nb + blk * 8u);
+}

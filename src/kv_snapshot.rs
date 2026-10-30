@@ -1,23 +1,21 @@
-//! Host-resident KV-cache snapshots.
+//! Host-resident conversation snapshots.
 //!
-//! A [`KvSnapshot`] is an owned blob of the GPU's KV-cache for positions
-//! `[0..pos)`. It is not tied to any [`Session`](crate::Session) lifetime and
-//! can be persisted to disk via [`KvSnapshot::to_bytes`] /
-//! [`KvSnapshot::from_bytes`].
+//! A [`KvSnapshot`] holds everything a session needs to continue from
+//! position `pos`: the `Q8_0` KV cache rows `[0..pos)` of every full-attention
+//! layer and the complete recurrent state (conv + delta-rule state) of every
+//! Gated-DeltaNet layer. Recurrent state summarizes the whole prefix, so a
+//! snapshot restores exactly the position it was captured at.
 //!
-//! # Payload layout
-//!
-//! Bytes after the 32-byte header are organized as:
+//! # Payload layout (after the 40-byte header)
 //! ```text
-//! for kind in [K, V]:
-//!   for il in 0..n_layer:
-//!     d-section:  pos * (kv_dim/32) * 4  bytes (FP32 scales)
-//!     qs-section: pos * kv_dim            bytes (i8 quants)
+//! for buf in [K, V]:
+//!   for each full-attention layer:
+//!     scales: pos * (kv_dim/32) * 4 bytes (f32)
+//!     qs:     pos * kv_dim          bytes (i8)
+//! state: state_words * 4 bytes (f32; omitted when pos == 0)
 //! ```
-//! This matches the `Q8_0` block structure used by the engine's KV buffers.
-//!
-//! A snapshot captured with `max_seq=512` can be restored into a model loaded
-//! with `max_seq=2048` as long as `pos ≤ model.max_seq_len()`.
+//! A snapshot taken with one `max_seq` restores into a model loaded with any
+//! `max_seq >= pos`.
 
 use alloc::vec::Vec;
 
@@ -25,23 +23,21 @@ use crate::error::{PotError, Result};
 use crate::model::Model;
 use crate::session::Session;
 
-// ---- on-disk header ---------------------------------------------------------
+const MAGIC: &[u8; 8] = b"BONSAI2S";
+const VERSION: u32 = 2;
+const HEADER_BYTES: usize = 40;
+/// Largest single staging buffer used by capture / restore.
+const CHUNK_BYTES: u64 = 256 << 20;
 
-const MAGIC: &[u8; 8] = b"BONSAIKV";
-const VERSION: u32 = 1;
-const HEADER_BYTES: usize = 32;
-
-/// Opaque host-resident copy of a Session's GPU KV-cache state.
-///
-/// `Clone` deep-copies the payload. `Send + Sync` (auto). Use
-/// [`KvSnapshot::to_bytes`] / [`KvSnapshot::from_bytes`] to persist to disk.
+/// Opaque host-resident copy of a session's KV cache and recurrent state.
 #[derive(Debug, Clone)]
 pub struct KvSnapshot {
-    n_layer: u32,
+    n_attn: u32,
     kv_dim: u32,
+    n_gdn: u32,
+    state_words: u32,
     max_seq: u32,
     pos: u32,
-    /// K bytes then V bytes, in canonical packed order (see module docs).
     payload: Vec<u8>,
 }
 
@@ -51,56 +47,55 @@ impl KvSnapshot {
     pub const fn pos(&self) -> u32 {
         self.pos
     }
+    /// Full-attention layers captured.
     #[must_use]
-    pub const fn n_layer(&self) -> u32 {
-        self.n_layer
+    pub const fn n_attn_layers(&self) -> u32 {
+        self.n_attn
+    }
+    /// Gated-DeltaNet layers captured.
+    #[must_use]
+    pub const fn n_gdn_layers(&self) -> u32 {
+        self.n_gdn
     }
     #[must_use]
     pub const fn kv_dim(&self) -> u32 {
         self.kv_dim
     }
+    /// `max_seq` of the session the snapshot was captured from.
     #[must_use]
     pub const fn max_seq(&self) -> u32 {
         self.max_seq
     }
 
-    /// Serialize to a flat byte blob (32-byte header + payload).
+    /// Serialize to a flat byte blob (header + payload).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_BYTES + self.payload.len());
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&self.n_layer.to_le_bytes());
-        out.extend_from_slice(&self.kv_dim.to_le_bytes());
-        out.extend_from_slice(&self.max_seq.to_le_bytes());
-        out.extend_from_slice(&self.pos.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        for v in [
+            VERSION,
+            self.n_attn,
+            self.kv_dim,
+            self.n_gdn,
+            self.state_words,
+            self.max_seq,
+            self.pos,
+            0,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
         out.extend_from_slice(&self.payload);
         out
     }
 
-    /// Parse a blob produced by [`Self::to_bytes`].
-    ///
-    /// Validates magic, version, non-zero reserved field, and the declared
-    /// (`n_layer`, `kv_dim`, `pos`) → payload-size invariant before allocating.
-    /// Does **not** validate against any [`Model`]; call
-    /// [`Session::restore`](crate::Session::restore) for that.
+    /// Parse a blob produced by [`Self::to_bytes`]. Checks the header and the
+    /// payload size; model compatibility is checked by
+    /// [`Session::restore`](crate::Session::restore).
     ///
     /// # Errors
     ///
-    /// Returns [`PotError::Config`] if the blob is too short, has the wrong
-    /// magic, an unsupported version, a non-zero reserved field, or a payload
-    /// length inconsistent with the declared header fields.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic in practice: the fixed-size slice conversions used
-    /// internally are guaranteed to succeed once the length precondition is
-    /// met.
-    #[allow(
-        clippy::unwrap_used,
-        reason = "fixed-size slice → array conversions are infallible after the length check above"
-    )]
+    /// Returns [`PotError::Config`] for a short blob, wrong magic, unsupported
+    /// version, non-zero reserved field, or inconsistent payload length.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_BYTES {
             return Err(PotError::Config(
@@ -110,82 +105,85 @@ impl KvSnapshot {
         if &bytes[0..8] != MAGIC {
             return Err(PotError::Config("KvSnapshot blob has wrong magic"));
         }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != VERSION {
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                bytes[8 + 4 * i],
+                bytes[9 + 4 * i],
+                bytes[10 + 4 * i],
+                bytes[11 + 4 * i],
+            ])
+        };
+        if word(0) != VERSION {
             return Err(PotError::Config("KvSnapshot blob has unsupported version"));
         }
-        let n_layer = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let kv_dim = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let max_seq = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let pos = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        let reserved = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
-        if reserved != 0 {
+        if word(7) != 0 {
             return Err(PotError::Config(
                 "KvSnapshot blob has non-zero reserved field",
             ));
         }
-        let expected = payload_bytes(n_layer, kv_dim, pos);
-        if bytes.len() - HEADER_BYTES != expected {
+        let snap = Self {
+            n_attn: word(1),
+            kv_dim: word(2),
+            n_gdn: word(3),
+            state_words: word(4),
+            max_seq: word(5),
+            pos: word(6),
+            payload: Vec::new(),
+        };
+        if (bytes.len() - HEADER_BYTES) as u64 != snap.expected_payload() {
             return Err(PotError::Config(
                 "KvSnapshot blob payload length does not match header",
             ));
         }
         Ok(Self {
-            n_layer,
-            kv_dim,
-            max_seq,
-            pos,
             payload: bytes[HEADER_BYTES..].to_vec(),
+            ..snap
         })
     }
-}
 
-// ---- layout helpers ---------------------------------------------------------
+    const fn kv_bytes_per_buffer(&self) -> u64 {
+        self.n_attn as u64 * self.pos as u64 * (self.kv_dim as u64 + self.kv_dim as u64 / 8)
+    }
 
-const fn nb(kv_dim: u32) -> u64 {
-    (kv_dim / 32) as u64
-}
-
-/// Total payload bytes for a snapshot of `pos` tokens.
-fn payload_bytes(n_layer: u32, kv_dim: u32, pos: u32) -> usize {
-    let d_layer = u64::from(pos) * nb(kv_dim) * 4;
-    let qs_layer = u64::from(pos) * u64::from(kv_dim);
-    (2 * u64::from(n_layer) * (d_layer + qs_layer)) as usize
-}
-
-/// Byte offset into the snapshot payload for a given (kind, layer, section).
-/// kind: 0 = K, 1 = V.  section: 0 = d (FP32 scales), 1 = qs (i8 quants).
-fn payload_offset(n_layer: u32, kv_dim: u32, pos: u32, kind: u32, il: u32, sect: u32) -> usize {
-    let d_layer = u64::from(pos) * nb(kv_dim) * 4;
-    let qs_layer = u64::from(pos) * u64::from(kv_dim);
-    let layer_bytes = d_layer + qs_layer;
-    let base_kv = u64::from(kind) * u64::from(n_layer) * layer_bytes;
-    let base_il = base_kv + u64::from(il) * layer_bytes;
-    if sect == 0 {
-        base_il as usize
-    } else {
-        (base_il + d_layer) as usize
+    const fn expected_payload(&self) -> u64 {
+        if self.pos == 0 {
+            0
+        } else {
+            2 * self.kv_bytes_per_buffer() + self.state_words as u64 * 4
+        }
     }
 }
 
-/// Byte offset of layer `il` in `kv_k`/`kv_v` (d-section start).
-const fn buf_d_offset(max_seq: u32, kv_dim: u32, il: u32) -> u64 {
-    il as u64 * max_seq as u64 * nb(kv_dim) * 4
+/// (buffer, byte offset, byte length) of every payload segment, in order.
+fn segments<'a>(session: &'a Session<'_>, pos: u32) -> Vec<(&'a wgpu::Buffer, u64, u64)> {
+    let model = session.model;
+    let kv = &model.kv;
+    let n_attn = model.cfg.n_attn_layers();
+    let mut v = Vec::new();
+    if pos == 0 {
+        return v;
+    }
+    for buf in [&session.state.kv_k, &session.state.kv_v] {
+        for idx in 0..n_attn {
+            let (o, l) = kv.d_range(idx, pos);
+            v.push((buf, o, l));
+            let (o, l) = kv.qs_range(idx, pos);
+            v.push((buf, o, l));
+        }
+    }
+    v.push((&session.state.state, 0, model.state.total * 4));
+    v
 }
 
-/// Byte offset of layer `il` in `kv_k`/`kv_v` (qs-section start).
-const fn buf_qs_offset(n_layer: u32, max_seq: u32, kv_dim: u32, il: u32) -> u64 {
-    let d_total = (n_layer as u64) * (max_seq as u64) * nb(kv_dim) * 4;
-    d_total + (il as u64) * (max_seq as u64) * (kv_dim as u64)
-}
-
-// ---- validate ---------------------------------------------------------------
-
-pub const fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
+fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
     let cfg = &model.cfg;
-    if snap.n_layer != cfg.n_layer || snap.kv_dim != cfg.kv_dim {
+    if snap.n_attn != cfg.n_attn_layers()
+        || snap.n_gdn != cfg.n_gdn_layers()
+        || snap.kv_dim != cfg.kv_dim()
+        || u64::from(snap.state_words) != model.state.total
+    {
         return Err(PotError::Config(
-            "KvSnapshot does not match model: n_layer or kv_dim differs",
+            "KvSnapshot does not match the model geometry",
         ));
     }
     if snap.pos > model.max_seq {
@@ -198,313 +196,146 @@ pub const fn validate_against(snap: &KvSnapshot, model: &Model) -> Result<()> {
     Ok(())
 }
 
-// ---- GPU paths --------------------------------------------------------------
-
-/// Read back the live `[0..pos)` slice of the GPU KV cache to a [`KvSnapshot`].
+/// Read the live state of `session` back into a [`KvSnapshot`].
 pub fn capture(session: &Session<'_>) -> Result<KvSnapshot> {
     let model = session.model;
-    let pos = session.pos;
     let cfg = &model.cfg;
-    let n_layer = cfg.n_layer;
-    let kv_dim = cfg.kv_dim;
-    let max_seq = model.max_seq;
-
-    let snap_payload_bytes = payload_bytes(n_layer, kv_dim, pos);
-
-    // Empty snapshot: skip GPU work entirely.
-    if pos == 0 {
-        return Ok(KvSnapshot {
-            n_layer,
-            kv_dim,
-            max_seq,
-            pos: 0,
-            payload: Vec::new(),
-        });
-    }
-
-    // One-shot staging buffer sized to the live prefix only.
-    let staging = model.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("kv_snapshot_staging"),
-        size: snap_payload_bytes as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+    let mut snap = KvSnapshot {
+        n_attn: cfg.n_attn_layers(),
+        kv_dim: cfg.kv_dim(),
+        n_gdn: cfg.n_gdn_layers(),
+        state_words: model.state.total as u32,
+        max_seq: model.max_seq,
+        pos: session.pos,
+        payload: Vec::new(),
+    };
+    let segs = segments(session, session.pos);
+    let total: u64 = segs.iter().map(|s| s.2).sum();
+    debug_assert_eq!(total, snap.expected_payload());
+    let mut payload = vec![0u8; total as usize];
+    let chunk = CHUNK_BYTES.min(total.max(4));
+    let staging = (total > 0).then(|| {
+        model.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("snapshot_staging"),
+            size: chunk,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     });
-
-    // Build one CommandEncoder with 4 × n_layer small copies:
-    // for kind in {K,V} × for il in 0..n_layer × for sect in {d, qs}.
-    let mut enc = model
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("kv_snapshot_enc"),
-        });
-
-    let d_size = u64::from(pos) * nb(kv_dim) * 4;
-    let qs_size = u64::from(pos) * u64::from(kv_dim);
-
-    for kind in 0u32..2 {
-        let src_buf = if kind == 0 {
-            &session.state.kv_k
-        } else {
-            &session.state.kv_v
-        };
-        for il in 0..n_layer {
-            // d-section
-            enc.copy_buffer_to_buffer(
-                src_buf,
-                buf_d_offset(max_seq, kv_dim, il),
-                &staging,
-                payload_offset(n_layer, kv_dim, pos, kind, il, 0) as u64,
-                d_size,
-            );
-            // qs-section
-            enc.copy_buffer_to_buffer(
-                src_buf,
-                buf_qs_offset(n_layer, max_seq, kv_dim, il),
-                &staging,
-                payload_offset(n_layer, kv_dim, pos, kind, il, 1) as u64,
-                qs_size,
-            );
+    // Walk the segments, filling the staging buffer up to `chunk` bytes per round.
+    let mut seg = 0usize;
+    let mut seg_off = 0u64;
+    let mut written = 0u64;
+    while let Some(staging) = staging.as_ref().filter(|_| written < total) {
+        let mut enc = model
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("snapshot"),
+            });
+        let mut used = 0u64;
+        while used < chunk && seg < segs.len() {
+            let (buf, off, len) = segs[seg];
+            let n = (len - seg_off).min(chunk - used);
+            enc.copy_buffer_to_buffer(buf, off + seg_off, staging, used, n);
+            used += n;
+            seg_off += n;
+            if seg_off == len {
+                seg += 1;
+                seg_off = 0;
+            }
         }
-    }
-
-    enc.map_buffer_on_submit(
-        &staging,
-        wgpu::MapMode::Read,
-        0..snap_payload_bytes as u64,
-        |_| {},
-    );
-    model.queue.submit([enc.finish()]);
-
-    let slice = staging.slice(0..snap_payload_bytes as u64);
-    if let Err(e) = model.device.poll(wgpu::PollType::wait_indefinitely()) {
+        enc.map_buffer_on_submit(staging, wgpu::MapMode::Read, 0..used, |_| {});
+        model.queue.submit([enc.finish()]);
+        if let Err(e) = model.device.poll(wgpu::PollType::wait_indefinitely()) {
+            model.check_device()?;
+            return Err(PotError::Poll(e));
+        }
         model.check_device()?;
-        return Err(PotError::Poll(e));
+        {
+            let mapped = staging.slice(0..used).get_mapped_range();
+            payload[written as usize..(written + used) as usize].copy_from_slice(&mapped);
+        }
+        staging.unmap();
+        written += used;
     }
-
-    let mut payload = vec![0u8; snap_payload_bytes];
-    {
-        let mapped = slice.get_mapped_range();
-        payload.copy_from_slice(&mapped);
-    }
-    staging.unmap();
-
-    Ok(KvSnapshot {
-        n_layer,
-        kv_dim,
-        max_seq,
-        pos,
-        payload,
-    })
+    snap.payload = payload;
+    Ok(snap)
 }
 
-/// Upload `snap`'s payload into the GPU KV cache and advance the session's
-/// position to match.
+/// Upload `snap` into `session` and set its position.
 pub fn apply(session: &mut Session<'_>, snap: &KvSnapshot) -> Result<()> {
     let model = session.model;
     validate_against(snap, model)?;
-
-    if snap.pos == 0 {
-        session.pos = 0;
-        return Ok(());
-    }
-
-    let cfg = &model.cfg;
-    let n_layer = cfg.n_layer;
-    let kv_dim = cfg.kv_dim;
-    let max_seq = model.max_seq;
-
-    let d_size = u64::from(snap.pos) * nb(kv_dim) * 4;
-    let qs_size = u64::from(snap.pos) * u64::from(kv_dim);
-
-    // Stage the whole payload into a single COPY_SRC buffer and issue all
-    // 4*n_layer copies + the submit in one shot, so the restore lands as a
-    // single GPU operation (~1-2 ms over PCIe vs interleaved write_buffer
-    // calls that get split across the queue's internal staging chunks).
-    let staging = model.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("kv_restore_staging"),
-        size: snap.payload.len() as u64,
-        usage: wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: true,
-    });
-    staging
-        .slice(..)
-        .get_mapped_range_mut()
-        .copy_from_slice(&snap.payload);
-    staging.unmap();
-
-    let mut enc = model
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("kv_restore"),
-        });
-    for kind in 0u32..2 {
-        let dst_buf = if kind == 0 {
-            &session.state.kv_k
-        } else {
-            &session.state.kv_v
-        };
-        for il in 0..n_layer {
-            // d-section
-            let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 0) as u64;
-            let dst_off = buf_d_offset(max_seq, kv_dim, il);
-            enc.copy_buffer_to_buffer(&staging, src_off, dst_buf, dst_off, d_size);
-            // qs-section
-            let src_off = payload_offset(n_layer, kv_dim, snap.pos, kind, il, 1) as u64;
-            let dst_off = buf_qs_offset(n_layer, max_seq, kv_dim, il);
-            enc.copy_buffer_to_buffer(&staging, src_off, dst_buf, dst_off, qs_size);
+    let segs = segments(session, snap.pos);
+    let mut src = 0usize;
+    for (buf, off, len) in segs {
+        let mut done = 0u64;
+        while done < len {
+            let n = (len - done).min(CHUNK_BYTES);
+            model
+                .queue
+                .write_buffer(buf, off + done, &snap.payload[src..src + n as usize]);
+            src += n as usize;
+            done += n;
         }
     }
-    model.queue.submit([enc.finish()]);
+    model.queue.submit([]);
     session.pos = snap.pos;
-
     Ok(())
 }
-
-// ---- tests ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_snap(n_layer: u32, kv_dim: u32, max_seq: u32, pos: u32) -> KvSnapshot {
-        let len = payload_bytes(n_layer, kv_dim, pos);
-        let payload: Vec<u8> = (0..len).map(|i| (i & 0xFF) as u8).collect();
-        KvSnapshot {
-            n_layer,
-            kv_dim,
-            max_seq,
+    fn make_snap(pos: u32) -> KvSnapshot {
+        let mut s = KvSnapshot {
+            n_attn: 16,
+            kv_dim: 1024,
+            n_gdn: 48,
+            state_words: 100,
+            max_seq: 4096,
             pos,
-            payload,
+            payload: Vec::new(),
+        };
+        s.payload = (0..s.expected_payload()).map(|i| (i % 251) as u8).collect();
+        s
+    }
+
+    #[test]
+    fn roundtrip() {
+        for pos in [0u32, 1, 7] {
+            let s = make_snap(pos);
+            let b = KvSnapshot::from_bytes(&s.to_bytes()).unwrap();
+            assert_eq!(b.pos(), pos);
+            assert_eq!(b.n_attn_layers(), 16);
+            assert_eq!(b.n_gdn_layers(), 48);
+            assert_eq!(b.kv_dim(), 1024);
+            assert_eq!(b.max_seq(), 4096);
+            assert_eq!(b.payload, s.payload);
         }
     }
 
     #[test]
-    fn header_roundtrip() {
-        let snap = make_snap(36, 1024, 1024, 64);
-        let bytes = snap.to_bytes();
-        let snap2 = KvSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(snap2.pos, snap.pos);
-        assert_eq!(snap2.n_layer, snap.n_layer);
-        assert_eq!(snap2.kv_dim, snap.kv_dim);
-        assert_eq!(snap2.max_seq, snap.max_seq);
-        assert_eq!(snap2.payload, snap.payload);
+    fn payload_size() {
+        // 16 layers × (1024 + 128) bytes × 2 buffers per position + state.
+        assert_eq!(make_snap(3).expected_payload(), 2 * 16 * 1152 * 3 + 400);
+        assert_eq!(make_snap(0).expected_payload(), 0);
     }
 
     #[test]
-    fn empty_roundtrip() {
-        let snap = make_snap(36, 1024, 1024, 0);
-        assert_eq!(snap.payload.len(), 0);
-        let bytes = snap.to_bytes();
-        assert_eq!(bytes.len(), HEADER_BYTES);
-        let snap2 = KvSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(snap2.pos, 0);
-        assert_eq!(snap2.payload.len(), 0);
-    }
-
-    #[test]
-    fn from_bytes_bad_magic() {
-        let snap = make_snap(36, 1024, 1024, 4);
-        let mut bytes = snap.to_bytes();
-        bytes[0] = 0xFF;
-        assert!(KvSnapshot::from_bytes(&bytes).is_err());
-    }
-
-    #[test]
-    fn from_bytes_truncated() {
-        let snap = make_snap(36, 1024, 1024, 4);
-        let bytes = snap.to_bytes();
-        assert!(KvSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
-    }
-
-    #[test]
-    fn payload_size_bonsai4b() {
-        // For Bonsai-4B at pos=512: 2 × 36 × 512 × (1024 + 128) = 42_467_328 bytes.
-        assert_eq!(payload_bytes(36, 1024, 512), 42_467_328);
-    }
-
-    #[test]
-    fn payload_size_bonsai8b() {
-        // Bonsai-8B: n_layer=36, kv_dim=1024 (n_kv_head=8 × head_dim=128).
-        // Identical KV layout to 4B — payload depends only on (n_layer, kv_dim, pos).
-        assert_eq!(payload_bytes(36, 1024, 512), 42_467_328);
-    }
-
-    #[test]
-    fn payload_size_bonsai8b_full_useful_ctx() {
-        // 8B at the practical ~32k cap (2× rope_orig_context=16384):
-        // 2 × 36 × 32768 × (1024 + 128) = 2_717_908_992 bytes.
-        // Verifies the arithmetic stays u64-clean above 2 GB.
-        assert_eq!(payload_bytes(36, 1024, 32768), 2_717_908_992);
-    }
-
-    #[test]
-    fn payload_offsets_no_overlap() {
-        // Verify d and qs regions for consecutive layers don't overlap.
-        let (n_layer, kv_dim, pos) = (36u32, 1024u32, 16u32);
-        for kind in 0u32..2 {
-            for il in 0..n_layer {
-                let d_start = payload_offset(n_layer, kv_dim, pos, kind, il, 0);
-                let d_end = d_start + (pos as usize * (kv_dim / 32) as usize * 4);
-                let qs_start = payload_offset(n_layer, kv_dim, pos, kind, il, 1);
-                let qs_end = qs_start + (pos as usize * kv_dim as usize);
-                assert!(d_end <= qs_start, "d and qs overlap at kind={kind} il={il}");
-                if il + 1 < n_layer {
-                    let next_d = payload_offset(n_layer, kv_dim, pos, kind, il + 1, 0);
-                    assert!(qs_end <= next_d, "qs/next-d overlap at kind={kind} il={il}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn from_bytes_bad_version() {
-        let snap = make_snap(36, 1024, 1024, 4);
-        let mut bytes = snap.to_bytes();
-        // VERSION field is at bytes[8..12].
-        let bad = (VERSION + 1).to_le_bytes();
-        bytes[8..12].copy_from_slice(&bad);
-        assert!(KvSnapshot::from_bytes(&bytes).is_err());
-    }
-
-    #[test]
-    fn from_bytes_nonzero_reserved() {
-        let snap = make_snap(36, 1024, 1024, 4);
-        let mut bytes = snap.to_bytes();
-        // Reserved field is at bytes[28..32].
-        bytes[28] = 1;
-        assert!(KvSnapshot::from_bytes(&bytes).is_err());
-    }
-
-    #[test]
-    fn from_bytes_payload_length_mismatch() {
-        let snap = make_snap(36, 1024, 1024, 4);
-        let bytes = snap.to_bytes();
-        // Truncate the payload by one byte — header says longer than actual.
-        assert!(KvSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
-    }
-
-    #[test]
-    fn getters_match_header() {
-        let snap = make_snap(36, 1024, 512, 64);
-        assert_eq!(snap.n_layer(), 36);
-        assert_eq!(snap.kv_dim(), 1024);
-        assert_eq!(snap.max_seq(), 512);
-        assert_eq!(snap.pos(), 64);
-    }
-
-    #[test]
-    fn clone_is_deep() {
-        let snap = make_snap(4, 128, 256, 8);
-        let mut clone = snap.clone();
-        if !clone.payload.is_empty() {
-            clone.payload[0] ^= 0xFF;
-            assert_ne!(snap.payload[0], clone.payload[0]);
-        }
-    }
-
-    #[test]
-    fn payload_bytes_zero_pos() {
-        // An empty snapshot (pos=0) has no payload.
-        assert_eq!(payload_bytes(36, 1024, 0), 0);
+    fn rejects_bad_blobs() {
+        let good = make_snap(2).to_bytes();
+        assert!(KvSnapshot::from_bytes(&good[..10]).is_err());
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        assert!(KvSnapshot::from_bytes(&bad).is_err());
+        let mut bad = good.clone();
+        bad[8] = 1;
+        assert!(KvSnapshot::from_bytes(&bad).is_err());
+        let mut bad = good.clone();
+        bad[36] = 1;
+        assert!(KvSnapshot::from_bytes(&bad).is_err());
+        assert!(KvSnapshot::from_bytes(&good[..good.len() - 1]).is_err());
     }
 }

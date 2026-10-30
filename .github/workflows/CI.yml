@@ -9,24 +9,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test-metal:
-    name: Build and test Metal backend in macOS
-    runs-on: macos-latest
+  build-and-unit-test:
+    # Hosted runners have no GPU and the 27B model is 6 GB, so CI covers the
+    # shader build, lints, and CPU-side unit tests. GPU integration tests
+    # (`tests/gpu_integration.rs`) run locally against ./model.
+    name: Build shaders, clippy, unit tests (Linux)
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout
       uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install glslang spirv-tools spirv-cross uv
-    - name: Download model
-      run: curl -L "https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf?download=true" -o Bonsai-4B-Q1_0.gguf
-    - name: Extract model
-      run: uv run scripts/extract.py Bonsai-4B-Q1_0.gguf
-    - name: Run tests
-      run: cargo test --all-features
-    - name: Run prompt & gen
-      run: |
-        uv run scripts/bpe.py ./model "Once upon a time" | cargo run --all-features -- ./model --mode prompt --max-new-tokens 64 --temperature 0 --seed 0 | tee prompt.txt
-        uv run scripts/bpe.py ./model "Once upon a time" | cargo run --all-features -- ./model --mode gen --max-new-tokens 64 --temperature 0 --seed 0 | tee gen.txt
-        diff prompt.txt gen.txt
-    - name: Bench HEAD
-      run: for i in 1 2 3; do cargo run --all-features -- ./model --mode bench --pp 512 --tg 128; done
+      run: sudo apt-get update && sudo apt-get install -y glslang-tools spirv-tools
+    - name: Clippy
+      run: cargo clippy --all-targets --features ci -- -D warnings
+    - name: Unit tests
+      run: cargo test --features ci --lib
+    - name: no_std build
+      run: cargo build --no-default-features

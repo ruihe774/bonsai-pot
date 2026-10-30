@@ -1,0 +1,54 @@
+#version 460
+
+// Gated-DeltaNet gates from the un-rotated normed input xn (BF16 weights):
+//   g[h]    = softplus(alpha_w[h] · xn + dt_bias[h]) * ssm_a[h]   (ssm_a = -exp(A_log))
+//   beta[h] = sigmoid(beta_w[h] · xn)
+// Output row m: act[out_off + m*2H + h] = g, act[out_off + m*2H + H + h] = beta.
+// dispatch: (2H, m_tokens, 1); one output per workgroup.
+
+layout(push_constant) uniform Params {
+    uint xn_off;    // act offset of xn (row stride n_embd)
+    uint alpha_off; // ws word offset of alpha weights (BF16, H rows × n_embd)
+    uint beta_off;  // ws word offset of beta weights
+    uint dt_off;    // ws word offset of dt bias (f32 × H)
+    uint a_off;     // ws word offset of ssm_a (f32 × H)
+    uint out_off;   // act offset of the gate output
+    uint n_embd;
+    uint n_heads;   // H
+}
+p;
+
+#include "lib/bindings.glsl"
+#include "lib/wg_reduce.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.y;
+    uint r = gl_WorkGroupID.x;
+    bool is_alpha = r < p.n_heads;
+    uint h = is_alpha ? r : r - p.n_heads;
+    uint half_k = p.n_embd >> 1u;
+    uint wrow = (is_alpha ? p.alpha_off : p.beta_off) + h * half_k;
+    uint xrow = p.xn_off + m * p.n_embd;
+
+    float acc = 0.0;
+    for (uint i = t; i < half_k; i += 256u) {
+        uint wv = ws[wrow + i];
+        float w_lo = uintBitsToFloat(wv << 16u);
+        float w_hi = uintBitsToFloat(wv & 0xFFFF0000u);
+        acc += w_lo * act[xrow + 2u * i] + w_hi * act[xrow + 2u * i + 1u];
+    }
+    float s = wg_sum(acc);
+    if (t == 0u) {
+        uint o = p.out_off + m * 2u * p.n_heads;
+        if (is_alpha) {
+            float x = s + ws_f32(p.dt_off + h);
+            float sp = x > 20.0 ? x : log(1.0 + exp(x));
+            act[o + h] = sp * ws_f32(p.a_off + h);
+        } else {
+            act[o + p.n_heads + h] = 1.0 / (1.0 + exp(-s));
+        }
+    }
+}

@@ -12,14 +12,14 @@
 //! `extract.py`'s `bpe_encode`); pipe its u32 output here.
 //!
 //! Examples:
-//!   cat ./model/prompt.bin | bonsai-pot ./model --max-new-tokens 64
+//!   uv run scripts/bpe.py ./model "Once upon a time" | bonsai-pot ./model --max-new-tokens 64
 //!   bonsai-pot ./model --mode bench --pp 512 --tg 128
-//!   bonsai-pot ./model --temperature 0.8 --top-k 50 --top-p 0.95 --seed 42 \
-//!       < ./model/prompt.bin
+//!   bonsai-pot ./model --mode dump --out /tmp/ours < prompt.u32
 
 use std::env;
 use std::fmt::Display;
-use std::io::{Read as _, Write as _, stdin, stdout};
+use std::fs::{File, create_dir_all};
+use std::io::{BufWriter, Read as _, Write as _, stdin, stdout};
 use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
@@ -39,11 +39,13 @@ struct Args {
     temperature: f32,
     top_k: Option<u32>,
     top_p: Option<f32>,
+    min_p: f32,
     seed: u64,
+    out: Option<PathBuf>,
 }
 
 const HELP: &str = "\
-Demo CLI for the bonsai-pot engine.
+Demo CLI for the bonsai-pot engine (Ternary-Bonsai-2).
 
 USAGE:
     bonsai-pot <model_dir> [OPTIONS]
@@ -58,9 +60,13 @@ MODES:
                            Reads u32 prompt tokens from stdin.
     --mode bench           Print a pp/tg table with wall-clock and GPU t/s.
                            No stdin input required.
-    --mode microbench      Per-kernel GPU-timestamp breakdown for a matmul
-                           prefill step (--pp tokens) followed by a tg step
-                           (KV cache pre-filled to --tg). No stdin input.
+    --mode microbench      Per-kernel GPU-timestamp breakdown for a prefill
+                           step (--pp tokens) followed by a tg step (state
+                           pre-filled to --tg). No stdin input.
+    --mode dump            Run the stdin prompt token by token and write
+                           llama.cpp-named activations + per-position logits
+                           to --out DIR (index.jsonl + raw f32), for
+                           scripts/compare.py.
 
 GEN/PROMPT OPTIONS:
     --max-new-tokens <n>   Tokens to generate (incl. the first sampled token).
@@ -71,6 +77,8 @@ GEN/PROMPT OPTIONS:
                            [default: unset]
     --top-p <p>            Nucleus filter cutoff in (0, 1].
                            [default: unset]
+    --min-p <p>            Drop candidates below p × the top probability.
+                           [default: 0.0]
     --seed <n>             PRNG seed for reproducible sampling.
                            [default: 0]
 
@@ -92,8 +100,11 @@ BENCH OPTIONS:
                            BEGIN/END markers on stderr.
 
 LOAD OPTIONS:
-    --max-seq <n>          KV-cache capacity (positions). Larger values cost
-                           VRAM linearly. [default: 1024]
+    --max-seq <n>          KV-cache capacity (positions). Costs 36 KiB of
+                           VRAM per position. [default: 32768]
+
+DUMP OPTIONS:
+    --out <dir>            Output directory for --mode dump.
 
 OTHER:
     -h, --help             Show this help and exit.
@@ -131,14 +142,16 @@ fn parse_args() -> Args {
         n_gen: 32,
         pp_n: 512,
         tg_n: 128,
-        max_seq: 1024,
+        max_seq: 32768,
         repeats: 5,
         no_marker: false,
         use_matmul_prefill: false,
         temperature: 0.0, // CLI default = greedy, for reproducible runs
         top_k: None,
         top_p: None,
+        min_p: 0.0,
         seed: 0,
+        out: None,
     };
     let mut i = 2;
     while i < argv.len() {
@@ -189,6 +202,14 @@ fn parse_args() -> Args {
                 a.top_p = Some(parse_or_die("--top-p", &next()));
                 i += 2;
             }
+            "--min-p" => {
+                a.min_p = parse_or_die("--min-p", &next());
+                i += 2;
+            }
+            "--out" => {
+                a.out = Some(PathBuf::from(next()));
+                i += 2;
+            }
             "--seed" => {
                 a.seed = parse_or_die("--seed", &next());
                 i += 2;
@@ -203,6 +224,24 @@ fn parse_args() -> Args {
     //                `--mode gen`    ⇒ matvec-loop prefill (parity with old CLI).
     a.use_matmul_prefill = a.mode == "prompt";
     a
+}
+
+fn read_prompt() -> Vec<u32> {
+    let mut buf = Vec::new();
+    stdin().lock().read_to_end(&mut buf).expect("read stdin");
+    if buf.len() % 4 != 0 {
+        eprintln!("stdin must be a multiple of 4 bytes (u32 token IDs)");
+        exit(1);
+    }
+    let prompt: Vec<u32> = buf
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if prompt.is_empty() {
+        eprintln!("empty prompt on stdin");
+        exit(1);
+    }
+    prompt
 }
 
 fn main() {
@@ -232,13 +271,13 @@ fn main() {
             });
         }
         "microbench" => {
-            #[cfg(target_vendor = "apple")]
+            #[cfg(feature = "ci")]
             {
                 let _ = args.no_marker;
-                eprintln!("microbench mode is not supported on the Metal backend");
+                eprintln!("microbench mode is not available with the ci feature");
                 exit(3);
             }
-            #[cfg(all(not(feature = "ci"), not(target_vendor = "apple")))]
+            #[cfg(not(feature = "ci"))]
             {
                 __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker)
                     .unwrap_or_else(|e| {
@@ -252,23 +291,44 @@ fn main() {
                     });
             }
         }
+        "dump" => {
+            let Some(out) = args.out.clone() else {
+                eprintln!("--mode dump requires --out <dir>");
+                exit(1);
+            };
+            let prompt = read_prompt();
+            let tensors = __bench::dump(&model, &prompt).unwrap_or_else(|e| {
+                eprintln!("dump error: {e}");
+                exit(3)
+            });
+            create_dir_all(&out).expect("create --out dir");
+            let mut index =
+                BufWriter::new(File::create(out.join("index.jsonl")).expect("index.jsonl"));
+            for t in &tensors {
+                let file = format!("{}.f32", t.name);
+                let mut f =
+                    BufWriter::new(File::create(out.join(&file)).expect("create dump file"));
+                for v in &t.data {
+                    f.write_all(&v.to_le_bytes()).expect("write dump");
+                }
+                let cols = t.data.len() / t.ne0 as usize;
+                writeln!(
+                    index,
+                    "{{\"name\":\"{}\",\"file\":\"{file}\",\"ne\":[{},{cols},1,1]}}",
+                    t.name, t.ne0
+                )
+                .expect("write index");
+            }
+            eprintln!("wrote {} tensors to {}", tensors.len(), out.display());
+        }
         "gen" | "prompt" => {
-            let mut buf = Vec::new();
-            stdin().lock().read_to_end(&mut buf).expect("read stdin");
-            if buf.len() % 4 != 0 {
-                eprintln!("stdin must be a multiple of 4 bytes (u32 token IDs)");
-                exit(1);
-            }
-            let prompt: Vec<u32> = bytemuck::cast_slice(&buf).to_vec();
-            if prompt.is_empty() {
-                eprintln!("empty prompt on stdin");
-                exit(1);
-            }
+            let prompt = read_prompt();
 
             let sampler = Sampler {
                 temperature: args.temperature,
                 top_k: args.top_k,
                 top_p: args.top_p,
+                min_p: args.min_p,
                 seed: args.seed,
             };
             let mut sess = model.new_session();

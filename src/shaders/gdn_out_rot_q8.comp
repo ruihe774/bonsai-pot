@@ -1,0 +1,61 @@
+#version 460
+
+// Gated-DeltaNet output: per value head RMSNorm(o_h)·ssm_norm ⊙ silu(z_h),
+// reordered from the tiled head order (h = k + n_k·r) to the grouped order
+// the rotated ssm_out expects (G = r + rep·k), then Hadamard signs →
+// blockwise FWHT → Q8/128.
+// dispatch: (inner / 1024, m_tokens, 1); eight grouped heads per workgroup,
+// 32 invocations per head.
+
+layout(push_constant) uniform Params {
+    uint o_off;     // act offset of the recurrence output (row stride inner)
+    uint z_off;     // act offset of z (row stride inner)
+    uint norm_off;  // ws word offset of ssm_norm (128 f32)
+    uint signs_off; // ws word offset of the inner-width sign bits
+    uint inner;     // n_v_heads * 128
+    uint n_k_heads;
+    uint rep;       // n_v_heads / n_k_heads
+    uint q8_qs;
+    uint q8_d;
+    uint q8_s;
+    float eps;
+}
+p;
+
+#define Q8_QUAL writeonly
+#include "lib/bindings.glsl"
+#include "lib/fwht_q8.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float head_sh[256];
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint G = blk * 8u + (t >> 5u);
+    uint h = (G / p.rep) + p.n_k_heads * (G % p.rep);
+    uint d0 = (t & 31u) * 4u;
+    uint src = m * p.inner + h * 128u + d0;
+    vec4 o = vec4(act[p.o_off + src], act[p.o_off + src + 1u], act[p.o_off + src + 2u], act[p.o_off + src + 3u]);
+    vec4 z = vec4(act[p.z_off + src], act[p.z_off + src + 1u], act[p.z_off + src + 2u], act[p.z_off + src + 3u]);
+
+    head_sh[t] = dot(o, o);
+    barrier();
+    float ss = 0.0;
+    uint hb = t & ~31u;
+    for (uint i = 0u; i < 32u; i += 1u) {
+        ss += head_sh[hb + i];
+    }
+    float scale = inversesqrt(ss / 128.0 + p.eps);
+    vec4 wn = vec4(ws_f32(p.norm_off + d0), ws_f32(p.norm_off + d0 + 1u), ws_f32(p.norm_off + d0 + 2u),
+                   ws_f32(p.norm_off + d0 + 3u));
+    vec4 v = o * scale * wn * silu4(z);
+
+    uint e0 = blk * 1024u + 4u * t;
+    v = fwht1024(v * hsign4(p.signs_off, e0));
+    uint nb = p.inner >> 7u;
+    store_q8_1024(v, p.q8_qs + ((m * p.inner + blk * 1024u) >> 2u), p.q8_d + m * nb + blk * 8u,
+                  p.q8_s + m * nb + blk * 8u);
+}

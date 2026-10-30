@@ -1,0 +1,160 @@
+#version 460
+
+// Causal flash attention for batched prefill (FA-2 style, f16 LDS tiles).
+// One workgroup = one KV head × QT consecutive query tokens; its query rows
+// are the G = n_head / n_kv_head heads sharing that KV head for each token
+// (R = G·QT ≤ 16 rows). Keys [0, pos_base + m] are visible to token m.
+// Per 32-key tile: scores R×32 from LDS, per-row online softmax, then each
+// invocation updates one head dim for all R rows. Output (pre-gate) goes to
+// act[o_off + m*q_dim + h*256 + d] for attn_out_rot_q8 (mode 1).
+// dispatch: (n_kv_head, ceil(m_tokens / QT), 1).
+
+layout(push_constant) uniform Params {
+    uint qg_off;     // act offset of the [q|gate] projection (row stride 2*q_dim)
+    uint o_off;      // act offset of the output rows (row stride q_dim)
+    uint n_head;
+    uint n_kv_head;
+    uint m_tokens;
+    uint pos_base;
+    uint kv_dim;
+    uint kv_d_word;
+    uint kv_qs_byte;
+    uint q_dim;
+    float scale;
+}
+p;
+
+#define KV_QUAL readonly
+#include "lib/bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint HD = 256u;
+const uint QT = 2u;
+const uint MAX_R = 16u;
+const uint KT = 32u;
+
+shared f16vec4 q_sh[MAX_R][HD / 4u];
+shared f16vec4 kv_sh[KT][HD / 4u + 1u]; // +1 pad: rows land on different LDS banks
+shared float p_sh[MAX_R][KT];
+shared float corr_sh[MAX_R];
+shared float m_sh[MAX_R];
+shared float l_sh[MAX_R];
+
+// Stage keys/values [k0, k0 + KT) of KV head g as f16 (zeros past n_valid).
+void load_tile(bool is_k, uint g, uint k0, uint n_valid) {
+    uint t = gl_LocalInvocationID.x;
+    for (uint idx = t; idx < KT * (HD / 4u); idx += 256u) {
+        uint kk = idx / (HD / 4u);
+        uint d4 = idx % (HD / 4u);
+        vec4 v = vec4(0.0);
+        if (k0 + kk < n_valid) {
+            uint e = (k0 + kk) * p.kv_dim + g * HD + 4u * d4;
+            // 4 consecutive elements share one Q8_0 block and one u32 word.
+            uint qw = (p.kv_qs_byte + e) >> 2u;
+            uint word = is_k ? kv_k[qw] : kv_v[qw];
+            float sc = uintBitsToFloat(is_k ? kv_k[p.kv_d_word + (e >> 5u)] : kv_v[p.kv_d_word + (e >> 5u)]);
+            v = vec4(float(bitfieldExtract(int(word), 0, 8)), float(bitfieldExtract(int(word), 8, 8)),
+                     float(bitfieldExtract(int(word), 16, 8)), float(bitfieldExtract(int(word), 24, 8))) * sc;
+        }
+        kv_sh[kk][d4] = f16vec4(v);
+    }
+}
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint m0 = gl_WorkGroupID.y * QT;
+    uint t = gl_LocalInvocationID.x;
+    uint G = p.n_head / p.n_kv_head;
+    uint R = G * QT;
+    uint qg_stride = 2u * p.q_dim;
+
+    // Query rows: r = j*G + hh  (token m0 + j, head g*G + hh), pre-scaled.
+    for (uint idx = t; idx < R * (HD / 4u); idx += 256u) {
+        uint r = idx / (HD / 4u);
+        uint d4 = idx % (HD / 4u);
+        uint j = r / G;
+        uint hh = r % G;
+        vec4 q = vec4(0.0);
+        if (m0 + j < p.m_tokens) {
+            uint qi = p.qg_off + (m0 + j) * qg_stride + (g * G + hh) * 2u * HD + 4u * d4;
+            q = vec4(act[qi], act[qi + 1u], act[qi + 2u], act[qi + 3u]) * p.scale;
+        }
+        q_sh[r][d4] = f16vec4(q);
+    }
+    if (t < MAX_R) {
+        m_sh[t] = -1e30;
+        l_sh[t] = 0.0;
+    }
+    float o[MAX_R];
+    [[unroll]] for (uint r = 0u; r < MAX_R; r += 1u) {
+        o[r] = 0.0;
+    }
+
+    uint m_last = min(m0 + QT, p.m_tokens) - 1u;
+    uint n_valid = p.pos_base + m_last + 1u;
+    for (uint k0 = 0u; k0 < n_valid; k0 += KT) {
+        barrier();
+        load_tile(true, g, k0, n_valid);
+        barrier();
+        // Scores.
+        for (uint s = t; s < R * KT; s += 256u) {
+            uint r = s / KT;
+            uint kk = s % KT;
+            uint key = k0 + kk;
+            uint tok = m0 + r / G;
+            float sc = -1e30;
+            if (tok < p.m_tokens && key <= p.pos_base + tok) {
+                float acc = 0.0;
+                for (uint d4 = 0u; d4 < HD / 4u; d4 += 1u) {
+                    acc += dot(vec4(q_sh[r][d4]), vec4(kv_sh[kk][d4]));
+                }
+                sc = acc;
+            }
+            p_sh[r][kk] = sc;
+        }
+        barrier();
+        // Online softmax per row.
+        if (t < R) {
+            float mx = m_sh[t];
+            for (uint kk = 0u; kk < KT; kk += 1u) {
+                mx = max(mx, p_sh[t][kk]);
+            }
+            float c = exp(m_sh[t] - mx);
+            float l = l_sh[t] * c;
+            for (uint kk = 0u; kk < KT; kk += 1u) {
+                float e = p_sh[t][kk] <= -1e29 ? 0.0 : exp(p_sh[t][kk] - mx);
+                p_sh[t][kk] = e;
+                l += e;
+            }
+            m_sh[t] = mx;
+            l_sh[t] = l;
+            corr_sh[t] = c;
+        }
+        barrier();
+        load_tile(false, g, k0, n_valid);
+        barrier();
+        // O update: invocation t owns head dim d = t.
+        uint d4 = t >> 2u;
+        uint dc = t & 3u;
+        [[unroll]] for (uint r = 0u; r < MAX_R; r += 1u) {
+            if (r < R) {
+                float acc = o[r] * corr_sh[r];
+                for (uint kk = 0u; kk < KT; kk += 1u) {
+                    acc += p_sh[r][kk] * float(kv_sh[kk][d4][dc]);
+                }
+                o[r] = acc;
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < MAX_R; r += 1u) {
+        if (r < R) {
+            uint tok = m0 + r / G;
+            if (tok < p.m_tokens) {
+                uint h = g * G + r % G;
+                act[p.o_off + tok * p.q_dim + h * HD + t] = o[r] / l_sh[r];
+            }
+        }
+    }
+}

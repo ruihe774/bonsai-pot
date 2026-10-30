@@ -1,0 +1,68 @@
+#version 460
+
+// Full-attention epilogue: attention output (merged from split-K partials, or
+// read directly for the prefill path) gated by sigmoid(gate), then Hadamard
+// signs → blockwise FWHT → Q8/128 for the attn_output projection.
+// dispatch: (q_dim / 1024, m_tokens, 1); four heads per workgroup, 64
+// invocations × 4 dims per head.
+
+layout(push_constant) uniform Params {
+    uint mode;      // 0: merge partials (single token), 1: read o rows
+    uint part_off;  // act offset of split-K partials
+    uint n_chunks;
+    uint o_off;     // act offset of o rows (mode 1, row stride q_dim)
+    uint qg_off;    // act offset of the [q|gate] projection (row stride 2*q_dim)
+    uint signs_off; // ws word offset of the q_dim sign bits
+    uint q_dim;
+    uint q8_qs;
+    uint q8_d;
+    uint q8_s;
+}
+p;
+
+#define Q8_QUAL writeonly
+#include "lib/bindings.glsl"
+#include "lib/fwht_q8.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint HD = 256u;
+const uint PSTRIDE = HD + 2u;
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint h = blk * 4u + (t >> 6u);
+    uint e0 = (t & 63u) * 4u;
+
+    vec4 o;
+    if (p.mode == 0u) {
+        uint hb = p.part_off + h * p.n_chunks * PSTRIDE;
+        float mx = -1e30;
+        for (uint c = 0u; c < p.n_chunks; c += 1u) {
+            mx = max(mx, act[hb + c * PSTRIDE + HD]);
+        }
+        float l = 0.0;
+        o = vec4(0.0);
+        for (uint c = 0u; c < p.n_chunks; c += 1u) {
+            uint cb = hb + c * PSTRIDE;
+            float f = exp(act[cb + HD] - mx);
+            l += act[cb + HD + 1u] * f;
+            o += vec4(act[cb + e0], act[cb + e0 + 1u], act[cb + e0 + 2u], act[cb + e0 + 3u]) * f;
+        }
+        o /= l;
+    } else {
+        uint oi = p.o_off + m * p.q_dim + h * HD + e0;
+        o = vec4(act[oi], act[oi + 1u], act[oi + 2u], act[oi + 3u]);
+    }
+    uint gi = p.qg_off + m * 2u * p.q_dim + h * 2u * HD + HD + e0;
+    vec4 gate = vec4(act[gi], act[gi + 1u], act[gi + 2u], act[gi + 3u]);
+    o *= 1.0 / (1.0 + exp(-gate));
+
+    uint pe = blk * 1024u + 4u * t;
+    o = fwht1024(o * hsign4(p.signs_off, pe));
+    uint nb = p.q_dim >> 7u;
+    store_q8_1024(o, p.q8_qs + ((m * p.q_dim + blk * 1024u) >> 2u), p.q8_d + m * nb + blk * 8u,
+                  p.q8_s + m * nb + blk * 8u);
+}

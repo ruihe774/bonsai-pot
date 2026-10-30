@@ -2,7 +2,7 @@
 
 // Pass-2 of the multi-WG top-K reduction. Reads `num_partials * K_MAX`
 // already-sorted-descending (f32 value, u32 index) pairs that pass-1
-// (`topk_partial`) wrote into a scratch region of `result`, and produces the
+// (`topk_partial`) wrote into a scratch region of `io`, and produces the
 // global top-K.
 //
 // Each thread directly loads one partial slot into its own K_MAX-entry shmem
@@ -14,23 +14,23 @@
 // dispatch: (1, 1, 1)
 
 layout(push_constant) uniform Params {
-    uint partials_off; // u32 word offset into `result` where pass-1 wrote
+    uint partials_off; // u32 word offset into `io` where pass-1 wrote
     uint num_partials; // # partial slots; <= WG
-    uint out_offset;   // u32 word offset for the final top-K output in `result`
+    uint out_offset;   // u32 word offset for the final top-K output in `io`
     uint k;
 }
 p;
 
-layout(set = 0, binding = 0, std430) buffer ResultBuf { uint result[]; };
+#include "lib/bindings.glsl"
+#define result io
 
 const uint WG = 64u;
 const uint K_MAX = 32u;
 
-// Logits enter at f16; demote to f16 in shmem (lossless; halves LDS: 8 KiB → 4 KiB).
-shared float16_t sh_val[2048]; // WG * K_MAX
+shared float sh_val[2048]; // WG * K_MAX
 shared uint sh_idx[2048];
 
-const float16_t NEG_INF_H = float16_t(-65504.0);
+const float NEG_INF = -3.0e38;
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -41,12 +41,12 @@ void main() {
     if (tid < p.num_partials) {
         uint slot_base = p.partials_off + tid * (2u * K_MAX);
         [[unroll]] for (uint i = 0u; i < K_MAX; i += 1u) {
-            sh_val[base + i] = float16_t(uintBitsToFloat(result[slot_base + i]));
+            sh_val[base + i] = uintBitsToFloat(result[slot_base + i]);
             sh_idx[base + i] = result[slot_base + K_MAX + i];
         }
     } else {
         [[unroll]] for (uint i = 0u; i < K_MAX; i += 1u) {
-            sh_val[base + i] = NEG_INF_H;
+            sh_val[base + i] = NEG_INF;
             sh_idx[base + i] = 0u;
         }
     }
@@ -64,8 +64,8 @@ void main() {
             uint a_base = pair_id * K_MAX;
             uint b_base = (pair_id + s) * K_MAX;
             uint bi = K_MAX - 1u - i;
-            float16_t av = sh_val[a_base + i];
-            float16_t bv = sh_val[b_base + bi];
+            float av = sh_val[a_base + i];
+            float bv = sh_val[b_base + bi];
             if (bv > av) {
                 sh_val[a_base + i] = bv;
                 sh_idx[a_base + i] = sh_idx[b_base + bi];
@@ -84,8 +84,8 @@ void main() {
                 uint lo = ((local_k & ~(stride - 1u)) << 1u) | (local_k & (stride - 1u));
                 uint hi = lo | stride;
                 uint a_base = pair_id * K_MAX;
-                float16_t vlo = sh_val[a_base + lo];
-                float16_t vhi = sh_val[a_base + hi];
+                float vlo = sh_val[a_base + lo];
+                float vhi = sh_val[a_base + hi];
                 if (vhi > vlo) {
                     uint ilo = sh_idx[a_base + lo];
                     sh_val[a_base + lo] = vhi;
@@ -106,8 +106,7 @@ void main() {
         uint kk = min(p.k, K_MAX);
         [[unroll, min_iterations(1), max_iterations(32), dependency_length(1)]]
         for (uint i = 0u; i < kk; i += 1u) {
-            // CPU sampler reads f32; widen at the boundary.
-            result[p.out_offset + i] = floatBitsToUint(float(sh_val[i]));
+            result[p.out_offset + i] = floatBitsToUint(sh_val[i]);
             result[p.out_offset + kk + i] = sh_idx[i];
         }
     }

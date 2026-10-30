@@ -7,27 +7,22 @@
 
 //! Interactive chat REPL on top of the `bonsai_pot` library.
 //!
-//! Bonsai is an instruction-tuned model family; we render each turn into the
-//! Qwen-style `ChatML` template (`<|im_start|>...<|im_end|>`), tokenize with
-//! the `tokenizers` crate (Qwen2 byte-level BPE, built from the model dir's
-//! `vocab.bin` + `merges.txt`), prefill, and stream the assistant's reply
-//! token-by-token. Multi-turn conversation is preserved across the `Session`'s
-//! KV cache.
+//! Renders each turn with the Ternary-Bonsai-2 (Qwen3.5) chat template:
+//! the system message carries the reasoning-effort instruction, and the
+//! assistant turn opens with `<think>\n` (or an empty think block when
+//! thinking is disabled). Following the template's default
+//! `preserve_thinking`, previous reasoning stays in the conversation, so the
+//! session state simply keeps growing turn by turn. Tokenization uses the
+//! `tokenizers` crate (byte-level BPE with the qwen35 pre-tokenizer, built
+//! from the model dir's vocab + `merges.txt`, with the added tokens matched
+//! atomically).
 //!
 //! Run:
 //!   cargo run --release --example chat -- ./model
 //!
-//! Optional flags:
-//!   --system "..."             override the system prompt
-//!   --temperature 0.7
-//!   --top-p 0.9
-//!   --top-k 40
-//!   --seed N                   default = wallclock-derived (non-reproducible)
-//!   --max-new-tokens 512
-//!
 //! In-REPL commands: `/reset` clears the conversation, `/quit` exits.
 
-use std::fmt::{Display, Write as _};
+use std::fmt::Display;
 use std::io::{Write, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -46,54 +41,38 @@ use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 struct Args {
     model_dir: PathBuf,
     system: String,
-    temperature: f32,
+    effort: String,
+    temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<u32>,
+    min_p: Option<f32>,
     seed: u64,
     max_new_tokens: u32,
     max_seq: u32,
 }
 
 const HELP: &str = "\
-Interactive ChatML REPL for the bonsai-pot engine.
+Interactive chat REPL for the bonsai-pot engine (Ternary-Bonsai-2).
 
 USAGE:
     chat <model_dir> [OPTIONS]
 
-ARGS:
-    <model_dir>            Path to a directory produced by scripts/extract.py
-                           (must contain config.json, weights_*.bin,
-                           vocab.bin, vocab_offsets.bin, merges.txt).
-
 OPTIONS:
-    --system <text>        System prompt prepended on the first turn.
-                           [default: \"You are a helpful assistant.\"]
-    --temperature <f>      Sampling temperature; 0.0 ⇒ greedy/argmax.
-                           [default: 0.7]
-    --top-p <p>            Nucleus filter cutoff in (0, 1].
-                           [default: 0.9]
-    --top-k <k>            Truncate to the top-k logits before sampling
-                           (capped at the engine's TOPK_MAX).
-                           [default: 40]
-    --seed <n>             PRNG seed for reproducible sampling.
-                           [default: wallclock-derived]
-    --max-new-tokens <n>   Hard cap on tokens emitted per assistant turn.
-                           [default: 4096]
-    --max-seq <n>          KV-cache capacity (positions). Sets the upper
-                           bound on prompt + generated tokens across the
-                           whole conversation; raising it linearly grows
-                           VRAM use. [default: 16384]
+    --system <text>        System prompt. [default: \"You are a helpful assistant\"]
+    --reasoning-effort <e> xhigh | medium | low | none (none disables thinking).
+                           [default: xhigh]
+    --temperature <f>      [default: 1.0 thinking / 0.7 none]
+    --top-p <p>            [default: 0.95 thinking / 0.8 none]
+    --top-k <k>            [default: 20]
+    --min-p <p>            [default: 0.05 thinking / 0.0 none]
+    --seed <n>             PRNG seed. [default: wallclock-derived]
+    --max-new-tokens <n>   Cap per assistant turn. [default: 16384]
+    --max-seq <n>          Session capacity in tokens. [default: 65536]
     -h, --help             Show this help and exit.
 
 REPL COMMANDS:
-    /reset                 Restore the KV cache to just after the system prompt,
-                           skipping a re-prefill (~1-2 ms vs hundreds of ms).
-    /quit, /exit           Exit the chat.
-
-EXAMPLE:
-    cargo run --release --example chat -- ./model
-    cargo run --release --example chat -- ./model --temperature 0.0 \\
-        --system \"You are a terse Rust expert.\"
+    /reset                 Restore the state captured after the system prompt.
+    /quit, /exit           Exit.
 ";
 
 fn parse_or_die<T: FromStr>(flag: &str, raw: &str) -> T
@@ -108,24 +87,23 @@ where
 
 fn parse_args() -> Args {
     let argv: Vec<String> = env::args().collect();
-    // Handle -h / --help before requiring a positional model_dir.
     if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
         exit(0);
     }
-    let model_dir_arg = argv.get(1).map_or("model", AsRef::as_ref).to_owned();
-    let model_dir = PathBuf::from(model_dir_arg);
     let mut a = Args {
-        model_dir,
-        system: "You are a helpful assistant.".into(),
-        temperature: 0.7,
-        top_p: Some(0.9),
-        top_k: Some(40),
+        model_dir: PathBuf::from(argv.get(1).map_or("model", AsRef::as_ref)),
+        system: "You are a helpful assistant".into(),
+        effort: "xhigh".into(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        min_p: None,
         seed: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64),
-        max_new_tokens: 4096,
-        max_seq: 16384,
+        max_new_tokens: 16384,
+        max_seq: 65536,
     };
     let mut i = 2;
     while i < argv.len() {
@@ -136,76 +114,55 @@ fn parse_args() -> Args {
             })
         };
         match argv[i].as_str() {
-            "--system" => {
-                a.system = val();
-                i += 2;
-            }
-            "--temperature" => {
-                a.temperature = parse_or_die("--temperature", &val());
-                i += 2;
-            }
-            "--top-p" => {
-                a.top_p = Some(parse_or_die("--top-p", &val()));
-                i += 2;
-            }
-            "--top-k" => {
-                a.top_k = Some(parse_or_die("--top-k", &val()));
-                i += 2;
-            }
-            "--seed" => {
-                a.seed = parse_or_die("--seed", &val());
-                i += 2;
-            }
-            "--max-new-tokens" => {
-                a.max_new_tokens = parse_or_die("--max-new-tokens", &val());
-                i += 2;
-            }
-            "--max-seq" => {
-                a.max_seq = parse_or_die("--max-seq", &val());
-                i += 2;
-            }
+            "--system" => a.system = val(),
+            "--reasoning-effort" => a.effort = val(),
+            "--temperature" => a.temperature = Some(parse_or_die("--temperature", &val())),
+            "--top-p" => a.top_p = Some(parse_or_die("--top-p", &val())),
+            "--top-k" => a.top_k = Some(parse_or_die("--top-k", &val())),
+            "--min-p" => a.min_p = Some(parse_or_die("--min-p", &val())),
+            "--seed" => a.seed = parse_or_die("--seed", &val()),
+            "--max-new-tokens" => a.max_new_tokens = parse_or_die("--max-new-tokens", &val()),
+            "--max-seq" => a.max_seq = parse_or_die("--max-seq", &val()),
             _ => {
                 eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
                 exit(1);
             }
         }
+        i += 2;
+    }
+    if !["xhigh", "medium", "low", "none"].contains(&a.effort.as_str()) {
+        eprintln!("error: --reasoning-effort must be xhigh, medium, low or none");
+        exit(1);
     }
     a
 }
 
-// Qwen2 pretokenizer regex (from llama.cpp's qwen2 branch / scripts/bpe.py).
-// Exhaustively matches every character so there are no unmatched gaps.
-const QWEN2_RE: &str = concat!(
+/// qwen35 pre-tokenizer regex (llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN35`).
+const QWEN35_RE: &str = concat!(
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|",
-    r"[^\r\n\p{L}\p{N}]?\p{L}+|",
+    r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|",
     r"\p{N}|",
-    r" ?[^\s\p{L}\p{N}]+[\r\n]*|",
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|",
     r"\s*[\r\n]+|",
     r"\s+(?!\S)|",
     r"\s+",
 );
 
-fn build_tokenizer(model: &bonsai_pot::Model, model_dir: &Path) -> Tokenizer {
-    // Vocab from Model's already-loaded table (GPT-2 byte-encoded strings).
-    let mut token_id: u32 = 0;
+fn build_tokenizer(model: &Model, model_dir: &Path) -> Tokenizer {
     let mut token_strs: Vec<String> = Vec::new();
-    while let Some(s) = model.vocab_token(token_id) {
+    while let Some(s) = model.vocab_token(token_strs.len() as u32) {
         token_strs.push(s.to_owned());
-        token_id += 1;
     }
-
-    let specials: Vec<AddedToken> = token_strs
+    let specials: Vec<AddedToken> = model
+        .added_tokens()
         .iter()
-        .filter(|s| s.starts_with("<|") && s.ends_with("|>"))
-        .map(|s| AddedToken::from(s.as_str(), true))
+        .map(|&id| AddedToken::from(token_strs[id as usize].clone(), true))
         .collect();
-
     let vocab: Vocab = token_strs
         .into_iter()
         .enumerate()
         .map(|(i, s)| (s, i as u32))
         .collect();
-
     let merges: Vec<(String, String)> = fs::read_to_string(model_dir.join("merges.txt"))
         .expect("merges.txt not found")
         .lines()
@@ -215,19 +172,14 @@ fn build_tokenizer(model: &bonsai_pot::Model, model_dir: &Path) -> Tokenizer {
             (a.to_owned(), b.to_owned())
         })
         .collect();
-
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
         .byte_fallback(false)
         .build()
         .expect("build BPE model");
-
     let mut tok = Tokenizer::new(bpe);
-
-    // Qwen2 pretokenizer: regex matches tokens to keep (invert=true), then
-    // ByteLevel maps each UTF-8 byte to its GPT-2 unicode codepoint.
     let split = Split::new(
-        SplitPattern::Regex(QWEN2_RE.to_owned()),
+        SplitPattern::Regex(QWEN35_RE.to_owned()),
         SplitDelimiterBehavior::Isolated,
         true,
     )
@@ -236,7 +188,6 @@ fn build_tokenizer(model: &bonsai_pot::Model, model_dir: &Path) -> Tokenizer {
         PreTokenizerWrapper::Split(split),
         PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
     ]))));
-
     let _ = tok.add_special_tokens(specials);
     tok
 }
@@ -245,72 +196,33 @@ fn read_user_line() -> Option<String> {
     let mut s = String::new();
     match stdin().read_line(&mut s) {
         Ok(n) if n > 0 => Some(s.trim_end_matches(['\n', '\r']).to_string()),
-        _ => None, // EOF or error
+        _ => None,
     }
 }
 
-/// Remove every `<think>...</think>` span (inclusive) from `tokens`.
-///
-/// If a `<think>` is opened but never closed (e.g. hit `max_new_tokens`
-/// mid-thought), every token from the unclosed `<think>` to the end is
-/// dropped — there is no usable response in that tail.
-fn strip_thinking(tokens: &[u32], open: Option<u32>, close: Option<u32>) -> Vec<u32> {
-    let (Some(open), Some(close)) = (open, close) else {
-        return tokens.to_vec();
-    };
-    let mut out = Vec::with_capacity(tokens.len());
-    let mut depth = 0u32;
-    for &tok in tokens {
-        if tok == open {
-            depth += 1;
+fn reasoning_instructions(effort: &str) -> &'static str {
+    match effort {
+        "xhigh" => {
+            "Reasoning effort is set to xhigh. Please think carefully through the task, validate key \
+             assumptions, consider plausible alternatives, and prioritize correctness, consistency, and \
+             clarity in the final answer."
         }
-        if depth == 0 {
-            out.push(tok);
+        "low" => {
+            "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the \
+             conclusion without unnecessary elaboration."
         }
-        if tok == close && depth > 0 {
-            depth -= 1;
-        }
-    }
-    // If depth > 0 an open tag was never closed — the tail was already
-    // excluded by the depth==0 guard above, so no extra work needed.
-    out
-}
-
-struct Emitter<'a> {
-    stdout: &'a mut dyn Write,
-    model: &'a Model,
-    think_open: Option<u32>,
-    think_close: Option<u32>,
-    out_tokens: &'a mut Vec<u32>,
-    pub in_think: bool,
-}
-
-impl Emitter<'_> {
-    fn emit(&mut self, id: u32) {
-        if self.think_open.is_some() {
-            if Some(id) == self.think_open {
-                self.in_think = true;
-                self.stdout.write_all(b"\x1b[2m").ok();
-            }
-            self.out_tokens.push(id);
-        }
-        self.stdout.write_all(&self.model.decode_token(id)).ok();
-        self.stdout.flush().ok();
-        if Some(id) == self.think_close {
-            self.in_think = false;
-            self.stdout.write_all(b"\x1b[0m").ok();
-        }
+        _ => "",
     }
 }
 
 fn fmt_phase(label: &str, n_tok: usize, dt: Duration) -> String {
-    let ms = dt.as_secs_f64() * 1000.0;
-    let tps = if ms > 0.0 {
-        n_tok as f64 / dt.as_secs_f64()
+    let s = dt.as_secs_f64();
+    let tps = if s > 0.0 {
+        n_tok as f64 / s
     } else {
         f64::INFINITY
     };
-    format!("{label} {n_tok} tok / {ms:.1} ms = {tps:.0} t/s")
+    format!("{label} {n_tok} tok / {:.1} ms = {tps:.1} t/s", s * 1000.0)
 }
 
 fn main() {
@@ -319,9 +231,7 @@ fn main() {
         .parse_default_env()
         .init();
     let args = parse_args();
-
     eprintln!("seed: {}", args.seed);
-
     eprintln!("loading model from {}…", args.model_dir.display());
     let model = Model::load_from_dir(
         &args.model_dir,
@@ -331,45 +241,44 @@ fn main() {
         },
     )
     .expect("load model");
-    let im_end = model.token_id("<|im_end|>").unwrap_or_else(|| {
-        eprintln!("error: vocab missing <|im_end|>");
-        exit(2);
-    });
-    let endoftext = model.token_id("<|endoftext|>").unwrap_or_else(|| {
-        eprintln!("error: vocab missing <|endoftext|>");
-        exit(2);
-    });
-    // Qwen3 thinking tokens — absent on non-Qwen3 vocabs, in which case
-    // stripping is silently disabled.
     let think_open = model.token_id("<think>");
     let think_close = model.token_id("</think>");
-    let thinking_supported = think_open.is_some() && think_close.is_some();
+    let thinking = args.effort != "none";
     let sampler = Sampler {
-        temperature: args.temperature,
-        top_k: args.top_k,
-        top_p: args.top_p,
+        temperature: args.temperature.unwrap_or(if thinking { 1.0 } else { 0.7 }),
+        top_k: Some(args.top_k.unwrap_or(20)),
+        top_p: Some(args.top_p.unwrap_or(if thinking { 0.95 } else { 0.8 })),
+        min_p: args.min_p.unwrap_or(if thinking { 0.05 } else { 0.0 }),
         seed: args.seed,
     };
+    let stops = model.stop_tokens();
     let tok = build_tokenizer(&model, &args.model_dir);
+    let encode = |text: &str| -> Vec<u32> {
+        tok.encode(text, false)
+            .expect("tokenize")
+            .get_ids()
+            .to_vec()
+    };
     let mut sess = model.new_session();
     let mut stdout = stdout().lock();
 
-    // Prefill the system prompt once with the fast batched-matmul path
-    // (requires pos == 0), then snapshot the KV state. /reset restores
-    // from this snapshot (~1-2 ms) instead of re-prefilling from scratch.
-    let system_segment = format!("<|im_start|>system\n{}<|im_end|>\n", args.system);
-    let system_tokens: Vec<u32> = tok
-        .encode(system_segment.as_str(), false)
-        .expect("tokenize system segment")
-        .get_ids()
-        .to_vec();
-    eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
-    sess.prefill(&system_tokens, &sampler)
-        .expect("system prefill");
-    let system_snap: KvSnapshot = sess.snapshot().expect("system snapshot");
-
+    let instr = reasoning_instructions(&args.effort);
+    let system_content = match (instr.is_empty(), args.system.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => args.system.trim().to_owned(),
+        (false, true) => instr.to_owned(),
+        (false, false) => format!("{instr}\n\n{}", args.system.trim()),
+    };
+    let system_snap: Option<KvSnapshot> = if system_content.is_empty() {
+        None
+    } else {
+        let system_tokens = encode(&format!("<|im_start|>system\n{system_content}<|im_end|>\n"));
+        eprintln!("prefilling system prompt ({} tokens)…", system_tokens.len());
+        sess.prefill(&system_tokens, &sampler)
+            .expect("system prefill");
+        Some(sess.snapshot().expect("system snapshot"))
+    };
     let mut turn: u32 = 0;
-
     eprintln!("ready. type a message (Ctrl-D to quit, /reset to clear, /quit to exit).");
 
     loop {
@@ -387,148 +296,88 @@ fn main() {
             break;
         }
         if user == "/reset" {
-            sess.restore(&system_snap).expect("restore system snapshot");
+            match &system_snap {
+                Some(snap) => sess.restore(snap).expect("restore system snapshot"),
+                None => sess.reset(),
+            }
             turn = 0;
             writeln!(stdout, "(conversation reset)").ok();
             continue;
         }
 
-        // Build the ChatML segment for this user turn. The system prompt
-        // is already in the KV cache, so we only encode the user/assistant
-        // wrapper. On turn 0 there is no prior assistant close; on later
-        // turns we re-emit <|im_end|> to close the previous assistant turn
-        // (generation stops before that token enters the KV cache).
-        let segment = if turn == 0 {
-            format!(
-                "<|im_start|>user\n{user}<|im_end|>\n\
-                     <|im_start|>assistant\n"
-            )
+        // The previous assistant turn stopped before its <|im_end|> entered the
+        // state, so close it first.
+        let close = if turn == 0 { "" } else { "<|im_end|>\n" };
+        let open_think = if thinking {
+            "<think>\n"
         } else {
-            format!(
-                "<|im_end|>\n\
-                     <|im_start|>user\n{user}<|im_end|>\n\
-                     <|im_start|>assistant\n"
-            )
+            "<think>\n\n</think>\n\n"
         };
-        let tokens: Vec<u32> = tok
-            .encode(segment.as_str(), false)
-            .expect("tokenize turn segment")
-            .get_ids()
-            .to_vec();
+        let tokens = encode(&format!(
+            "{close}<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n{open_think}"
+        ));
 
-        // Batched matmul prefill (chunks internally for turns longer than
-        // `model.max_prefill_tokens()`). The first sampled token is not
-        // yet in KV — it is fed back via `step` in the streaming loop
-        // below.
         let pp_t0 = Instant::now();
         let next = sess.prefill(&tokens, &sampler).expect("prefill");
         let pp_dt = pp_t0.elapsed();
-        let pp_n = tokens.len();
-
-        // Snapshot here: the first sampled token hasn't been `step`-fed
-        // yet, so this captures KV state just after `<|im_start|>assistant\n`.
-        // We'll rewind to this point after generation to re-prefill with
-        // thinking stripped, as required by the Qwen3 chat template.
-        let pre_assistant_snap = if thinking_supported {
-            Some(sess.snapshot().expect("pre-assistant snapshot"))
-        } else {
-            None
-        };
 
         write!(stdout, "Assistant: ").ok();
+        if thinking {
+            stdout.write_all(b"\x1b[2m").ok();
+        }
         stdout.flush().ok();
-
-        let stop = |t: u32| t == im_end || t == endoftext;
+        let mut in_think = thinking;
+        let mut emit = |id: u32, out: &mut dyn Write| {
+            if Some(id) == think_open {
+                in_think = true;
+                out.write_all(b"\x1b[2m").ok();
+            }
+            out.write_all(&model.decode_token(id)).ok();
+            if Some(id) == think_close {
+                in_think = false;
+                out.write_all(b"\x1b[0m").ok();
+            }
+            out.flush().ok();
+        };
+        let stop = |t: u32| stops.contains(&t);
         let gen_opts = GenerateOptions {
             max_new_tokens: args.max_new_tokens,
             stop_pred: Some(stop),
             sampler: sampler.clone(),
         };
-
-        let mut out_tokens: Vec<u32> = Vec::new();
-        let mut tg_count: usize = 0;
-        let hit_overflow;
-        let in_think;
-        let tg_dt;
-        {
-            let mut emitter = Emitter {
-                stdout: &mut stdout,
-                model: &model,
-                think_open: if thinking_supported { think_open } else { None },
-                think_close,
-                out_tokens: &mut out_tokens,
-                in_think: false,
-            };
-            // `next` is the prefill-sampled token; generate_streaming feeds
-            // first_token as input without invoking the callback for it, so
-            // emit it manually first.
-            let tg_t0 = Instant::now();
-            if stop(next) {
-                hit_overflow = false;
-            } else {
-                emitter.emit(next);
+        let tg_t0 = Instant::now();
+        let mut tg_count = 0usize;
+        let mut overflow = false;
+        if !stop(next) {
+            emit(next, &mut stdout);
+            tg_count += 1;
+            match sess.generate_streaming(next, &gen_opts, |id| {
+                emit(id, &mut stdout);
                 tg_count += 1;
-                match sess.generate_streaming(next, &gen_opts, |id| {
-                    emitter.emit(id);
-                    tg_count += 1;
-                }) {
-                    Ok(_) => {
-                        hit_overflow = false;
-                    }
-                    Err(PotError::ContextOverflow { .. }) => {
-                        hit_overflow = true;
-                    }
-                    Err(e) => panic!("generate_streaming: {e}"),
-                }
+            }) {
+                Ok(_) => {}
+                Err(PotError::ContextOverflow { .. }) => overflow = true,
+                Err(e) => panic!("generate_streaming: {e}"),
             }
-            tg_dt = tg_t0.elapsed();
-            in_think = emitter.in_think;
         }
-        // Reset dim if we hit max_new_tokens or overflow mid-think.
+        let tg_dt = tg_t0.elapsed();
         if in_think {
             stdout.write_all(b"\x1b[0m").ok();
         }
         writeln!(stdout).ok();
-        if hit_overflow {
+        if overflow {
             writeln!(
                 stdout,
                 "(context full at {} tokens — use /reset to start a new conversation)",
-                sess.pos(),
+                sess.pos()
             )
             .ok();
         }
-
-        // Rewind KV cache to just after the assistant header, then
-        // re-prefill with thinking blocks removed. This matches the Qwen3
-        // chat template, which strips prior-turn thinking from history.
-        let mut post_pp: Option<(usize, Duration)> = None;
-        if let Some(snap) = pre_assistant_snap {
-            let stripped = strip_thinking(&out_tokens, think_open, think_close);
-            if stripped.len() != out_tokens.len() {
-                // Something was stripped — rewind and rebuild KV.
-                sess.restore(&snap).expect("restore pre-assistant snapshot");
-                if stripped.is_empty() {
-                    writeln!(stdout, "(no response after thinking)").ok();
-                } else {
-                    let post_t0 = Instant::now();
-                    sess.prefill(&stripped, &sampler)
-                        .expect("re-prefill stripped response");
-                    post_pp = Some((stripped.len(), post_t0.elapsed()));
-                }
-            }
-        }
-
-        let mut perf = format!(
-            "[{}  |  {}",
-            fmt_phase("PP", pp_n, pp_dt),
-            fmt_phase("TG", tg_count, tg_dt),
+        eprintln!(
+            "[{}  |  {}]",
+            fmt_phase("PP", tokens.len(), pp_dt),
+            fmt_phase("TG", tg_count, tg_dt)
         );
-        if let Some((n, dt)) = post_pp {
-            let _ = write!(&mut perf, "  |  {}", fmt_phase("Post-PP", n, dt));
-        }
-        perf.push(']');
-        eprintln!("{perf}");
-
         turn += 1;
     }
 }
