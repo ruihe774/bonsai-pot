@@ -1,5 +1,6 @@
 /target
 /model*
+/*/model*
 *.bin
 *.gguf
 .claude/settings.local.json

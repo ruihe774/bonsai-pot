@@ -1,0 +1,89 @@
+[package]
+name = "bonsai-pot"
+version = "0.300.0"
+authors = ["Rui He <ruihe774@outlook.com>"]
+edition = "2024"
+rust-version = "1.87"
+description = "A from-scratch, dependency-light, dequant-free Bonsai (Qwen3-architecture) Q1_0 inference engine running on wgpu compute shaders"
+readme = "README.md"
+repository = "https://github.com/ruihe774/bonsai-pot"
+license = "Unlicense"
+keywords = [
+    "llm-inference",
+    "llm",
+    "vulkan",
+    "webgpu",
+    "wgpu",
+]
+categories = ["artificial-intelligence"]
+
+[lib]
+name = "bonsai_pot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bonsai-pot"
+path = "src/bin/bonsai-pot.rs"
+required-features = ["bench-internals"]
+
+[features]
+default = ["std"]
+# Enable std-dependent functionality: filesystem-backed model loading
+# (`Model::load`, `Model::load_with_options`, `ModelWeights::from_dir`) and the
+# `PotError::Io` variant. Without this feature the crate is `no_std + alloc`;
+# callers must supply pre-loaded bytes via `Model::load_from_snapshot`.
+std = [
+    "half/std",
+    "log/std",
+    "thiserror/std",
+]
+# Exposes bench/microbench utilities under `bonsai_pot::__bench` and pulls in
+# the extra deps needed by the bundled `bonsai-pot` binary. Not part of the
+# stable public library API.
+bench-internals = ["dep:env_logger", "std"]
+# Disable timestamp query in CI
+ci = ["bench-internals"]
+
+[dependencies]
+# Library deps.
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", default-features = false, features = ["bytemuck"] }
+log = { version = "0.4", default-features = false }
+once_cell = { version = "1", default-features = false, features = ["parking_lot"] }
+parking_lot = "0.12"
+thiserror = { version = "2", default-features = false }
+
+# Bin-only deps (gated behind `bench-internals`, which the bin requires).
+env_logger = { version = "0.11", optional = true }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "staging", default-features = false, features = ["std", "parking_lot", "vulkan"] }
+ash = "0.38"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { git = "https://github.com/ruihe774/wgpu.git", branch = "staging", default-features = false, features = ["std", "parking_lot", "metal"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[build-dependencies]
+tree-sitter = "0.25"
+tree-sitter-cpp = "0.23"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+absolute_paths = "warn"
+allow_attributes_without_reason = "warn"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+expect_used = "warn"
+float_cmp = "allow"
+many_single_char_names = "allow"
+panic = "warn"
+similar_names = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+unused_trait_names = "warn"
+unwrap_used = "warn"

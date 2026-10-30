@@ -1,0 +1,38 @@
+#version 460
+
+// SwiGLU activation for the FFN down projection:
+//   q8 = Q8(FWHT(s ⊙ silu(gate) ⊙ up))
+// dispatch: (k / 1024, m_tokens, 1).
+
+layout(push_constant) uniform Params {
+    uint gate_off;  // act offset of gate rows (row stride k)
+    uint up_off;    // act offset of up rows (row stride k)
+    uint k;
+    uint signs_off; // ws word offset of the k sign bits
+    uint q8_qs;
+    uint q8_d;
+    uint q8_s;
+}
+p;
+
+#define ACT_QUAL readonly
+#define Q8_QUAL writeonly
+#include "lib/bindings.glsl"
+#include "lib/fwht_q8.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint e0 = blk * 1024u + 4u * t;
+    uint gi = p.gate_off + m * p.k + e0;
+    uint ui = p.up_off + m * p.k + e0;
+    vec4 g = vec4(act[gi], act[gi + 1u], act[gi + 2u], act[gi + 3u]);
+    vec4 u = vec4(act[ui], act[ui + 1u], act[ui + 2u], act[ui + 3u]);
+    vec4 v = fwht1024(silu4(g) * u * hsign4(p.signs_off, e0));
+    uint nb = p.k >> 7u;
+    store_q8_1024(v, p.q8_qs + ((m * p.k + blk * 1024u) >> 2u), p.q8_d + m * nb + blk * 8u,
+                  p.q8_s + m * nb + blk * 8u);
+}

@@ -1,0 +1,44 @@
+#version 460
+
+// Token embedding lookup for a Hadamard-latent PTQ1_0 table:
+//   x = s ⊙ FWHT_1024blockwise(dequant(token_embd[tok]))
+// dispatch: (n_embd / 1024, m_tokens, 1); token ids read from io[].
+
+layout(push_constant) uniform Params {
+    uint w_word;     // word offset of token_embd in the bound weight buffer
+    uint nb_row;     // PTQ1_0 blocks per row (n_embd / 128)
+    uint x_off;      // act offset of x (row stride n_embd)
+    uint sample_off; // u32 index of the first token id in io[]
+    uint signs_off;  // ws word offset of the n_embd sign bits
+    uint n_embd;
+}
+p;
+
+#define ACT_QUAL writeonly
+#define SAMPLE_QUAL readonly
+#include "lib/bindings.glsl"
+#include "lib/ptq1_0.glsl"
+#include "lib/fwht_q8.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint blk = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint tok = io[p.sample_off + m];
+    uint row = p.w_word + tok * p.nb_row * 7u;
+    uint e0 = blk * 1024u + 4u * t;
+    uint wb = row + (e0 >> 7u) * 7u;
+    float d = ptq1_0_scale(wb);
+    vec4 v;
+    [[unroll]] for (uint j = 0u; j < 4u; j += 1u) {
+        v[j] = ptq1_0_trit(wb, (e0 + j) & 127u) * d;
+    }
+    v = fwht1024(v) * hsign4(p.signs_off, e0);
+    uint o = p.x_off + m * p.n_embd + e0;
+    act[o + 0u] = v.x;
+    act[o + 1u] = v.y;
+    act[o + 2u] = v.z;
+    act[o + 3u] = v.w;
+}

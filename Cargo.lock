@@ -177,7 +177,23 @@ dependencies = [
  "tokenizers",
  "tree-sitter",
  "tree-sitter-cpp",
- "wgpu",
+ "wgpu 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+]
+
+[[package]]
+name = "bonsai2-pot"
+version = "0.300.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "env_logger",
+ "half",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "thiserror",
+ "tokenizers",
+ "wgpu 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
 ]
 
 [[package]]
@@ -752,6 +768,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "naga"
+version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.9.1",
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown 0.16.1",
+ "hexf-parse",
+ "indexmap",
+ "libm",
+ "log",
+ "num-traits",
+ "once_cell",
+ "rustc-hash",
+ "spirv",
+ "thiserror",
+ "unicode-ident",
 ]
 
 [[package]]
@@ -1443,6 +1484,34 @@ dependencies = [
 [[package]]
 name = "wgpu"
 version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "arrayvec",
+ "bitflags",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases",
+ "document-features",
+ "hashbrown 0.16.1",
+ "js-sys",
+ "log",
+ "parking_lot",
+ "portable-atomic",
+ "profiling",
+ "raw-window-handle",
+ "smallvec",
+ "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu-core 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+]
+
+[[package]]
+name = "wgpu"
+version = "29.0.3"
 source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
 dependencies = [
  "arrayvec",
@@ -1463,9 +1532,39 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "wgpu-core",
- "wgpu-hal",
- "wgpu-types",
+ "wgpu-core 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+]
+
+[[package]]
+name = "wgpu-core"
+version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.9.1",
+ "bit-vec 0.9.1",
+ "bitflags",
+ "bytemuck",
+ "cfg_aliases",
+ "document-features",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "log",
+ "naga 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "once_cell",
+ "parking_lot",
+ "portable-atomic",
+ "profiling",
+ "raw-window-handle",
+ "rustc-hash",
+ "smallvec",
+ "thiserror",
+ "wgpu-core-deps-windows-linux-android 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-naga-bridge 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
 ]
 
 [[package]]
@@ -1483,7 +1582,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap",
  "log",
- "naga",
+ "naga 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
  "once_cell",
  "parking_lot",
  "portable-atomic",
@@ -1493,10 +1592,10 @@ dependencies = [
  "smallvec",
  "thiserror",
  "wgpu-core-deps-apple",
- "wgpu-core-deps-windows-linux-android",
- "wgpu-hal",
- "wgpu-naga-bridge",
- "wgpu-types",
+ "wgpu-core-deps-windows-linux-android 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-naga-bridge 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
 ]
 
 [[package]]
@@ -1504,7 +1603,15 @@ name = "wgpu-core-deps-apple"
 version = "29.0.3"
 source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
 dependencies = [
- "wgpu-hal",
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+]
+
+[[package]]
+name = "wgpu-core-deps-windows-linux-android"
+version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
 ]
 
 [[package]]
@@ -1512,7 +1619,41 @@ name = "wgpu-core-deps-windows-linux-android"
 version = "29.0.3"
 source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
 dependencies = [
- "wgpu-hal",
+ "wgpu-hal 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+]
+
+[[package]]
+name = "wgpu-hal"
+version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "android_system_properties",
+ "arrayvec",
+ "ash",
+ "bitflags",
+ "bytemuck",
+ "cfg-if",
+ "cfg_aliases",
+ "gpu-allocator",
+ "gpu-descriptor",
+ "hashbrown 0.16.1",
+ "libc",
+ "libloading",
+ "log",
+ "naga 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "ordered-float",
+ "parking_lot",
+ "portable-atomic",
+ "portable-atomic-util",
+ "profiling",
+ "raw-window-handle",
+ "raw-window-metal",
+ "renderdoc-sys",
+ "smallvec",
+ "thiserror",
+ "wgpu-naga-bridge 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "windows",
 ]
 
 [[package]]
@@ -1534,7 +1675,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
- "naga",
+ "naga 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
@@ -1550,9 +1691,18 @@ dependencies = [
  "renderdoc-sys",
  "smallvec",
  "thiserror",
- "wgpu-naga-bridge",
- "wgpu-types",
+ "wgpu-naga-bridge 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
  "windows",
+]
+
+[[package]]
+name = "wgpu-naga-bridge"
+version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "naga 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits)",
 ]
 
 [[package]]
@@ -1560,8 +1710,21 @@ name = "wgpu-naga-bridge"
 version = "29.0.3"
 source = "git+https://github.com/ruihe774/wgpu.git?branch=staging#66bf385889bc1da100e26faf568f46240a244925"
 dependencies = [
- "naga",
- "wgpu-types",
+ "naga 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+ "wgpu-types 29.0.3 (git+https://github.com/ruihe774/wgpu.git?branch=staging)",
+]
+
+[[package]]
+name = "wgpu-types"
+version = "29.0.3"
+source = "git+https://github.com/ruihe774/wgpu.git?branch=relax-4gib-buffer-limits#0cd00eb189e0134c34ff5615f7187ac8f55af2dd"
+dependencies = [
+ "bitflags",
+ "bytemuck",
+ "js-sys",
+ "log",
+ "raw-window-handle",
+ "web-sys",
 ]
 
 [[package]]

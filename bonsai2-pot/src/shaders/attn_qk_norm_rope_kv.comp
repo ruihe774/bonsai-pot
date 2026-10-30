@@ -1,0 +1,113 @@
+#version 460
+
+// Full-attention prologue for m_tokens tokens at positions pos_base + m:
+//   Q heads (wg.x < n_head):          q = rope(rmsnorm(q)·q_norm), in place in
+//                                      the interleaved [q | gate] projection
+//   K heads (next n_kv_head groups):  k = rope(rmsnorm(k)·k_norm) → Q8_0 → kv_k
+//   V heads (last n_kv_head groups):  v → Q8_0 → kv_v
+// RoPE is NEOX-style on the first 2*rope_half dims (pairs d, d + rope_half),
+// angles from the host-computed table rope[pos*rope_half + i].
+// dispatch: (n_head + 2*n_kv_head, m_tokens, 1); one head (256 dims) per workgroup.
+
+layout(push_constant) uniform Params {
+    uint qg_off;     // act offset of the [q|gate] projection (row stride 4*n_head*128)
+    uint k_off;      // act offset of K (row stride kv_dim)
+    uint v_off;      // act offset of V (row stride kv_dim)
+    uint qnorm_off;  // ws word offset of q_norm (256 f32)
+    uint knorm_off;  // ws word offset of k_norm (256 f32)
+    uint pos_base;
+    uint n_head;
+    uint n_kv_head;
+    uint rope_half;  // rotary pairs per head
+    float eps;
+    uint kv_d_word;  // kv word offset of this layer's scale section
+    uint kv_qs_byte; // kv byte offset of this layer's qs section
+    uint kv_dim;
+}
+p;
+
+#include "lib/bindings.glsl"
+#include "lib/wg_reduce.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint HD = 256u;
+
+shared float x_sh[256];
+shared float amax_sh[8];
+shared uint qb_sh[256];
+
+float rope_apply(float x, uint d, uint pos) {
+    x_sh[d] = x;
+    barrier();
+    float y = x;
+    if (d < 2u * p.rope_half) {
+        uint i = d < p.rope_half ? d : d - p.rope_half;
+        vec2 cs = rope[pos * p.rope_half + i];
+        y = d < p.rope_half ? x * cs.x - x_sh[d + p.rope_half] * cs.y : x_sh[d - p.rope_half] * cs.y + x * cs.x;
+    }
+    barrier();
+    return y;
+}
+
+void store_kv_q8(float x, uint d, uint row_elem, bool is_k) {
+    x_sh[d] = abs(x);
+    barrier();
+    if ((d & 31u) == 0u) {
+        float mm = 0.0;
+        for (uint i = 0u; i < 32u; i += 1u) {
+            mm = max(mm, x_sh[d + i]);
+        }
+        amax_sh[d >> 5u] = mm;
+    }
+    barrier();
+    float scale = amax_sh[d >> 5u] / 127.0;
+    float id = scale > 0.0 ? 1.0 / scale : 0.0;
+    int q = clamp(int(round(x * id)), -127, 127);
+    qb_sh[d] = uint(q) & 0xFFu;
+    barrier();
+    uint e = row_elem + d;
+    if ((d & 3u) == 0u) {
+        uint word = qb_sh[d] | (qb_sh[d + 1u] << 8u) | (qb_sh[d + 2u] << 16u) | (qb_sh[d + 3u] << 24u);
+        uint wi = (p.kv_qs_byte + e) >> 2u;
+        if (is_k) {
+            kv_k[wi] = word;
+        } else {
+            kv_v[wi] = word;
+        }
+    }
+    if ((d & 31u) == 0u) {
+        uint di = p.kv_d_word + (e >> 5u);
+        if (is_k) {
+            kv_k[di] = floatBitsToUint(scale);
+        } else {
+            kv_v[di] = floatBitsToUint(scale);
+        }
+    }
+}
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint d = gl_LocalInvocationID.x;
+    uint pos = p.pos_base + m;
+
+    if (g < p.n_head) {
+        uint idx = p.qg_off + m * (4u * p.n_head * 128u) + g * 2u * HD + d;
+        float x = act[idx];
+        float ss = wg_sum(x * x);
+        x *= inversesqrt(ss / float(HD) + p.eps) * ws_f32(p.qnorm_off + d);
+        act[idx] = rope_apply(x, d, pos);
+    } else if (g < p.n_head + p.n_kv_head) {
+        uint kh = g - p.n_head;
+        float x = act[p.k_off + m * p.kv_dim + kh * HD + d];
+        float ss = wg_sum(x * x);
+        x *= inversesqrt(ss / float(HD) + p.eps) * ws_f32(p.knorm_off + d);
+        x = rope_apply(x, d, pos);
+        store_kv_q8(x, d, pos * p.kv_dim + kh * HD, true);
+    } else {
+        uint vh = g - p.n_head - p.n_kv_head;
+        float x = act[p.v_off + m * p.kv_dim + vh * HD + d];
+        store_kv_q8(x, d, pos * p.kv_dim + vh * HD, false);
+    }
+}

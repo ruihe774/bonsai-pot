@@ -1,0 +1,59 @@
+#version 460
+
+// Gated-DeltaNet causal depthwise conv (kernel 4) + SiLU, with L2 norm of the
+// q/k heads, over m_tokens consecutive tokens.
+//   y_t[c] = silu(Σ_{j<3} w[c][j] · s_j[c] + w[c][3] · x_t[c]),  s ← (s1, s2, x_t)
+//   q/k heads (the first n_qk_heads × 128 channels): y /= max(‖y_head‖, eps)
+// The conv state s (3 previous inputs per channel, oldest first) lives in
+// st[state_off + j*C + c] and is treated as zero when `fresh` is set.
+// dispatch: (C / 128, 1, 1); one channel per invocation, one head per workgroup.
+
+layout(push_constant) uniform Params {
+    uint m_tokens;
+    uint in_off;     // act offset of the qkv projection (row stride in_stride)
+    uint in_stride;
+    uint out_off;    // act offset of the output (row stride C)
+    uint w_off;      // ws word offset of conv weights (C × 4, f32)
+    uint state_off;  // st offset of this layer's conv state (3 × C)
+    uint n_qk_heads; // heads (of 128) that get the L2 norm
+    uint channels;   // C
+    float eps;
+    uint fresh;
+}
+p;
+
+#include "lib/bindings.glsl"
+#include "lib/wg_reduce.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint c = head * 128u + gl_LocalInvocationID.x;
+    uint C = p.channels;
+    vec4 wc = vec4(ws_f32(p.w_off + 4u * c), ws_f32(p.w_off + 4u * c + 1u), ws_f32(p.w_off + 4u * c + 2u),
+                   ws_f32(p.w_off + 4u * c + 3u));
+    float s0 = 0.0, s1 = 0.0, s2 = 0.0;
+    if (p.fresh == 0u) {
+        s0 = st[p.state_off + c];
+        s1 = st[p.state_off + C + c];
+        s2 = st[p.state_off + 2u * C + c];
+    }
+    bool norm = head < p.n_qk_heads;
+    for (uint m = 0u; m < p.m_tokens; m += 1u) {
+        float x = act[p.in_off + m * p.in_stride + c];
+        float y = wc.x * s0 + wc.y * s1 + wc.z * s2 + wc.w * x;
+        s0 = s1;
+        s1 = s2;
+        s2 = x;
+        y = silu(y);
+        if (norm) {
+            float ss = wg_sum(y * y);
+            y *= 1.0 / max(sqrt(ss), p.eps);
+        }
+        act[p.out_off + m * C + c] = y;
+    }
+    st[p.state_off + c] = s0;
+    st[p.state_off + C + c] = s1;
+    st[p.state_off + 2u * C + c] = s2;
+}

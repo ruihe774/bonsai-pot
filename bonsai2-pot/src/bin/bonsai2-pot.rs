@@ -1,0 +1,367 @@
+#![allow(
+    clippy::panic,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "demo"
+)]
+
+//! Demo CLI for `bonsai2-pot`.
+//!
+//! Reads pre-tokenized prompts from stdin (little-endian u32 token IDs) and
+//! generates text. Tokenization stays in your script of choice (e.g.
+//! `extract.py`'s `bpe_encode`); pipe its u32 output here.
+//!
+//! Examples:
+//!   uv run scripts/bpe.py ./model "Once upon a time" | bonsai2-pot ./model --max-new-tokens 64
+//!   bonsai2-pot ./model --mode bench --pp 512 --tg 128
+//!   bonsai2-pot ./model --mode dump --out /tmp/ours < prompt.u32
+
+use std::env;
+use std::fmt::Display;
+use std::fs::{File, create_dir_all};
+use std::io::{BufWriter, Read as _, Write as _, stdin, stdout};
+use std::path::PathBuf;
+use std::process::exit;
+use std::str::FromStr;
+
+use bonsai2_pot::{__bench, GenerateOptions, LoadOptions, Model, Sampler};
+
+struct Args {
+    model_dir: PathBuf,
+    mode: String,
+    n_gen: u32,
+    pp_n: u32,
+    tg_n: u32,
+    max_seq: u32,
+    repeats: u32,
+    no_marker: bool,
+    use_matmul_prefill: bool,
+    temperature: f32,
+    top_k: Option<u32>,
+    top_p: Option<f32>,
+    min_p: f32,
+    seed: u64,
+    out: Option<PathBuf>,
+}
+
+const HELP: &str = "\
+Demo CLI for the bonsai2-pot engine (Ternary-Bonsai-2).
+
+USAGE:
+    bonsai2-pot <model_dir> [OPTIONS]
+
+ARGS:
+    <model_dir>            Path to a directory produced by scripts/extract.py.
+
+MODES:
+    --mode gen             (default) Single-token matvec for prefill + generation.
+                           Reads u32 prompt tokens from stdin.
+    --mode prompt          Batched matmul prefill, then matvec generation.
+                           Reads u32 prompt tokens from stdin.
+    --mode bench           Print a pp/tg table with wall-clock and GPU t/s.
+                           No stdin input required.
+    --mode microbench      Per-kernel GPU-timestamp breakdown for a prefill
+                           step (--pp tokens) followed by a tg step (state
+                           pre-filled to --tg). No stdin input.
+    --mode dump            Run the stdin prompt token by token and write
+                           llama.cpp-named activations + per-position logits
+                           to --out DIR (index.jsonl + raw f32), for
+                           scripts/compare.py.
+
+GEN/PROMPT OPTIONS:
+    --max-new-tokens <n>   Tokens to generate (incl. the first sampled token).
+                           [default: 32]
+    --temperature <f>      Sampling temperature; 0.0 ⇒ greedy.
+                           [default: 0.0]
+    --top-k <k>            Truncate to top-k logits before sampling.
+                           [default: unset]
+    --top-p <p>            Nucleus filter cutoff in (0, 1].
+                           [default: unset]
+    --min-p <p>            Drop candidates below p × the top probability.
+                           [default: 0.0]
+    --seed <n>             PRNG seed for reproducible sampling.
+                           [default: 0]
+
+BENCH OPTIONS:
+    --pp <n>               Prefill batch size for the pp{N} bench row.
+                           [default: 512]
+    --tg <n>               Token-generation length for the tg{N} bench row;
+                           also the measurement pos for --mode microbench.
+                           [default: 128]
+    --repeats <n>          Repeat count per bench row.
+                           [default: 5]
+    --no-marker            (--mode microbench only) Skip per-step GPU timestamp
+                           markers and the post-step resolve submit. Each
+                           measurement becomes exactly one submit, giving
+                           deterministic submit indices suitable for selecting
+                           the measurement window in an external profiler like
+                           Nsight Graphics GPU Trace via --start-after-submits.
+                           Brackets the measurement loop with PROFILE
+                           BEGIN/END markers on stderr.
+
+LOAD OPTIONS:
+    --max-seq <n>          KV-cache capacity (positions). Costs 36 KiB of
+                           VRAM per position. [default: 32768]
+
+DUMP OPTIONS:
+    --out <dir>            Output directory for --mode dump.
+
+OTHER:
+    -h, --help             Show this help and exit.
+
+EXAMPLES:
+    uv run scripts/bpe.py ./model \"Once upon a time\" \\
+        | bonsai2-pot ./model --mode prompt --max-new-tokens 64
+    bonsai2-pot ./model --mode bench --pp 512 --tg 128
+";
+
+fn parse_or_die<T: FromStr>(flag: &str, raw: &str) -> T
+where
+    T::Err: Display,
+{
+    raw.parse::<T>().unwrap_or_else(|e| {
+        eprintln!("error: invalid value for {flag}: {raw:?}: {e}\n\n{HELP}");
+        exit(1);
+    })
+}
+
+fn parse_args() -> Args {
+    let argv: Vec<String> = env::args().collect();
+    if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        print!("{HELP}");
+        exit(0);
+    }
+    let Some(model_dir_arg) = argv.get(1) else {
+        eprintln!("error: missing <model_dir>\n\n{HELP}");
+        exit(1);
+    };
+    let model_dir = PathBuf::from(model_dir_arg);
+    let mut a = Args {
+        model_dir,
+        mode: "gen".to_string(),
+        n_gen: 32,
+        pp_n: 512,
+        tg_n: 128,
+        max_seq: 32768,
+        repeats: 5,
+        no_marker: false,
+        use_matmul_prefill: false,
+        temperature: 0.0, // CLI default = greedy, for reproducible runs
+        top_k: None,
+        top_p: None,
+        min_p: 0.0,
+        seed: 0,
+        out: None,
+    };
+    let mut i = 2;
+    while i < argv.len() {
+        let next = || {
+            argv.get(i + 1).cloned().unwrap_or_else(|| {
+                eprintln!("error: missing value for {}\n\n{HELP}", argv[i]);
+                exit(1)
+            })
+        };
+        match argv[i].as_str() {
+            "--mode" => {
+                a.mode = next();
+                i += 2;
+            }
+            "--max-new-tokens" => {
+                a.n_gen = parse_or_die("--max-new-tokens", &next());
+                i += 2;
+            }
+            "--pp" => {
+                a.pp_n = parse_or_die("--pp", &next());
+                i += 2;
+            }
+            "--tg" => {
+                a.tg_n = parse_or_die("--tg", &next());
+                i += 2;
+            }
+            "--repeats" => {
+                a.repeats = parse_or_die("--repeats", &next());
+                i += 2;
+            }
+            "--no-marker" => {
+                a.no_marker = true;
+                i += 1;
+            }
+            "--max-seq" => {
+                a.max_seq = parse_or_die("--max-seq", &next());
+                i += 2;
+            }
+            "--temperature" => {
+                a.temperature = parse_or_die("--temperature", &next());
+                i += 2;
+            }
+            "--top-k" => {
+                a.top_k = Some(parse_or_die("--top-k", &next()));
+                i += 2;
+            }
+            "--top-p" => {
+                a.top_p = Some(parse_or_die("--top-p", &next()));
+                i += 2;
+            }
+            "--min-p" => {
+                a.min_p = parse_or_die("--min-p", &next());
+                i += 2;
+            }
+            "--out" => {
+                a.out = Some(PathBuf::from(next()));
+                i += 2;
+            }
+            "--seed" => {
+                a.seed = parse_or_die("--seed", &next());
+                i += 2;
+            }
+            _ => {
+                eprintln!("error: unknown flag: {}\n\n{HELP}", argv[i]);
+                exit(1);
+            }
+        }
+    }
+    // Mode shortcut: `--mode prompt` ⇒ batched matmul prefill;
+    //                `--mode gen`    ⇒ matvec-loop prefill (parity with old CLI).
+    a.use_matmul_prefill = a.mode == "prompt";
+    a
+}
+
+fn read_prompt() -> Vec<u32> {
+    let mut buf = Vec::new();
+    stdin().lock().read_to_end(&mut buf).expect("read stdin");
+    if buf.len() % 4 != 0 {
+        eprintln!("stdin must be a multiple of 4 bytes (u32 token IDs)");
+        exit(1);
+    }
+    let prompt: Vec<u32> = buf
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if prompt.is_empty() {
+        eprintln!("empty prompt on stdin");
+        exit(1);
+    }
+    prompt
+}
+
+fn main() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .parse_default_env()
+        .init();
+    let args = parse_args();
+
+    let model = Model::load_from_dir(
+        &args.model_dir,
+        LoadOptions {
+            max_seq: args.max_seq,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("load error: {e}");
+        exit(2)
+    });
+
+    match args.mode.as_str() {
+        "bench" => {
+            __bench::bench(&model, args.pp_n, args.tg_n, args.repeats).unwrap_or_else(|e| {
+                eprintln!("bench error: {e}");
+                exit(3)
+            });
+        }
+        "microbench" => {
+            #[cfg(feature = "ci")]
+            {
+                let _ = args.no_marker;
+                eprintln!("microbench mode is not available with the ci feature");
+                exit(3);
+            }
+            #[cfg(not(feature = "ci"))]
+            {
+                __bench::microbench_pp(&model, args.pp_n, args.repeats, args.no_marker)
+                    .unwrap_or_else(|e| {
+                        eprintln!("microbench error: {e}");
+                        exit(3)
+                    });
+                __bench::microbench_tg(&model, args.tg_n, args.repeats, args.no_marker)
+                    .unwrap_or_else(|e| {
+                        eprintln!("microbench error: {e}");
+                        exit(3)
+                    });
+            }
+        }
+        "dump" => {
+            let Some(out) = args.out.clone() else {
+                eprintln!("--mode dump requires --out <dir>");
+                exit(1);
+            };
+            let prompt = read_prompt();
+            let tensors = __bench::dump(&model, &prompt).unwrap_or_else(|e| {
+                eprintln!("dump error: {e}");
+                exit(3)
+            });
+            create_dir_all(&out).expect("create --out dir");
+            let mut index =
+                BufWriter::new(File::create(out.join("index.jsonl")).expect("index.jsonl"));
+            for t in &tensors {
+                let file = format!("{}.f32", t.name);
+                let mut f =
+                    BufWriter::new(File::create(out.join(&file)).expect("create dump file"));
+                for v in &t.data {
+                    f.write_all(&v.to_le_bytes()).expect("write dump");
+                }
+                let cols = t.data.len() / t.ne0 as usize;
+                writeln!(
+                    index,
+                    "{{\"name\":\"{}\",\"file\":\"{file}\",\"ne\":[{},{cols},1,1]}}",
+                    t.name, t.ne0
+                )
+                .expect("write index");
+            }
+            eprintln!("wrote {} tensors to {}", tensors.len(), out.display());
+        }
+        "gen" | "prompt" => {
+            let prompt = read_prompt();
+
+            let sampler = Sampler {
+                temperature: args.temperature,
+                top_k: args.top_k,
+                top_p: args.top_p,
+                min_p: args.min_p,
+                seed: args.seed,
+            };
+            let mut sess = model.new_session();
+            let first = if args.use_matmul_prefill {
+                sess.prefill(&prompt, &sampler).expect("prefill")
+            } else {
+                sess.prefill_one_at_a_time(&prompt, &sampler)
+                    .expect("prefill")
+            };
+
+            let mut stdout = stdout().lock();
+            // Echo the decoded prompt before the first sampled token,
+            // matching the original CLI's behavior.
+            for &id in &prompt {
+                stdout.write_all(&model.decode_token(id)).ok();
+            }
+            stdout.write_all(&model.decode_token(first)).ok();
+            stdout.flush().ok();
+            let opts = GenerateOptions {
+                max_new_tokens: args.n_gen.saturating_sub(1),
+                sampler,
+                ..Default::default()
+            };
+            sess.generate_streaming(first, &opts, |id| {
+                stdout.write_all(&model.decode_token(id)).ok();
+                stdout.flush().ok();
+            })
+            .expect("generate");
+            writeln!(stdout).ok();
+        }
+        other => {
+            eprintln!("unknown mode: {other}");
+            exit(1);
+        }
+    }
+}

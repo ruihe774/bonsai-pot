@@ -1,0 +1,138 @@
+#version 460
+
+// PTQ1_0 × Q8/128 mat-vec for one activation row, up to three weight segments
+// (e.g. qkv + z, or q + k + v) sharing the same input in one dispatch.
+//
+//   y[r] (=|+=) Σ_b d_w,b · (d_a,b · Σ_e trit_e · q_e − d_a,b · Σ_e q_e)
+//
+// 16 invocations per output row, 16 rows per workgroup; two invocations per
+// 128-element block (8 blocks in flight per row, which divides every K of the
+// model: 40, 48 and 136 blocks) (lane `sub` 0 decodes qs words 0..2, lane 1 qs words 3..5
+// plus qh). Trits are decoded with the base-3 residue trick on 16-bit lane
+// pairs: after w = v*3 the trit sits in bytes 1/3 and the residue in bytes 0/2,
+// so the activation words are pre-masked to bytes 1/3 and the residue drops
+// out of the integer dot product.
+//
+// dispatch: (total_rows / 16, 1, 1); all segment row counts are multiples of 16.
+
+layout(push_constant) uniform Params {
+    uint nb;    // blocks per row (k / 128)
+    uint q8_qs; // q8 word offset of the activation qs (k/4 words)
+    uint q8_d;  // q8 word offset of the activation scales (nb)
+    uint q8_s;  // q8 word offset of the activation scale*sums (nb)
+    uint seg1;  // first global row of segment 1
+    uint seg2;  // first global row of segment 2
+    uint w0;    // weight word offset of segment 0
+    uint w1;
+    uint w2;
+    uint out0;  // act offset of segment 0 output
+    uint out1;
+    uint out2;
+    uint flags; // bit 0: accumulate into the output
+}
+p;
+
+#define Q8_QUAL readonly
+#include "lib/bindings.glsl"
+#include "lib/ptq1_0.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint LANES = 16u;
+const uint ROWS = 256u / LANES;
+shared float red_sh[256];
+
+// One trit level of a qs word pair (vl: bytes 0,2; vh: bytes 1,3) against
+// activation word y (4 i8, element order 0..3).
+#define TRIT_LEVEL(vl, vh, y, acc)                                                         \
+    {                                                                                      \
+        uint wl_ = MUL3(vl);                                                               \
+        uint wh_ = MUL3(vh);                                                               \
+        vl = wl_ & 0x00FF00FFu;                                                            \
+        vh = wh_ & 0x00FF00FFu;                                                            \
+        acc = dotPacked4x8EXT(int(wl_), int(((y) << 8u) & 0xFF00FF00u)) + acc;            \
+        acc = dotPacked4x8EXT(int(wh_), int((y) & 0xFF00FF00u)) + acc;                     \
+    }
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint grow = gl_WorkGroupID.x * ROWS + t / LANES;
+    uint row;
+    uint wbase;
+    uint out_off;
+    if (grow < p.seg1) {
+        row = grow;
+        wbase = p.w0;
+        out_off = p.out0;
+    } else if (grow < p.seg2) {
+        row = grow - p.seg1;
+        wbase = p.w1;
+        out_off = p.out1;
+    } else {
+        row = grow - p.seg2;
+        wbase = p.w2;
+        out_off = p.out2;
+    }
+    uint lane = t % LANES;
+    uint sub = lane & 1u;
+    uint rbase = wbase + row * p.nb * 7u;
+
+    float acc = 0.0;
+    for (uint b = lane >> 1u; b < p.nb; b += LANES / 2u) {
+        uint wb = rbase + b * 7u;
+        uint ab = p.q8_qs + b * 32u;
+        uint qa = w[wb + 3u * sub];
+        uint qb = w[wb + 3u * sub + 1u];
+        uint qc = w[wb + 3u * sub + 2u];
+        uint w6 = w[wb + 6u];
+        uint al = qa & 0x00FF00FFu, ah = (qa >> 8u) & 0x00FF00FFu;
+        uint bl = qb & 0x00FF00FFu, bh = (qb >> 8u) & 0x00FF00FFu;
+        uint cl = qc & 0x00FF00FFu, ch = (qc >> 8u) & 0x00FF00FFu;
+        int iacc = 0;
+        [[unroll]] for (uint lv = 0u; lv < 5u; lv += 1u) {
+            uint ya = q8[ab + 4u * lv + 3u * sub];
+            uint yb = q8[ab + (sub == 0u ? 4u * lv + 1u : 20u + 2u * lv)];
+            uint yc = q8[ab + (sub == 0u ? 4u * lv + 2u : 21u + 2u * lv)];
+            TRIT_LEVEL(al, ah, ya, iacc);
+            TRIT_LEVEL(bl, bh, yb, iacc);
+            TRIT_LEVEL(cl, ch, yc, iacc);
+        }
+        float bias = 0.0;
+        if (sub != 0u) {
+            // qh: four trit levels of two bytes → elements 120 + 2n + h.
+            uint vq = (w6 & 0xFFu) | ((w6 & 0xFF00u) << 8u);
+            uint wq;
+            wq = MUL3(vq);
+            vq = wq & 0x00FF00FFu;
+            uint q01 = ((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u);
+            wq = MUL3(vq);
+            vq = wq & 0x00FF00FFu;
+            q01 |= ((wq << 8u) & 0x30000u) | (wq & 0x03000000u);
+            wq = MUL3(vq);
+            vq = wq & 0x00FF00FFu;
+            uint q23 = ((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u);
+            wq = MUL3(vq);
+            q23 |= ((wq << 8u) & 0x30000u) | (wq & 0x03000000u);
+            iacc = dotPacked4x8EXT(int(q01), int(q8[ab + 30u])) + iacc;
+            iacc = dotPacked4x8EXT(int(q23), int(q8[ab + 31u])) + iacc;
+            bias = uintBitsToFloat(q8[p.q8_s + b]);
+        }
+        float da = uintBitsToFloat(q8[p.q8_d + b]);
+        float dw = unpackHalf2x16(w6).y;
+        acc += dw * (da * float(iacc) - bias);
+    }
+
+    red_sh[t] = acc;
+    barrier();
+    if (lane == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < LANES; i += 1u) {
+            s += red_sh[t + i];
+        }
+        if ((p.flags & 1u) != 0u) {
+            act[out_off + row] += s;
+        } else {
+            act[out_off + row] = s;
+        }
+    }
+}

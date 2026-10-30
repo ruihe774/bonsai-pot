@@ -1,0 +1,195 @@
+#version 460
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// PTQ1_0 × Q8/128 matmul for batched prefill on cooperative matrices
+// (VK_KHR_cooperative_matrix, 16×16×16 f16 × f16 → f32). Same interface and
+// push constants as matmul_ptq1_0.comp.
+//
+// Tile: 64 weight rows × 128 tokens. Per 128-element block the workgroup
+// decodes the 64 weight rows to f16 ((trit − 1) · d, exact) and dequantizes
+// the 128 token rows of Q8 activations to f16 (q · d_a) in LDS (f16vec4
+// stores); each of the eight wave32 subgroups accumulates a 32×32 sub-tile
+// (2 × 2 matrices) in f32 across the whole K. The epilogue stages each tile
+// through LDS so token tails and residual accumulation stay scalar.
+//
+// Requires a subgroup size of exactly 32 (pipeline created with Fixed(32)).
+// dispatch: (total_rows / 64, ceil(m_tokens / 128), 1).
+
+layout(push_constant) uniform Params {
+    uint nb;
+    uint m_tokens;
+    uint q8_qs;
+    uint q8_d;
+    uint q8_s;
+    uint seg1;
+    uint seg2;
+    uint w0;
+    uint w1;
+    uint w2;
+    uint out0;
+    uint out1;
+    uint out2;
+    uint total_rows;
+    uint flags;
+}
+p;
+
+#define Q8_QUAL readonly
+#include "lib/bindings.glsl"
+#include "lib/ptq1_0.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint TR = 64u;
+const uint TM = 128u;
+const uint LS4 = 34u; // LDS row stride in f16vec4 (128 + 8 pad halves)
+const uint NSG = 8u;
+
+shared f16vec4 a_sh[TR * LS4];
+shared f16vec4 b_sh[TM * LS4];
+shared float c_sh[NSG][256];
+
+uint trit_word(inout uint vl, inout uint vh) {
+    uint wl = MUL3(vl);
+    uint wh = MUL3(vh);
+    vl = wl & 0x00FF00FFu;
+    vh = wh & 0x00FF00FFu;
+    return ((wl >> 8u) & 0x00FF00FFu) | (wh & 0xFF00FF00u);
+}
+
+// Store the four trits of `word` as f16 (trit − 1) · d at f16vec4 slot `slot`.
+void put_trits(uint slot, uint word, float16_t d) {
+    f16vec4 tv = f16vec4(unpack8(word)) - f16vec4(1.0);
+    a_sh[slot] = tv * d;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint row0 = gl_WorkGroupID.x * TR;
+    uint tok0 = gl_WorkGroupID.y * TM;
+
+    uint wbase;
+    uint out_off;
+    uint seg_rows;
+    uint seg_row0;
+    if (row0 < p.seg1) {
+        wbase = p.w0;
+        out_off = p.out0;
+        seg_row0 = row0;
+        seg_rows = p.seg1;
+    } else if (row0 < p.seg2) {
+        wbase = p.w1;
+        out_off = p.out1;
+        seg_row0 = row0 - p.seg1;
+        seg_rows = p.seg2 - p.seg1;
+    } else {
+        wbase = p.w2;
+        out_off = p.out2;
+        seg_row0 = row0 - p.seg2;
+        seg_rows = p.total_rows - p.seg2;
+    }
+
+    uint wr = (sg >> 2u) * 32u; // 2 row groups
+    uint wc = (sg & 3u) * 32u;  // 4 token groups
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2][2];
+    [[unroll]] for (uint i = 0u; i < 2u; i += 1u) {
+        [[unroll]] for (uint j = 0u; j < 2u; j += 1u) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+    uint kw = p.nb * 32u;
+
+    for (uint b = 0u; b < p.nb; b += 1u) {
+        // ---- decode weights to f16 ----------------------------------------
+        for (uint task = t; task < TR * 7u; task += 256u) {
+            uint r = task / 7u;
+            uint i = task % 7u;
+            uint wb = wbase + ((seg_row0 + r) * p.nb + b) * 7u;
+            uint q = w[wb + i];
+            float16_t d = float16_t(ptq1_0_scale(wb));
+            uint rb = r * LS4;
+            if (i < 6u) {
+                uint vl = q & 0x00FF00FFu;
+                uint vh = (q >> 8u) & 0x00FF00FFu;
+                [[unroll]] for (uint lv = 0u; lv < 5u; lv += 1u) {
+                    uint word = trit_word(vl, vh);
+                    uint dst = i < 4u ? 4u * lv + i : 20u + 2u * lv + (i - 4u);
+                    put_trits(rb + dst, word, d);
+                }
+            } else {
+                uint vq = (q & 0xFFu) | ((q & 0xFF00u) << 8u);
+                uint wq;
+                wq = MUL3(vq);
+                vq = wq & 0x00FF00FFu;
+                uint q01 = ((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u);
+                wq = MUL3(vq);
+                vq = wq & 0x00FF00FFu;
+                q01 |= ((wq << 8u) & 0x30000u) | (wq & 0x03000000u);
+                wq = MUL3(vq);
+                vq = wq & 0x00FF00FFu;
+                uint q23 = ((wq >> 8u) & 0x3u) | ((wq >> 16u) & 0x300u);
+                wq = MUL3(vq);
+                q23 |= ((wq << 8u) & 0x30000u) | (wq & 0x03000000u);
+                put_trits(rb + 30u, q01, d);
+                put_trits(rb + 31u, q23, d);
+            }
+        }
+        // ---- dequantize activations to f16 ---------------------------------
+        for (uint idx = t; idx < TM * 32u; idx += 256u) {
+            uint m = idx >> 5u;
+            uint wi = idx & 31u;
+            uint tok = tok0 + m;
+            uint word = 0u;
+            float da = 0.0;
+            if (tok < p.m_tokens) {
+                word = q8[p.q8_qs + tok * kw + b * 32u + wi];
+                da = uintBitsToFloat(q8[p.q8_d + tok * p.nb + b]);
+            }
+            b_sh[m * LS4 + wi] = f16vec4(vec4(unpack8(int(word))) * da);
+        }
+        barrier();
+
+        [[unroll]] for (uint ks = 0u; ks < 8u; ks += 1u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ma[2];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[2];
+            [[unroll]] for (uint i = 0u; i < 2u; i += 1u) {
+                coopMatLoad(ma[i], a_sh, (wr + 16u * i) * LS4 + 4u * ks, LS4, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mb[i], b_sh, (wc + 16u * i) * LS4 + 4u * ks, LS4, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < 2u; i += 1u) {
+                [[unroll]] for (uint j = 0u; j < 2u; j += 1u) {
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // ---- epilogue: tile → LDS → masked scalar stores ------------------------
+    [[unroll]] for (uint i = 0u; i < 2u; i += 1u) {
+        [[unroll]] for (uint j = 0u; j < 2u; j += 1u) {
+            coopMatStore(acc[i][j], c_sh[sg], 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint e = lane; e < 256u; e += 32u) {
+                uint r = e >> 4u;
+                uint c = e & 15u;
+                uint tok = tok0 + wc + 16u * j + c;
+                if (tok < p.m_tokens) {
+                    uint o = out_off + tok * seg_rows + seg_row0 + wr + 16u * i + r;
+                    if ((p.flags & 1u) != 0u) {
+                        act[o] += c_sh[sg][e];
+                    } else {
+                        act[o] = c_sh[sg][e];
+                    }
+                }
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+}
