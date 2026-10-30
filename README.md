@@ -112,7 +112,7 @@ Each kernel that produces a projection input fuses this transform: RMSNorm, SwiG
 
 ### Memory
 
-Weights live in one storage buffer per window. wgpu caps buffers and bindings at 2 GiB − 1 on Mesa, so the 2.5 GB gate/up file is split at layer boundaries.
+Weights live in one storage buffer per window. The wgpu fork reports the driver's buffer and binding limit (4 GiB − 4 on Mesa/RADV), so the 2.5 GB gate/up file loads as a single window. On an adapter with a smaller limit (for example 2 GiB − 1), that file is split at layer boundaries into several windows.
 
 Each session owns:
 - f32 activation scratch;
@@ -120,7 +120,7 @@ Each session owns:
 - the Gated-DeltaNet recurrent state (about 157 MB);
 - a Q8_0 KV cache for the 16 full-attention layers, in separate `kv_k` and `kv_v` buffers at 36 KiB per position.
 
-`LoadOptions::max_seq` defaults to 32768. It is capped by the model's context length and by the per-buffer limit: about 116K positions under the 2 GiB cap, and about 233K with a 4 GiB limit.
+`LoadOptions::max_seq` defaults to 32768. It is capped by the model's context length and by the per-buffer limit: about 233K positions with the 4 GiB limit that the wgpu fork reports on Mesa/RADV, and about 116K on an adapter capped at 2 GiB − 1.
 
 There is one universal bind-group layout of 9 storage buffers for every kernel. Per-dispatch parameters (≤ 64 B) are wgpu immediates.
 

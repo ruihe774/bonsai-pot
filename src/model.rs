@@ -116,9 +116,10 @@ pub struct LoadOptions {
     /// The `Q8_0` KV cache of the full-attention layers costs
     /// `n_attn_layers * kv_dim * 2.25` bytes per position (36 KiB for
     /// Bonsai-2-27B); K and V each live in one buffer, so `max_seq` is capped
-    /// at the adapter's per-buffer limit (wgpu caps buffers at 2 GiB − 1 on
-    /// Mesa, i.e. about 116K positions; 233K with a 4 GiB limit) and at the
-    /// model's `context_length`.
+    /// at the adapter's per-buffer limit and at the model's `context_length`.
+    /// The wgpu fork reports the driver's limit (4 GiB − 4 on Mesa/RADV, i.e.
+    /// about 233K positions); an adapter capped at 2 GiB − 1 would allow
+    /// about 116K.
     pub max_seq: u32,
     /// System-wide GPU scheduling priority via `VK_KHR_global_priority`.
     /// Default [`GlobalPriority::LOW`]; ignored if unsupported.
