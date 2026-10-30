@@ -18,7 +18,6 @@ use std::path::Path;
 
 use bytemuck::cast_slice;
 use once_cell::sync::OnceCell;
-use wgpu::util::DeviceExt as _;
 use wgpu::{Backends, InstanceDescriptor};
 
 use crate::config::{self, LayerTensors, ModelConfig, OutputTensors};
@@ -640,13 +639,6 @@ impl Model {
         }
 
         // ---- weights ------------------------------------------------------
-        let make_storage = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-        };
         let rope = build_rope_table(&cfg, opts.max_seq);
         // ---- weight windows ---------------------------------------------
         let bind_limit = max_buf;
@@ -715,18 +707,28 @@ impl Model {
             &snapshot.w_ffn_down,
             &snapshot.w_embed_lmhead,
         ];
+        let rope_bytes: &[u8] = cast_slice(&rope);
+        let max_upload = windows
+            .iter()
+            .map(|w| w.size)
+            .chain([snapshot.w_small.len() as u64, rope_bytes.len() as u64])
+            .max()
+            .unwrap_or(0);
+        let up = Uploader::new(&device, &queue, &lost, max_upload);
+        let weights = windows
+            .iter()
+            .map(|w| {
+                let bytes =
+                    &file_bytes[w.file as usize][w.offset as usize..(w.offset + w.size) as usize];
+                up.upload("weights", bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let buffers = Buffers {
-            weights: windows
-                .iter()
-                .map(|w| {
-                    let bytes = &file_bytes[w.file as usize]
-                        [w.offset as usize..(w.offset + w.size) as usize];
-                    make_storage("weights", bytes)
-                })
-                .collect(),
-            w_small: make_storage("w_small", &snapshot.w_small),
-            rope: make_storage("rope", cast_slice(&rope)),
+            weights,
+            w_small: up.upload("w_small", &snapshot.w_small)?,
+            rope: up.upload("rope", rope_bytes)?,
         };
+        drop(up);
         drop(snapshot.w_attn);
         drop(snapshot.w_ffn_gate_up);
         drop(snapshot.w_ffn_down);
@@ -992,6 +994,93 @@ enum CoopChoice {
     I8,
     F16,
     Off,
+}
+
+/// Largest staging chunk used to upload weights (see [`Uploader`]).
+const UPLOAD_CHUNK_BYTES: u64 = 64 << 20;
+
+/// Uploads `STORAGE` buffers through one reusable staging buffer of at most
+/// [`UPLOAD_CHUNK_BYTES`], waiting for each chunk's copy before reusing it.
+///
+/// `create_buffer_init` stages every buffer through its own equally large
+/// host-visible allocation, which with resizable BAR lives in VRAM. Loading the
+/// weights then briefly needed about twice their size, and a session created
+/// right after found VRAM full: the kernel placed its KV cache in system
+/// memory and never moved it back, halving attention speed. With one bounded
+/// staging buffer the peak is the weights plus one chunk.
+struct Uploader<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    lost: &'a OnceCell<DeviceLostInfo>,
+    staging: wgpu::Buffer,
+    chunk: u64,
+}
+
+impl<'a> Uploader<'a> {
+    /// Staging sized for the largest upload, capped at [`UPLOAD_CHUNK_BYTES`].
+    fn new(
+        device: &'a wgpu::Device,
+        queue: &'a wgpu::Queue,
+        lost: &'a OnceCell<DeviceLostInfo>,
+        max_len: u64,
+    ) -> Self {
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let chunk = max_len
+            .next_multiple_of(align)
+            .clamp(align, UPLOAD_CHUNK_BYTES);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("upload_staging"),
+            size: chunk,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        Self {
+            device,
+            queue,
+            lost,
+            staging,
+            chunk,
+        }
+    }
+
+    /// A new `STORAGE` buffer holding `bytes` (zero-padded to 4 bytes).
+    fn upload(&self, label: &str, bytes: &[u8]) -> Result<wgpu::Buffer> {
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (bytes.len() as u64).next_multiple_of(align).max(align),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut offset = 0u64;
+        for part in bytes.chunks(self.chunk as usize) {
+            let n = (part.len() as u64).next_multiple_of(align);
+            {
+                let mut view = self.staging.slice(..n).get_mapped_range_mut();
+                // Mapped memory may be write-combining: write-only access.
+                view.slice(..part.len()).copy_from_slice(part);
+                view.slice(part.len()..).fill(0);
+            }
+            self.staging.unmap();
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            enc.copy_buffer_to_buffer(&self.staging, 0, &buf, offset, n);
+            enc.map_buffer_on_submit(&self.staging, wgpu::MapMode::Write, .., |_| ());
+            self.queue.submit([enc.finish()]);
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(PotError::Poll)?;
+            if let Some(d) = self.lost.get() {
+                return Err(PotError::DeviceLost {
+                    reason: d.reason,
+                    message: d.message.clone(),
+                });
+            }
+            offset += n;
+        }
+        Ok(buf)
+    }
 }
 
 /// `BONSAI_POT_ATTN=scalar` forces the scalar prefill attention kernel even
